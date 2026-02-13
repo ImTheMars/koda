@@ -66,7 +66,7 @@ export function registerScheduleTools(deps: {
       const userTasks = dbTasks.listByUser(getUserId());
       return {
         success: true,
-        tasks: userTasks.map((t) => ({
+        tasks: userTasks.map((t: { id: string; type: string; description: string; cron: string | null; nextRunAt: string }) => ({
           id: t.id, type: t.type, description: t.description,
           schedule: t.cron ?? null, nextRunAt: t.nextRunAt,
         })),

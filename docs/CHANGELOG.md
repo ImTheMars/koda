@@ -4,6 +4,49 @@ all notable changes to koda.
 
 ---
 
+## v1.1.0 — hardening + voice pipeline upgrade (2026-02-13)
+
+hardening release. ships all 8 v1.1 roadmap items plus a full voice pipeline swap.
+
+### changed
+
+- **voice STT: groq whisper → gemini 3 flash via openrouter** — eliminates a separate API key. STT now reuses the existing openrouter key. gemini handles audio natively as multimodal input (`input_audio` with base64 ogg).
+- **voice TTS: openai tts-1 → cartesia sonic 3** — lower latency (~40ms), better voice quality. configurable voice id via `voice.cartesiaVoiceId` (defaults to `694f9389-aac1-45b6-b726-9d9369183238`).
+- **voice-only reply** — voice messages now get voice replies only (no duplicate text message). falls back to text when TTS is unavailable.
+- **config: voice keys replaced** — `voice.groqApiKey` + `voice.openaiApiKey` replaced by `voice.cartesiaApiKey` + `voice.cartesiaVoiceId`. env vars: `KODA_CARTESIA_API_KEY` + `KODA_CARTESIA_VOICE_ID` replace `KODA_GROQ_API_KEY` + `KODA_OPENAI_API_KEY`.
+- **message dedup by content hash** — switched from message_id-based dedup to `Bun.hash()` content hashing. identical messages with different IDs now correctly deduplicated. voice uses message_id hash (content unknown pre-transcription), photos hash caption.
+- **telegram reconnect with exponential backoff** — `bot.start()` now retries with exponential backoff + jitter on connection failure. consecutive error tracking auto-restarts bot after 5 failures.
+- **context compaction** — when tool step count exceeds 10, `prepareStep` splices older messages keeping last 6. prevents context window exhaustion on deep tool chains.
+- **heartbeat structured parsing** — heartbeat now parses `- [ ]` / `- [x]` checkboxes from HEARTBEAT.md. only sends pending items with structured count to agent (e.g. "you have 3 pending tasks (2 completed)").
+
+### no-op
+
+- **skill hot-reload** — marked done. `loadSkill()` already reads the file fresh every call, `listSkills()` scans directories every call. no cache to invalidate.
+
+---
+
+## v1.0.1 — stability + safety patch (2026-02-13)
+
+bugfix release focused on setup reliability, request isolation, scheduler delivery, and filesystem hardening.
+
+### fixed
+
+- **setup/runtime env mismatch** — runtime now loads both `~/.koda/.env` and project `.env`, so `koda setup` works without manual env copying.
+- **required key inconsistency** — setup now requires `KODA_SUPERMEMORY_API_KEY`, matching config validation.
+- **request context race** — tools now use request-scoped context via `AsyncLocalStorage` to prevent cross-chat/user leakage under concurrency.
+- **telegram proactive delivery** — scheduler reminders now send through Telegram when the task channel is telegram.
+- **soul persistence** — `updateSoul` now writes changes back to `soul.md` instead of mutating in-memory only.
+- **filesystem symlink escape** — write path validation now checks real paths of existing parents and blocks symlink writes outside workspace.
+- **cron schedule validation** — invalid weekday/time inputs now fail fast instead of drifting into bad scheduling behavior.
+- **exec portability** — shell execution is now platform-aware (`cmd.exe` on Windows, `sh` on Unix-like systems).
+- **telegram dedup collisions** — dedup keys now include chat id + message id to avoid cross-chat false positives.
+- **memory fallback targeting** — sqlite fallback recall now accepts the active session key so lookups hit the correct conversation history.
+- **cli entrypoint** — `bun run src/cli.ts <command>` now executes commands directly (`koda` script is functional).
+
+### changed
+
+- bumped version to **1.0.1** (`package.json`, CLI version output, health endpoint version).
+
 ## v1.0.0 — the rebuild (2026-02-12)
 
 ground-up rewrite. threw away the over-engineered prototype, kept the good ideas, rebuilt everything from scratch.

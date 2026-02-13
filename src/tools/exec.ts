@@ -19,13 +19,15 @@ interface ProcessEntry {
 const processes = new Map<string, ProcessEntry>();
 
 const BLOCKED_COMMANDS = [
-  /^rm\s+-rf\s+\//,
-  /^sudo\b/,
-  /^shutdown\b/,
-  /^reboot\b/,
-  /^mkfs\b/,
-  /^dd\s+if=/,
-  /^:\(\)\{.*\}/,
+  /^\s*rm\s+-rf\s+\//i,
+  /^\s*sudo\b/i,
+  /^\s*shutdown\b/i,
+  /^\s*reboot\b/i,
+  /^\s*mkfs\b/i,
+  /^\s*dd\s+if=/i,
+  /^\s*:\(\)\{.*\}/,
+  /^\s*(del|erase)\s+/i,
+  /^\s*format\b/i,
 ];
 
 const AUTO_BG_TIMEOUT_MS = 10_000;
@@ -58,7 +60,11 @@ export function registerExecTools(deps: { workspace: string }): ToolSet {
       };
 
       try {
-        const proc = Bun.spawn(["sh", "-c", command], {
+        const shellCommand = process.platform === "win32"
+          ? ["cmd.exe", "/d", "/s", "/c", command]
+          : ["sh", "-lc", command];
+
+        const proc = Bun.spawn(shellCommand, {
           cwd: workspace,
           stdout: "pipe",
           stderr: "pipe",

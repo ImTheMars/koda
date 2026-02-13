@@ -1,11 +1,12 @@
 /**
  * Tools index — builds the complete ToolSet from all capabilities.
  *
- * Context closure: tools receive getUserId/getChatId/getChannel via a shared ref
- * that's set per-request in the agent, instead of AsyncLocalStorage.
+ * Tools resolve user/chat/channel from AsyncLocalStorage request context
+ * set by the agent around each generateText call.
  */
 
 import type { ToolSet } from "ai";
+import { AsyncLocalStorage } from "async_hooks";
 import type { Config } from "../config.js";
 import type { MemoryProvider } from "./memory.js";
 import type { SkillLoader } from "./skills.js";
@@ -18,12 +19,27 @@ import { registerScheduleTools } from "./schedule.js";
 import { registerSkillTools } from "./skills.js";
 import { registerSoulTools, SoulLoader } from "./soul.js";
 
-/** Shared context ref — set per-request before tool execution */
-export const toolContext = {
+interface ToolRuntimeContext {
+  userId: string;
+  chatId: string;
+  channel: string;
+}
+
+const DEFAULT_CONTEXT: ToolRuntimeContext = {
   userId: "owner",
   chatId: "owner",
   channel: "cli",
 };
+
+const toolContextStore = new AsyncLocalStorage<ToolRuntimeContext>();
+
+export function withToolContext<T>(ctx: ToolRuntimeContext, fn: () => Promise<T>): Promise<T> {
+  return toolContextStore.run(ctx, fn);
+}
+
+function getToolContext(): ToolRuntimeContext {
+  return toolContextStore.getStore() ?? DEFAULT_CONTEXT;
+}
 
 export function buildTools(deps: {
   config: Config;
@@ -37,7 +53,7 @@ export function buildTools(deps: {
   const tools: ToolSet = {
     ...registerMemoryTools({
       memory: memoryProvider,
-      getUserId: () => toolContext.userId,
+      getUserId: () => getToolContext().userId,
     }),
     ...registerFilesystemTools({ workspace }),
     ...registerExecTools({ workspace }),
@@ -52,9 +68,9 @@ export function buildTools(deps: {
   // Schedule
   Object.assign(tools, registerScheduleTools({
     timezone: config.scheduler.timezone,
-    getUserId: () => toolContext.userId,
-    getChatId: () => toolContext.chatId,
-    getChannel: () => toolContext.channel,
+    getUserId: () => getToolContext().userId,
+    getChatId: () => getToolContext().chatId,
+    getChannel: () => getToolContext().channel,
   }));
 
   // Browser (optional)

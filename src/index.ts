@@ -55,14 +55,14 @@ const agentDeps: AgentDeps = {
   tools,
   getSoulPrompt: () => soulLoader.generatePrompt(),
   getSkillsSummary: () => skillLoader.buildSkillsSummary(),
-  getMemories: (userId, query) => memoryProvider.recall(userId, query),
+  getMemories: (userId, query, sessionKey) => memoryProvider.recall(userId, query, 5, sessionKey),
   isMemoryDegraded: () => memoryProvider.isDegraded,
 };
 
 const runAgent = createAgent(agentDeps);
 
 // --- Channels ---
-let telegram: { stop: () => Promise<void> } | null = null;
+let telegram: { stop: () => Promise<void>; sendDirect: (chatId: string, text: string) => Promise<void> } | null = null;
 let repl: { stop: () => void } | null = null;
 
 if (config.mode !== "cli-only" && config.telegram.token) {
@@ -89,8 +89,15 @@ if (config.features.scheduler || config.features.heartbeat) {
   proactive = startProactive({
     runAgent,
     sendDirect: async (channel, chatId, text) => {
-      // Direct send for reminders — for now just log, Telegram send handled differently
-      if (channel === "cli") console.log(`[reminder] ${text}`);
+      if (channel === "cli") {
+        console.log(`[reminder] ${text}`);
+        return;
+      }
+      if (channel === "telegram" && telegram) {
+        await telegram.sendDirect(chatId, text);
+        return;
+      }
+      console.warn(`[proactive] no direct sender for channel: ${channel}`);
     },
     config,
     defaultUserId: defaultOwner,
@@ -106,7 +113,7 @@ const server = Bun.serve({
   fetch(req) {
     const url = new URL(req.url);
     if (url.pathname === "/health") {
-      return Response.json({ status: "ok", version: "1.0.0", uptime: process.uptime() });
+      return Response.json({ status: "ok", version: "1.0.1", uptime: process.uptime() });
     }
     return new Response("Not found", { status: 404 });
   },

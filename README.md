@@ -31,7 +31,7 @@ built on bun. runs on a $5 vps. 19 files. no bloat.
 | llm costs spiral out of control | 3-tier auto-routing — greetings cost $0.075/M tokens, only reasoning tasks hit opus at $25/M. the router picks the cheapest model that can handle the job. |
 | assistants forget everything between sessions | semantic memory via supermemory with circuit breaker fallback to sqlite. koda remembers what you told it last month. |
 | "let me think about that" for simple questions | fast tier responds in <1s. model escalation kicks in automatically if the task turns out to be harder than expected — starts cheap, upgrades mid-conversation. |
-| voice feels bolted on | native voice pipeline — groq whisper for STT, openai tts-1 for synthesis. send a voice note, get a voice note back. no sdk dependencies, just fetch. |
+| voice feels bolted on | native voice pipeline — gemini 3 flash for STT (via openrouter), cartesia sonic 3 for synthesis. send a voice note, get a voice note back. no sdk dependencies, just fetch. |
 | sandbox execution is expensive | local `Bun.spawn()` with auto-background after 10s. no cloud sandbox bills. blocked commands list for safety. |
 | personality feels corporate | fully editable soul.md with hot-reload. koda writes in lowercase, uses slang, splits messages naturally. texts like a person, not a product. |
 | tools are static | skills system — koda reads, creates, and loads its own SKILL.md files at runtime. it literally teaches itself new abilities. |
@@ -107,8 +107,8 @@ cp config/config.example.json config/config.json  # tweak models, timezone, feat
 **optional keys:**
 - `KODA_TELEGRAM_TOKEN` — telegram bot (required unless cli-only mode)
 - `KODA_TAVILY_API_KEY` — web search
-- `KODA_GROQ_API_KEY` — voice transcription (whisper)
-- `KODA_OPENAI_API_KEY` — voice synthesis (tts-1)
+- `KODA_CARTESIA_API_KEY` — voice synthesis (cartesia sonic 3, STT uses openrouter)
+- `KODA_CARTESIA_VOICE_ID` — optional custom cartesia voice id (defaults to Sonic 3 voice)
 
 ## benchmarks
 
@@ -197,7 +197,7 @@ all models are configurable. swap in any openrouter-supported model.
 | **remember** / **recall** | semantic memory — stores facts, retrieves relevant context. supermemory with sqlite fallback when circuit breaker trips. |
 | **webSearch** / **extractUrl** | tavily-powered search + page content extraction. |
 | **readFile** / **writeFile** / **listFiles** | workspace-scoped filesystem. blocked patterns for .env, secrets, node_modules. |
-| **exec** / **process** | local code execution via Bun.spawn. auto-backgrounds after 10s. poll, stream logs, or kill running processes. |
+| **exec** / **process** | local code execution via Bun.spawn. auto-backgrounds after 10s. poll, view logs, or kill running processes. |
 | **browseUrl** / **browserAct** / **browserExtract** / **browserScreenshot** / **browserClose** | stagehand headless browser. navigate, click, fill forms, extract data, take screenshots. |
 | **createReminder** / **createRecurringTask** / **listTasks** / **deleteTask** | timezone-aware scheduling with cron-style recurrence. |
 | **skills** | list, load, or create SKILL.md files. koda teaches itself new abilities at runtime. |
@@ -243,8 +243,8 @@ runs on anything that runs bun. 128mb ram is plenty.
 | validation | [zod v4](https://zod.dev) |
 | browser | [stagehand](https://github.com/browserbase/stagehand) |
 | search | [tavily](https://tavily.com) |
-| voice stt | [groq](https://groq.com) whisper (raw fetch) |
-| voice tts | [openai](https://openai.com) tts-1 (raw fetch) |
+| voice stt | [gemini 3 flash](https://openrouter.ai) via openrouter (multimodal audio) |
+| voice tts | [cartesia](https://cartesia.ai) sonic 3 (raw fetch) |
 | cli ui | [@clack/prompts](https://github.com/bombshell-dev/clack) + chalk + ora |
 
 ## the v1 rebuild

@@ -10,7 +10,7 @@ import type { Config, Tier } from "./config.js";
 import { classifyTier, classifyIntent, getModelId, calculateCost, shouldAck, FAILOVER } from "./router.js";
 import { messages as dbMessages, usage as dbUsage, learnings as dbLearnings } from "./db.js";
 import { formatUserTime } from "./time.js";
-import { toolContext } from "./tools/index.js";
+import { withToolContext } from "./tools/index.js";
 
 export interface AgentInput {
   content: string;
@@ -36,7 +36,7 @@ export interface AgentDeps {
   tools: ToolSet;
   getSoulPrompt: () => string | null;
   getSkillsSummary: () => Promise<string | null>;
-  getMemories: (userId: string, query: string) => Promise<string[]>;
+  getMemories: (userId: string, query: string, sessionKey?: string) => Promise<string[]>;
   isMemoryDegraded: () => boolean;
 }
 
@@ -137,7 +137,7 @@ export function createAgent(deps: AgentDeps) {
 
     // Build context
     const [memories, skillsSummary, recentLearnings] = await Promise.all([
-      deps.getMemories(input.senderId, input.content),
+      deps.getMemories(input.senderId, input.content, input.sessionKey),
       deps.getSkillsSummary(),
       Promise.resolve(dbLearnings.getRecent(input.senderId, 5)),
     ]);
@@ -159,11 +159,6 @@ export function createAgent(deps: AgentDeps) {
       { role: "user" as const, content: input.content },
     ];
 
-    // Set tool context for this request
-    toolContext.userId = input.senderId;
-    toolContext.chatId = input.chatId;
-    toolContext.channel = input.channel;
-
     // Typing indicator
     input.onTypingStart?.();
 
@@ -172,65 +167,82 @@ export function createAgent(deps: AgentDeps) {
     let stepCount = 0;
 
     try {
-      const modelId = getModelId(currentTier, config);
-      const fallbackIds = FAILOVER[currentTier] ?? [];
-      const model = provider(modelId, { models: fallbackIds });
-
-      const result = await generateText({
-        model,
-        system: systemPrompt,
-        messages: messageList,
-        tools,
-        toolChoice: "auto",
-        stopWhen: stepCountIs(config.agent.maxSteps),
-        maxOutputTokens: config.agent.maxTokens,
-        temperature: config.agent.temperature,
-        prepareStep: ({ stepNumber }) => {
-          stepCount = stepNumber;
-          // Model escalation: step > 5 on fast/standard → upgrade
-          if (stepNumber > 5 && currentTier !== "deep") {
-            const idx = tierOrder.indexOf(currentTier);
-            if (idx < tierOrder.length - 1) {
-              currentTier = tierOrder[idx + 1]!;
-              const newModelId = getModelId(currentTier, config);
-              const newFallbacks = FAILOVER[currentTier] ?? [];
-              return { model: provider(newModelId, { models: newFallbacks }) };
-            }
-          }
-          return {};
-        },
-        onStepFinish: async (step) => {
-          if (step.toolCalls) {
-            for (const call of step.toolCalls) toolsUsed.push(call.toolName);
-          }
-        },
-      });
-
-      const finalModelId = getModelId(currentTier, config);
-      const promptTokens = result.usage?.inputTokens ?? 0;
-      const completionTokens = result.usage?.outputTokens ?? 0;
-      const cost = calculateCost(finalModelId, promptTokens, completionTokens);
-
-      // Track usage
-      dbUsage.track({
+      return await withToolContext({
         userId: input.senderId,
-        model: finalModelId,
-        inputTokens: promptTokens,
-        outputTokens: completionTokens,
-        cost,
-        toolsUsed: [...new Set(toolsUsed)],
+        chatId: input.chatId,
+        channel: input.channel,
+      }, async () => {
+        const modelId = getModelId(currentTier, config);
+        const fallbackIds = FAILOVER[currentTier] ?? [];
+        const model = provider(modelId, { models: fallbackIds });
+
+        const result = await generateText({
+          model,
+          system: systemPrompt,
+          messages: messageList,
+          tools,
+          toolChoice: "auto",
+          stopWhen: stepCountIs(config.agent.maxSteps),
+          maxOutputTokens: config.agent.maxTokens,
+          temperature: config.agent.temperature,
+          prepareStep: ({ stepNumber }) => {
+            stepCount = stepNumber;
+
+            // Context compaction: trim older messages when deep in tool loop
+            if (stepNumber > 10 && messageList.length > 8) {
+              const keep = 6;
+              const removed = messageList.length - keep;
+              messageList.splice(0, removed, {
+                role: "user" as const,
+                content: `[${removed} earlier messages compacted]`,
+              });
+            }
+
+            // Model escalation: step > 5 on fast/standard → upgrade
+            if (stepNumber > 5 && currentTier !== "deep") {
+              const idx = tierOrder.indexOf(currentTier);
+              if (idx < tierOrder.length - 1) {
+                currentTier = tierOrder[idx + 1]!;
+                const newModelId = getModelId(currentTier, config);
+                const newFallbacks = FAILOVER[currentTier] ?? [];
+                return { model: provider(newModelId, { models: newFallbacks }) };
+              }
+            }
+            return {};
+          },
+          onStepFinish: async (step) => {
+            if (step.toolCalls) {
+              for (const call of step.toolCalls) toolsUsed.push(call.toolName);
+            }
+          },
+        });
+
+        const finalModelId = getModelId(currentTier, config);
+        const promptTokens = result.usage?.inputTokens ?? 0;
+        const completionTokens = result.usage?.outputTokens ?? 0;
+        const cost = calculateCost(finalModelId, promptTokens, completionTokens);
+
+        // Track usage
+        dbUsage.track({
+          userId: input.senderId,
+          model: finalModelId,
+          inputTokens: promptTokens,
+          outputTokens: completionTokens,
+          cost,
+          toolsUsed: [...new Set(toolsUsed)],
+        });
+
+        // Persist messages
+        dbMessages.append(input.sessionKey, "user", input.content);
+        dbMessages.append(input.sessionKey, "assistant", result.text || "done.", [...new Set(toolsUsed)]);
+
+        return {
+          text: result.text || "done.",
+          tier: currentTier,
+          toolsUsed: [...new Set(toolsUsed)],
+          usage: { promptTokens, completionTokens, cost },
+        };
       });
-
-      // Persist messages
-      dbMessages.append(input.sessionKey, "user", input.content);
-      dbMessages.append(input.sessionKey, "assistant", result.text || "done.", [...new Set(toolsUsed)]);
-
-      return {
-        text: result.text || "done.",
-        tier: currentTier,
-        toolsUsed: [...new Set(toolsUsed)],
-        usage: { promptTokens, completionTokens, cost },
-      };
     } catch (err) {
       console.error("[agent] LLM generate error:", err);
       return {

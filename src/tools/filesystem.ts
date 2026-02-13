@@ -4,13 +4,14 @@
 
 import { tool, type ToolSet } from "ai";
 import { z } from "zod";
-import { mkdirSync, readdirSync, realpathSync } from "fs";
+import { mkdirSync, readdirSync, realpathSync, existsSync, lstatSync } from "fs";
 import { dirname, resolve, normalize, relative, isAbsolute } from "path";
 
 const BLOCKED_PATTERNS = [
   /(^|[\\/])\.env(\..+)?$/i,
   /credentials/i,
   /secrets?/i,
+  /(^|[\\/])node_modules([\\/]|$)/i,
   /[\\/]\.git[\\/]config$/i,
   /(^|[\\/])\.ssh([\\/]|$)/i,
   /(^|[\\/])\.aws([\\/]|$)/i,
@@ -21,20 +22,44 @@ function safePath(filePath: string, workspace: string, mode: "read" | "write"): 
   if (filePath.includes("\0")) throw new Error("Access denied: invalid path");
 
   const normalized = normalize(filePath);
-  const wsResolved = resolve(workspace);
+  const wsResolved = realpathSync(resolve(workspace));
   const resolved = isAbsolute(normalized) ? resolve(normalized) : resolve(wsResolved, normalized);
+
+  const ensureInWorkspace = (checkPath: string): void => {
+    const rel = relative(wsResolved, checkPath);
+    if (rel.startsWith("..") || isAbsolute(rel)) throw new Error("Access denied: path is outside workspace");
+  };
+
+  const checkSensitive = (checkPath: string): void => {
+    for (const pattern of BLOCKED_PATTERNS) {
+      if (pattern.test(checkPath)) throw new Error("Access denied: sensitive file");
+    }
+  };
 
   let checkPath = resolved;
   if (mode === "read") {
     try { checkPath = realpathSync(resolved); } catch {}
+    ensureInWorkspace(checkPath);
+    checkSensitive(checkPath);
+    return resolved;
   }
 
-  const rel = relative(wsResolved, checkPath);
-  if (rel.startsWith("..") || isAbsolute(rel)) throw new Error("Access denied: path is outside workspace");
-
-  for (const pattern of BLOCKED_PATTERNS) {
-    if (pattern.test(checkPath)) throw new Error("Access denied: sensitive file");
+  // Write-mode symlink guard: validate nearest existing parent via realpath.
+  let existingParent = dirname(resolved);
+  while (!existsSync(existingParent)) {
+    const parent = dirname(existingParent);
+    if (parent === existingParent) throw new Error("Access denied: invalid path");
+    existingParent = parent;
   }
+
+  const parentReal = realpathSync(existingParent);
+  ensureInWorkspace(parentReal);
+
+  if (existsSync(resolved) && lstatSync(resolved).isSymbolicLink()) {
+    throw new Error("Access denied: symlink writes are not allowed");
+  }
+
+  checkSensitive(resolved);
 
   return resolved;
 }

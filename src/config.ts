@@ -1,13 +1,15 @@
 /**
  * Koda v1 configuration — Zod-validated with env override for secrets.
  *
- * 3-tier LLM: fast/standard/deep. Voice via Groq STT + OpenAI TTS.
+ * 3-tier LLM: fast/standard/deep. Voice via Gemini STT (OpenRouter) + Cartesia TTS.
  */
 
 import { z } from "zod";
 import { resolve, isAbsolute } from "path";
 import { homedir } from "os";
 import { statSync } from "fs";
+import { loadEnvFromFiles } from "./env.js";
+import { validateTimezone } from "./time.js";
 
 function withEmptyDefault<T extends z.ZodTypeAny>(schema: T) {
   return schema.optional().transform((val) => schema.parse(val ?? {}));
@@ -27,8 +29,8 @@ const ConfigSchema = z.object({
   }),
   tavily: withEmptyDefault(z.object({ apiKey: z.string().optional() })),
   voice: withEmptyDefault(z.object({
-    groqApiKey: z.string().optional(),
-    openaiApiKey: z.string().optional(),
+    cartesiaApiKey: z.string().optional(),
+    cartesiaVoiceId: z.string().default("694f9389-aac1-45b6-b726-9d9369183238"),
   })),
   telegram: withEmptyDefault(z.object({
     token: z.string().optional(),
@@ -57,7 +59,7 @@ const ConfigSchema = z.object({
     dir: z.string().default("./config/soul.d"),
   })),
   scheduler: withEmptyDefault(z.object({
-    timezone: z.string().default("America/Los_Angeles"),
+    timezone: z.string().refine(validateTimezone, "Invalid timezone").default("America/Los_Angeles"),
   })),
   proactive: withEmptyDefault(z.object({
     tickIntervalMs: z.number().min(10_000).default(30_000),
@@ -99,15 +101,18 @@ function resolvePath(p: string, base: string): string {
 }
 
 function applyEnvOverrides(raw: Record<string, unknown>): Record<string, unknown> {
-  const env = typeof Bun !== "undefined" ? Bun.env : process.env;
+  const env = {
+    ...(typeof Bun !== "undefined" ? Bun.env : {}),
+    ...process.env,
+  } as Record<string, string | undefined>;
 
   const mappings: [string, string[]][] = [
     ["KODA_OPENROUTER_API_KEY", ["openrouter", "apiKey"]],
     ["KODA_SUPERMEMORY_API_KEY", ["supermemory", "apiKey"]],
     ["KODA_TAVILY_API_KEY", ["tavily", "apiKey"]],
     ["KODA_TELEGRAM_TOKEN", ["telegram", "token"]],
-    ["KODA_GROQ_API_KEY", ["voice", "groqApiKey"]],
-    ["KODA_OPENAI_API_KEY", ["voice", "openaiApiKey"]],
+    ["KODA_CARTESIA_API_KEY", ["voice", "cartesiaApiKey"]],
+    ["KODA_CARTESIA_VOICE_ID", ["voice", "cartesiaVoiceId"]],
   ];
 
   function setNested(obj: Record<string, unknown>, path: string[], value: unknown): void {
@@ -132,6 +137,12 @@ function applyEnvOverrides(raw: Record<string, unknown>): Record<string, unknown
 }
 
 export async function loadConfig(configPath?: string): Promise<Config> {
+  // Load ~/.koda/.env first, then project .env.
+  // Precedence: shell/runtime vars > project .env > workspace .env.
+  const protectedEnvKeys = new Set(Object.keys(process.env));
+  loadEnvFromFiles([resolve(homedir(), ".koda", ".env")], false, protectedEnvKeys);
+  loadEnvFromFiles([resolve(process.cwd(), ".env")], true, protectedEnvKeys);
+
   checkEnvPermissions();
 
   const searchPaths = [

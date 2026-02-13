@@ -168,6 +168,39 @@ export class SoulLoader {
     return parts.join("\n\n");
   }
 
+  async saveSoul(): Promise<void> {
+    const content = this.serialize(this.soul);
+    await Bun.write(this.soulPath, content);
+    this.rawContent = content;
+  }
+
+  private serialize(soul: SoulDocument): string {
+    const lines: string[] = [
+      "# Koda",
+      "",
+      `name: ${soul.identity.name}`,
+      "",
+      "## Core Values",
+      ...soul.coreValues.map((v) => `- ${v}`),
+      "",
+      "## Personality",
+      `style: ${soul.personality.style}`,
+      `tone: ${soul.personality.tone}`,
+      ...soul.personality.quirks.map((q) => `- ${q}`),
+      "",
+      "## Boundaries",
+      ...soul.boundaries.map((b) => `- ${b}`),
+      "",
+      "## Protocol",
+      ...soul.protocol.map((p) => `- ${p}`),
+      "",
+      "## Response Style",
+      ...soul.responseStyle.map((r) => `- ${r}`),
+      "",
+    ];
+    return lines.join("\n");
+  }
+
   dispose(): void {
     this.watcher?.close();
     this.dirWatcher?.close();
@@ -227,6 +260,8 @@ export function registerSoulTools(deps: { soulLoader: SoulLoader }): ToolSet {
         if (idx === -1) return { success: false, error: "Item not found" };
         list.splice(idx, 1);
       }
+
+      await soulLoader.saveSoul();
 
       return { success: true, section, action, item };
     },

@@ -10,10 +10,10 @@ import ora from "ora";
 import { writeFile, readFile, chmod, access, stat } from "fs/promises";
 import { resolve } from "path";
 import { homedir } from "os";
-import { spawn } from "child_process";
 import { validateTimezone } from "./time.js";
+import { readEnvFile } from "./env.js";
 
-const VERSION = "1.0.0";
+const VERSION = "1.0.1";
 const REPO = "ImTheMars/koda";
 
 function getWorkspacePath(): string {
@@ -76,20 +76,25 @@ async function runSetup(): Promise<void> {
   else { keySpinner.fail("key rejected"); return; }
 
   // Supermemory key
-  const supermemoryKey = await clack.text({ message: "Supermemory API key:", placeholder: "optional" });
+  const supermemoryKey = await clack.text({
+    message: "Supermemory API key:",
+    validate: (v) => v ? undefined : "Required",
+  });
   if (clack.isCancel(supermemoryKey)) { clack.outro("cancelled"); return; }
 
   // Tavily key
   const tavilyKey = await clack.text({ message: "Tavily API key (for web search):", placeholder: "optional" });
   if (clack.isCancel(tavilyKey)) { clack.outro("cancelled"); return; }
 
-  // Groq key (voice)
-  const groqKey = await clack.text({ message: "Groq API key (for voice STT):", placeholder: "optional" });
-  if (clack.isCancel(groqKey)) { clack.outro("cancelled"); return; }
+  // Cartesia key (voice TTS)
+  const cartesiaKey = await clack.text({ message: "Cartesia API key (for voice TTS):", placeholder: "optional" });
+  if (clack.isCancel(cartesiaKey)) { clack.outro("cancelled"); return; }
 
-  // OpenAI key (voice TTS)
-  const openaiKey = await clack.text({ message: "OpenAI API key (for voice TTS):", placeholder: "optional" });
-  if (clack.isCancel(openaiKey)) { clack.outro("cancelled"); return; }
+  const cartesiaVoiceId = await clack.text({
+    message: "Cartesia voice ID:",
+    placeholder: "694f9389-aac1-45b6-b726-9d9369183238",
+  });
+  if (clack.isCancel(cartesiaVoiceId)) { clack.outro("cancelled"); return; }
 
   // Telegram (conditional)
   let telegramToken = "";
@@ -107,10 +112,14 @@ async function runSetup(): Promise<void> {
   // Timezone
   let timezone: string;
   try { timezone = Intl.DateTimeFormat().resolvedOptions().timeZone; } catch { timezone = "UTC"; }
+  if (!validateTimezone(timezone)) timezone = "UTC";
   const useDetected = await clack.confirm({ message: `Use detected timezone ${chalk.cyan(timezone)}?` });
   if (clack.isCancel(useDetected)) { clack.outro("cancelled"); return; }
   if (!useDetected) {
-    const tz = await clack.text({ message: "Timezone (e.g. America/New_York):" });
+    const tz = await clack.text({
+      message: "Timezone (e.g. America/New_York):",
+      validate: (v) => validateTimezone(v) ? undefined : "Invalid timezone",
+    });
     if (clack.isCancel(tz)) { clack.outro("cancelled"); return; }
     timezone = tz as string;
   }
@@ -122,10 +131,10 @@ async function runSetup(): Promise<void> {
   const envPath = resolve(workspace, ".env");
   const envLines: string[] = [];
   envLines.push(`KODA_OPENROUTER_API_KEY=${openrouterKey}`);
-  if (supermemoryKey) envLines.push(`KODA_SUPERMEMORY_API_KEY=${supermemoryKey}`);
+  envLines.push(`KODA_SUPERMEMORY_API_KEY=${supermemoryKey}`);
   if (tavilyKey) envLines.push(`KODA_TAVILY_API_KEY=${tavilyKey}`);
-  if (groqKey) envLines.push(`KODA_GROQ_API_KEY=${groqKey}`);
-  if (openaiKey) envLines.push(`KODA_OPENAI_API_KEY=${openaiKey}`);
+  if (cartesiaKey) envLines.push(`KODA_CARTESIA_API_KEY=${cartesiaKey}`);
+  if (cartesiaVoiceId) envLines.push(`KODA_CARTESIA_VOICE_ID=${cartesiaVoiceId}`);
   if (telegramToken) envLines.push(`KODA_TELEGRAM_TOKEN=${telegramToken}`);
   await writeFile(envPath, envLines.join("\n") + "\n", "utf-8");
   try { await chmod(envPath, 0o600); } catch {}
@@ -153,6 +162,8 @@ async function runDoctor(): Promise<void> {
   clack.intro(chalk.cyan("koda doctor"));
 
   const workspace = getWorkspacePath();
+  const workspaceEnv = readEnvFile(resolve(workspace, ".env"));
+  const getEnv = (key: string) => process.env[key] ?? Bun.env[key] ?? workspaceEnv[key];
   let failures = 0;
   let warnings = 0;
 
@@ -177,15 +188,15 @@ async function runDoctor(): Promise<void> {
       catch { return { status: "ok", detail: ".env permissions (skipped)" }; }
     }},
     { label: "OpenRouter API", async run() {
-      const key = process.env.KODA_OPENROUTER_API_KEY ?? Bun.env.KODA_OPENROUTER_API_KEY;
+      const key = getEnv("KODA_OPENROUTER_API_KEY");
       if (!key) return { status: "fail", detail: "OpenRouter API key not set" };
       try { const res = await fetch("https://openrouter.ai/api/v1/models", { headers: { Authorization: `Bearer ${key}` }, signal: AbortSignal.timeout(10_000) });
         return res.ok ? { status: "ok", detail: "OpenRouter reachable" } : { status: "fail", detail: `OpenRouter returned ${res.status}` }; }
       catch (e) { return { status: "fail", detail: `OpenRouter unreachable` }; }
     }},
     { label: "Supermemory", async run() {
-      const key = process.env.KODA_SUPERMEMORY_API_KEY ?? Bun.env.KODA_SUPERMEMORY_API_KEY;
-      return key ? { status: "ok", detail: "Supermemory key present" } : { status: "warn", detail: "Supermemory key not set" };
+      const key = getEnv("KODA_SUPERMEMORY_API_KEY");
+      return key ? { status: "ok", detail: "Supermemory key present" } : { status: "fail", detail: "Supermemory key not set" };
     }},
     { label: "SQLite", async run() {
       try { const p = resolve(workspace, "koda.db.test"); await writeFile(p, "", "utf-8"); const { unlink } = await import("fs/promises"); await unlink(p);
@@ -306,4 +317,17 @@ export async function runCli(command: string): Promise<void> {
     case "version": runVersion(); break;
     default: console.log(`Unknown command: ${command}\nAvailable: setup, doctor, upgrade, version`);
   }
+}
+
+if (import.meta.main) {
+  const command = process.argv[2];
+  if (!command) {
+    console.log("Usage: koda <setup|doctor|upgrade|version>");
+    process.exit(1);
+  }
+
+  runCli(command).catch((err) => {
+    console.error(err instanceof Error ? err.message : String(err));
+    process.exit(1);
+  });
 }

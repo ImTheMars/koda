@@ -35,17 +35,30 @@ export function parseCronNext(schedule: string, from: Date, tz: string): Date {
   let timeStr: string;
 
   if (parts.length === 2) {
-    targetDays = parts[0]!.toLowerCase().split(",")
-      .map((d) => DAY_MAP[d.trim()])
-      .filter((d): d is number => d !== undefined);
+    const rawDays = parts[0]!.toLowerCase().split(",").map((d) => d.trim()).filter(Boolean);
+    if (rawDays.length === 0) throw new Error("Invalid schedule format");
+
+    targetDays = [];
+    for (const d of rawDays) {
+      const day = DAY_MAP[d];
+      if (day === undefined) throw new Error(`Invalid weekday token: ${d}`);
+      if (!targetDays.includes(day)) targetDays.push(day);
+    }
+
     timeStr = parts[1]!;
-  } else {
+  } else if (parts.length === 1) {
     timeStr = parts[0]!;
+  } else {
+    throw new Error("Invalid schedule format");
   }
 
+  if (!/^\d{1,2}:\d{2}$/.test(timeStr)) throw new Error("Invalid time format");
   const timeParts = timeStr.split(":").map(Number);
-  const targetH = timeParts[0] ?? 0;
-  const targetM = timeParts[1] ?? 0;
+  const targetH = timeParts[0] ?? -1;
+  const targetM = timeParts[1] ?? -1;
+  if (targetH < 0 || targetH > 23 || targetM < 0 || targetM > 59) {
+    throw new Error("Invalid time value");
+  }
   const { hour, minute, weekday } = nowInTz(from, tz);
   const currentMinutes = hour * 60 + minute;
   const targetMinutes = targetH * 60 + targetM;

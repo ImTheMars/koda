@@ -27,7 +27,7 @@ function recordSuccess(): void { failures = 0; }
 
 export interface MemoryProvider {
   store(userId: string, content: string, tags?: string[]): Promise<{ id: string }>;
-  recall(userId: string, query: string, limit?: number): Promise<string[]>;
+  recall(userId: string, query: string, limit?: number, sessionKey?: string): Promise<string[]>;
   delete(memoryId: string): Promise<boolean>;
   healthCheck(): Promise<boolean>;
   readonly isDegraded: boolean;
@@ -56,10 +56,10 @@ export function createMemoryProvider(apiKey: string): MemoryProvider {
       }
     },
 
-    async recall(userId, query, limit = 5) {
+    async recall(userId, query, limit = 5, sessionKey) {
       if (isCircuitOpen()) {
-        // SQLite fallback — keyword search on messages table
-        const history = dbMessages.getHistory(`telegram_${userId}`, 50);
+        // SQLite fallback — keyword search on session history
+        const history = dbMessages.getHistory(sessionKey ?? `telegram_${userId}`, 50);
         const lower = query.toLowerCase();
         return history
           .filter((m) => m.content.toLowerCase().includes(lower))
