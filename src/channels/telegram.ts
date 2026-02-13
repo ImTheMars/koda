@@ -7,6 +7,7 @@
 import { Bot } from "grammy";
 import type { Config } from "../config.js";
 import { messages as dbMessages, usage as dbUsage } from "../db.js";
+import { log } from "../log.js";
 
 export interface TelegramDeps {
   runAgent: (input: {
@@ -203,9 +204,10 @@ export function startTelegram(deps: TelegramDeps): { stop: () => Promise<void>; 
     const senderId = String(ctx.from?.id);
     if (!isAllowed(senderId)) return;
     const key = dedupKey(ctx.chat.id, ctx.message.message_id);
-    if (processedMessages.has(key)) return;
+    if (processedMessages.has(key)) { log("telegram", "dedup: text hash collision"); return; }
     processedMessages.add(key);
     const chatId = String(ctx.chat.id);
+    log("telegram", "text from=%s chat=%s len=%d", senderId, chatId, ctx.message.text.length);
     if (isRateLimited(chatId)) { await ctx.reply("slow down! you're sending messages too fast."); return; }
 
     const result = await deps.runAgent({
@@ -229,6 +231,7 @@ export function startTelegram(deps: TelegramDeps): { stop: () => Promise<void>; 
     if (processedMessages.has(key)) return;
     processedMessages.add(key);
     const chatId = String(ctx.chat.id);
+    log("telegram", "voice from=%s chat=%s", senderId, chatId);
     if (isRateLimited(chatId)) { await ctx.reply("slow down!"); return; }
 
     try {
@@ -242,6 +245,7 @@ export function startTelegram(deps: TelegramDeps): { stop: () => Promise<void>; 
 
       const transcription = await transcribe(buffer);
       if (!transcription) { await ctx.reply("I couldn't transcribe that audio."); return; }
+      log("telegram", "stt: %d chars", transcription.length);
 
       const result = await deps.runAgent({
         content: transcription,
@@ -257,8 +261,10 @@ export function startTelegram(deps: TelegramDeps): { stop: () => Promise<void>; 
       // Voice reply first, text as fallback
       const audioBuffer = await synthesize(result.text.replace(/\|\|\|/g, " ").slice(0, 4096));
       if (audioBuffer) {
+        log("telegram", "tts: %d bytes", audioBuffer.length);
         await ctx.replyWithVoice(new Blob([new Uint8Array(audioBuffer)], { type: "audio/mpeg" }) as any);
       } else {
+        log("telegram", "tts: unavailable, text fallback");
         await sendReply(Number(chatId), result.text);
       }
     } catch (err) {
@@ -275,6 +281,7 @@ export function startTelegram(deps: TelegramDeps): { stop: () => Promise<void>; 
     if (processedMessages.has(key)) return;
     processedMessages.add(key);
     const chatId = String(ctx.chat.id);
+    log("telegram", "photo from=%s chat=%s", senderId, chatId);
     if (isRateLimited(chatId)) { await ctx.reply("slow down!"); return; }
 
     const caption = ctx.message.caption ?? "What's in this image?";

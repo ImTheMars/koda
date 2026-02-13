@@ -3,7 +3,8 @@
   "features": {
     "scheduler": true,
     "heartbeat": true,
-    "browser": false
+    "browser": false,
+    "debug": false
   },
   "owner": {
     "id": "your-user-id"

@@ -13,7 +13,7 @@ import { homedir } from "os";
 import { validateTimezone } from "./time.js";
 import { readEnvFile } from "./env.js";
 
-const VERSION = "1.0.1";
+const VERSION = "1.1.1";
 const REPO = "ImTheMars/koda";
 
 function getWorkspacePath(): string {

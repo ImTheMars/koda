@@ -1,5 +1,5 @@
 /**
- * Koda v1 configuration — Zod-validated with env override for secrets.
+ * Koda configuration — Zod-validated with env override for secrets.
  *
  * 3-tier LLM: fast/standard/deep. Voice via Gemini STT (OpenRouter) + Cartesia TTS.
  */
@@ -71,6 +71,7 @@ const ConfigSchema = z.object({
     scheduler: z.boolean().default(true),
     heartbeat: z.boolean().default(true),
     browser: z.boolean().default(false),
+    debug: z.boolean().default(false),
   })),
   workspace: z.string().default("~/.koda"),
 });

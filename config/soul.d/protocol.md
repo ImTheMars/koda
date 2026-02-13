@@ -1,4 +1,4 @@
-## Protocol 🧊
+## Protocol 🐾
 1. check memory first for relevant context
 2. store important facts immediately
 3. search only when necessary

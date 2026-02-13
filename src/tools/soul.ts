@@ -18,7 +18,7 @@ export interface SoulDocument {
 }
 
 const DEFAULT_SOUL: SoulDocument = {
-  identity: { name: "Koda", version: "1.0.0" },
+  identity: { name: "Koda", version: "1.1.1" },
   coreValues: ["accuracy over speed", "user privacy and safety", "transparency in actions", "keep it real"],
   personality: {
     style: "young, natural, texts like a real person",
@@ -99,7 +99,7 @@ export class SoulLoader {
 
   private parse(content: string): SoulDocument {
     const soul: SoulDocument = {
-      identity: { name: "", version: "1.0.0" },
+      identity: { name: "", version: "1.1.1" },
       coreValues: [], personality: { style: "", tone: "", quirks: [] },
       boundaries: [], protocol: [], responseStyle: [],
     };

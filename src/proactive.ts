@@ -8,6 +8,7 @@ import { join } from "path";
 import type { Config } from "./config.js";
 import { tasks as dbTasks, messages as dbMessages } from "./db.js";
 import { parseCronNext, isActiveHours } from "./time.js";
+import { log } from "./log.js";
 
 const HEARTBEAT_INTERVAL_MS = 30 * 60 * 1000;
 
@@ -53,6 +54,7 @@ export function startProactive(deps: ProactiveDeps): { stop: () => void } {
     const ready = dbTasks.getReady(now.toISOString());
 
     for (const task of ready) {
+      log("proactive", "task: %s", task.description);
       if (task.type === "reminder") {
         const text = task.prompt ?? task.description;
         await deps.sendDirect(task.channel, task.chatId, text);
@@ -89,8 +91,22 @@ export function startProactive(deps: ProactiveDeps): { stop: () => void } {
       if (hash === lastHeartbeatHash) return;
       lastHeartbeatHash = hash;
 
+      const pending: string[] = [];
+      const completed: string[] = [];
+      for (const line of content.split("\n")) {
+        const trimmed = line.trim();
+        if (/^[-*]\s*\[\s\]/.test(trimmed)) pending.push(trimmed.replace(/^[-*]\s*\[\s\]\s*/, ""));
+        else if (/^[-*]\s*\[x\]/i.test(trimmed)) completed.push(trimmed.replace(/^[-*]\s*\[x\]\s*/i, ""));
+      }
+
+      log("proactive", "heartbeat: %d pending %d completed", pending.length, completed.length);
+      if (pending.length === 0) return;
+
+      const taskList = pending.map((t, i) => `${i + 1}. ${t}`).join("\n");
+      const prompt = `[heartbeat] you have ${pending.length} pending task${pending.length > 1 ? "s" : ""}${completed.length ? ` (${completed.length} completed)` : ""}. review and act on them:\n\n${taskList}`;
+
       await deps.runAgent({
-        content: `[heartbeat] check your task list and act on any pending items:\n\n${content}`,
+        content: prompt,
         senderId: defaultUserId,
         chatId: defaultChatId,
         channel: defaultChannel,
@@ -103,6 +119,7 @@ export function startProactive(deps: ProactiveDeps): { stop: () => void } {
   };
 
   const tick = async () => {
+    log("proactive", "tick");
     if (!isActiveHours(config.scheduler.timezone, config.proactive.activeHoursStart, config.proactive.activeHoursEnd)) return;
 
     if (config.features.scheduler) await checkTasks();

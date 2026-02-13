@@ -6,6 +6,7 @@ import { tool, type ToolSet } from "ai";
 import { z } from "zod";
 import Supermemory from "supermemory";
 import { messages as dbMessages } from "../db.js";
+import { log } from "../log.js";
 
 // --- Circuit breaker (inline) ---
 
@@ -40,7 +41,8 @@ export function createMemoryProvider(apiKey: string): MemoryProvider {
     get isDegraded() { return isCircuitOpen(); },
 
     async store(userId, content, tags) {
-      if (isCircuitOpen()) return { id: "unavailable" };
+      if (isCircuitOpen()) { log("memory", "circuit breaker tripped"); return { id: "unavailable" }; }
+      log("memory", "store key=%s", content.slice(0, 80));
       try {
         const result = await client.memories.add({
           content,
@@ -58,6 +60,7 @@ export function createMemoryProvider(apiKey: string): MemoryProvider {
 
     async recall(userId, query, limit = 5, sessionKey) {
       if (isCircuitOpen()) {
+        log("memory", "sqlite fallback");
         // SQLite fallback — keyword search on session history
         const history = dbMessages.getHistory(sessionKey ?? `telegram_${userId}`, 50);
         const lower = query.toLowerCase();
@@ -69,6 +72,7 @@ export function createMemoryProvider(apiKey: string): MemoryProvider {
       try {
         const response = await client.search.memories({ q: query, containerTag: `user-${userId}`, limit });
         recordSuccess();
+        log("memory", "recall: %d results", response.results.length);
         return response.results.map((r) => r.memory ?? "");
       } catch (err) {
         recordFailure();

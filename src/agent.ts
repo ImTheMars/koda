@@ -11,6 +11,7 @@ import { classifyTier, classifyIntent, getModelId, calculateCost, shouldAck, FAI
 import { messages as dbMessages, usage as dbUsage, learnings as dbLearnings } from "./db.js";
 import { formatUserTime } from "./time.js";
 import { withToolContext } from "./tools/index.js";
+import { log } from "./log.js";
 
 export interface AgentInput {
   content: string;
@@ -128,9 +129,11 @@ export function createAgent(deps: AgentDeps) {
   return async function runAgent(input: AgentInput): Promise<AgentResult> {
     const tier = classifyTier(input.content);
     const intent = classifyIntent(input.content);
+    const willAck = shouldAck({ content: input.content, tier, intent, source: input.source });
+    log("agent", "tier=%s intent=%s ack=%s len=%d", tier, intent, willAck, input.content.length);
 
     // Ack decision
-    if (input.onAck && shouldAck({ content: input.content, tier, intent, source: input.source })) {
+    if (input.onAck && willAck) {
       const ackMsg = ACK_TEMPLATES[Math.abs(Number(Bun.hash(input.chatId))) % ACK_TEMPLATES.length]!;
       input.onAck(ackMsg);
     }
@@ -173,6 +176,7 @@ export function createAgent(deps: AgentDeps) {
         channel: input.channel,
       }, async () => {
         const modelId = getModelId(currentTier, config);
+        log("agent", "model=%s session=%s", modelId, input.sessionKey);
         const fallbackIds = FAILOVER[currentTier] ?? [];
         const model = provider(modelId, { models: fallbackIds });
 
@@ -192,6 +196,7 @@ export function createAgent(deps: AgentDeps) {
             if (stepNumber > 10 && messageList.length > 8) {
               const keep = 6;
               const removed = messageList.length - keep;
+              log("agent", "compacted %d msgs", removed);
               messageList.splice(0, removed, {
                 role: "user" as const,
                 content: `[${removed} earlier messages compacted]`,
@@ -204,6 +209,7 @@ export function createAgent(deps: AgentDeps) {
               if (idx < tierOrder.length - 1) {
                 currentTier = tierOrder[idx + 1]!;
                 const newModelId = getModelId(currentTier, config);
+                log("agent", "escalated tier=%s model=%s", currentTier, newModelId);
                 const newFallbacks = FAILOVER[currentTier] ?? [];
                 return { model: provider(newModelId, { models: newFallbacks }) };
               }
@@ -212,7 +218,10 @@ export function createAgent(deps: AgentDeps) {
           },
           onStepFinish: async (step) => {
             if (step.toolCalls) {
-              for (const call of step.toolCalls) toolsUsed.push(call.toolName);
+              for (const call of step.toolCalls) {
+                toolsUsed.push(call.toolName);
+                log("agent", "step %d tool=%s", stepCount, call.toolName);
+              }
             }
           },
         });
@@ -221,6 +230,8 @@ export function createAgent(deps: AgentDeps) {
         const promptTokens = result.usage?.inputTokens ?? 0;
         const completionTokens = result.usage?.outputTokens ?? 0;
         const cost = calculateCost(finalModelId, promptTokens, completionTokens);
+
+        log("agent", "done tokens=%d/%d cost=$%s tools=[%s]", promptTokens, completionTokens, cost.toFixed(4), [...new Set(toolsUsed)].join(","));
 
         // Track usage
         dbUsage.track({

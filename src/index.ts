@@ -1,5 +1,5 @@
 /**
- * Koda v1 — composition root.
+ * Koda — composition root.
  *
  * loadConfig → initDb → init providers → build tools → register channels → start proactive
  */
@@ -16,6 +16,7 @@ import { startRepl } from "./channels/repl.js";
 import { startTelegram } from "./channels/telegram.js";
 import { startProactive } from "./proactive.js";
 import { buildTools } from "./tools/index.js";
+import { enableDebug } from "./log.js";
 
 // --- CLI routing ---
 const command = process.argv[2];
@@ -27,6 +28,7 @@ if (command === "setup" || command === "doctor" || command === "upgrade" || comm
 
 // --- Boot ---
 const config = await loadConfig();
+if (config.features.debug) enableDebug();
 console.log(`[boot] Config loaded (mode: ${config.mode}, workspace: ${config.workspace})`);
 
 await mkdir(config.workspace, { recursive: true });
@@ -113,7 +115,7 @@ const server = Bun.serve({
   fetch(req) {
     const url = new URL(req.url);
     if (url.pathname === "/health") {
-      return Response.json({ status: "ok", version: "1.0.1", uptime: process.uptime() });
+      return Response.json({ status: "ok", version: "1.1.1", uptime: process.uptime() });
     }
     return new Response("Not found", { status: 404 });
   },

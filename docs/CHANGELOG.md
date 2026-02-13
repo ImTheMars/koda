@@ -4,6 +4,23 @@ all notable changes to koda.
 
 ---
 
+## v1.1.1 — dev logging + emoji tuning + cleanup (2026-02-13)
+
+small quality-of-life release. adds opt-in debug logging for the full message lifecycle, tones down emoji usage in soul files, and cleans up stale v1.0 references.
+
+### added
+
+- **debug logging** — set `"debug": true` in config.json `features` to enable `[tag]` console logs across the entire message lifecycle: tier/intent classification, model selection, context compaction, model escalation, tool calls, token usage + cost, telegram message routing, STT/TTS, proactive ticks, memory operations. zero-cost when disabled.
+- **`src/log.ts`** — tiny `log(tag, ...args)` helper. `enableDebug()` activates it on boot.
+
+### changed
+
+- **soul emoji cleanup** — removed all 🧊 usage (was 3 occurrences). 🐻‍❄️ kept where identity matters (3 uses). added one 🐾 on protocol header. emojis now used sparingly.
+- **version bump to 1.1.1** — updated `package.json`, health endpoint, soul default version, all file headers.
+- **header cleanup** — removed "v1" from file header comments in `src/config.ts`, `src/index.ts`, `.env.example`.
+
+---
+
 ## v1.1.0 — hardening + voice pipeline upgrade (2026-02-13)
 
 hardening release. ships all 8 v1.1 roadmap items plus a full voice pipeline swap.
