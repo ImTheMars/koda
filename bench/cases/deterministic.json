@@ -1,0 +1,371 @@
+{
+  "classify": [
+    {
+      "name": "simple greeting: hey",
+      "input": "hey",
+      "expectedTier": "fast",
+      "expectedIntent": "chat"
+    },
+    {
+      "name": "simple greeting: good morning",
+      "input": "good morning",
+      "expectedTier": "fast",
+      "expectedIntent": "chat"
+    },
+    {
+      "name": "simple greeting: gm",
+      "input": "gm",
+      "expectedTier": "fast",
+      "expectedIntent": "chat"
+    },
+    {
+      "name": "simple question: what is gravity",
+      "input": "what is gravity",
+      "expectedTier": "fast",
+      "expectedIntent": "chat"
+    },
+    {
+      "name": "simple question: define photosynthesis",
+      "input": "define photosynthesis",
+      "expectedTier": "fast",
+      "expectedIntent": "chat"
+    },
+    {
+      "name": "simple farewell: bye",
+      "input": "bye",
+      "expectedTier": "fast",
+      "expectedIntent": "chat"
+    },
+    {
+      "name": "simple thanks: thank you",
+      "input": "thank you",
+      "expectedTier": "fast",
+      "expectedIntent": "chat"
+    },
+    {
+      "name": "schedule: remind me tomorrow",
+      "input": "remind me tomorrow at 9am to call mom",
+      "expectedTier": "standard",
+      "expectedIntent": "schedule"
+    },
+    {
+      "name": "schedule: set daily reminder",
+      "input": "schedule a daily reminder to drink water",
+      "expectedTier": "standard",
+      "expectedIntent": "schedule"
+    },
+    {
+      "name": "schedule: recurring weekly",
+      "input": "remind me every week on monday to review my goals",
+      "expectedTier": "standard",
+      "expectedIntent": "schedule"
+    },
+    {
+      "name": "memory: remember my fav color",
+      "input": "remember that my favorite color is blue",
+      "expectedTier": "standard",
+      "expectedIntent": "memory"
+    },
+    {
+      "name": "memory: remember birthday",
+      "input": "remember, my birthday is march 15th",
+      "expectedTier": "standard",
+      "expectedIntent": "memory"
+    },
+    {
+      "name": "code: debug typescript",
+      "input": "debug this typescript function and explain the bug",
+      "expectedTier": "standard",
+      "expectedIntent": "code"
+    },
+    {
+      "name": "code: write async function",
+      "input": "write an async function that fetches data from an api and handles errors",
+      "expectedTier": "standard",
+      "expectedIntent": "code"
+    },
+    {
+      "name": "code: refactor class",
+      "input": "refactor this class to use typescript interfaces and add proper types",
+      "expectedTier": "standard",
+      "expectedIntent": "code"
+    },
+    {
+      "name": "code: SQL query",
+      "input": "write a SQL query that joins users and orders tables",
+      "expectedTier": "standard",
+      "expectedIntent": "code"
+    },
+    {
+      "name": "code: python debug",
+      "input": "debug this python function, it returns the wrong value",
+      "expectedTier": "standard",
+      "expectedIntent": "code"
+    },
+    {
+      "name": "research: compare frameworks",
+      "input": "research the latest frontend frameworks and compare their performance",
+      "expectedTier": "standard",
+      "expectedIntent": "research"
+    },
+    {
+      "name": "research: find sources",
+      "input": "find me sources about climate change impacts on agriculture",
+      "expectedTier": "fast",
+      "expectedIntent": "research"
+    },
+    {
+      "name": "task: fix setup",
+      "input": "fix the docker setup and make sure the containers are running properly",
+      "expectedTier": "fast",
+      "expectedIntent": "task"
+    },
+    {
+      "name": "reasoning: step by step proof",
+      "input": "prove step by step that the square root of 2 is irrational, formally derive it",
+      "expectedTier": "deep",
+      "expectedIntent": "chat"
+    },
+    {
+      "name": "reasoning: analyze and compare",
+      "input": "analyze this algorithm and compare and contrast its time complexity with merge sort, explain why one is better",
+      "expectedTier": "deep",
+      "expectedIntent": "research"
+    },
+    {
+      "name": "reasoning: chain of thought",
+      "input": "use chain of thought reasoning to deduce who the murderer is from these clues",
+      "expectedTier": "deep",
+      "expectedIntent": "chat"
+    },
+    {
+      "name": "creative: write a story",
+      "input": "write a short story about a robot learning to paint",
+      "expectedTier": "fast",
+      "expectedIntent": "chat"
+    },
+    {
+      "name": "creative: brainstorm ideas",
+      "input": "brainstorm 10 creative names for a coffee shop",
+      "expectedTier": "fast",
+      "expectedIntent": "chat"
+    },
+    {
+      "name": "multi-step: first then",
+      "input": "first research the best hiking trails in colorado, then create a 3-day itinerary",
+      "expectedTier": "standard",
+      "expectedIntent": "task"
+    },
+    {
+      "name": "technical: kubernetes deploy",
+      "input": "optimize the kubernetes deployment for our microservice architecture, need better database connection pooling and api endpoint caching",
+      "expectedTier": "fast",
+      "expectedIntent": "task"
+    },
+    {
+      "name": "long complex: full project plan",
+      "input": "I need you to help me build a full stack web application. First, set up the backend with express and postgresql. Then create the frontend with react and tailwind. The app should have user authentication, a dashboard, and an api for managing projects. I also need docker deployment scripts and CI/CD pipeline configuration. Let's start with the database schema and work our way up.",
+      "expectedTier": "standard",
+      "expectedIntent": "task"
+    },
+    {
+      "name": "search: look up current info",
+      "input": "search for the latest news about SpaceX launches",
+      "expectedTier": "standard",
+      "expectedIntent": "research"
+    },
+    {
+      "name": "browse: open url",
+      "input": "browse this url and tell me what it says: https://example.com",
+      "expectedTier": "standard",
+      "expectedIntent": "chat"
+    }
+  ],
+  "ack": [
+    {
+      "name": "heavy multi-step task should ack",
+      "input": {
+        "content": "first research three options then compare cost and reliability and give me a plan",
+        "tier": "standard",
+        "intent": "research"
+      },
+      "expected": true
+    },
+    {
+      "name": "complex code task should ack",
+      "input": {
+        "content": "refactor the entire authentication module to use JWT tokens and add refresh token rotation",
+        "tier": "standard",
+        "intent": "code"
+      },
+      "expected": true
+    },
+    {
+      "name": "research with multiple steps should ack",
+      "input": {
+        "content": "research the top 5 cloud providers, compare their pricing for a small startup, then give me a recommendation",
+        "tier": "standard",
+        "intent": "research"
+      },
+      "expected": true
+    },
+    {
+      "name": "short simple message should not ack",
+      "input": {
+        "content": "thanks",
+        "tier": "fast",
+        "intent": "chat"
+      },
+      "expected": false
+    },
+    {
+      "name": "simple greeting should not ack",
+      "input": {
+        "content": "hey whats up",
+        "tier": "fast",
+        "intent": "chat"
+      },
+      "expected": false
+    },
+    {
+      "name": "scheduler message should not ack",
+      "input": {
+        "content": "[scheduled task] daily report",
+        "source": "scheduler",
+        "tier": "standard",
+        "intent": "task"
+      },
+      "expected": false
+    },
+    {
+      "name": "simple question should not ack",
+      "input": {
+        "content": "what time is it",
+        "tier": "fast",
+        "intent": "chat"
+      },
+      "expected": false
+    },
+    {
+      "name": "standard task without multi-step should not ack",
+      "input": {
+        "content": "remind me tomorrow to buy groceries",
+        "tier": "standard",
+        "intent": "schedule"
+      },
+      "expected": false
+    },
+    {
+      "name": "ok acknowledgement should not ack",
+      "input": {
+        "content": "ok",
+        "tier": "fast",
+        "intent": "chat"
+      },
+      "expected": false
+    },
+    {
+      "name": "long reasoning task should ack",
+      "input": {
+        "content": "analyze this codebase architecture, identify potential bottlenecks, and propose a refactoring strategy with step-by-step migration plan",
+        "tier": "deep",
+        "intent": "code"
+      },
+      "expected": true
+    }
+  ],
+  "time": [
+    {
+      "name": "daily: 09:00 UTC, before target",
+      "schedule": "09:00",
+      "fromISO": "2026-02-10T07:00:00Z",
+      "timezone": "UTC",
+      "expectedDateISO": "2026-02-10T09:00:00Z",
+      "toleranceMs": 60000
+    },
+    {
+      "name": "daily: 09:00 UTC, after target (next day)",
+      "schedule": "09:00",
+      "fromISO": "2026-02-10T10:00:00Z",
+      "timezone": "UTC",
+      "expectedDateISO": "2026-02-11T09:00:00Z",
+      "toleranceMs": 60000
+    },
+    {
+      "name": "daily: 14:30 US Eastern",
+      "schedule": "14:30",
+      "fromISO": "2026-02-10T15:00:00Z",
+      "timezone": "America/New_York",
+      "expectedDateISO": "2026-02-10T19:30:00Z",
+      "toleranceMs": 60000
+    },
+    {
+      "name": "weekday: mon,wed,fri 08:00 UTC from Tuesday",
+      "schedule": "mon,wed,fri 08:00",
+      "fromISO": "2026-02-10T06:00:00Z",
+      "timezone": "UTC",
+      "expectedDateISO": "2026-02-11T08:00:00Z",
+      "toleranceMs": 60000
+    },
+    {
+      "name": "weekday: mon 10:00 UTC from Monday before time",
+      "schedule": "mon 10:00",
+      "fromISO": "2026-02-09T08:00:00Z",
+      "timezone": "UTC",
+      "expectedDateISO": "2026-02-09T10:00:00Z",
+      "toleranceMs": 60000
+    }
+  ],
+  "timezoneValidation": [
+    {
+      "name": "valid: America/New_York",
+      "timezone": "America/New_York",
+      "expectedValid": true
+    },
+    {
+      "name": "valid: Europe/London",
+      "timezone": "Europe/London",
+      "expectedValid": true
+    },
+    {
+      "name": "valid: Asia/Tokyo",
+      "timezone": "Asia/Tokyo",
+      "expectedValid": true
+    },
+    {
+      "name": "valid: UTC",
+      "timezone": "UTC",
+      "expectedValid": true
+    },
+    {
+      "name": "valid: America/Los_Angeles",
+      "timezone": "America/Los_Angeles",
+      "expectedValid": true
+    },
+    {
+      "name": "invalid: Fake/Timezone",
+      "timezone": "Fake/Timezone",
+      "expectedValid": false
+    },
+    {
+      "name": "invalid: empty string",
+      "timezone": "",
+      "expectedValid": false
+    },
+    {
+      "name": "valid-but-legacy: EST abbreviation",
+      "timezone": "EST",
+      "expectedValid": true
+    },
+    {
+      "name": "valid: Pacific/Auckland",
+      "timezone": "Pacific/Auckland",
+      "expectedValid": true
+    },
+    {
+      "name": "invalid: random string",
+      "timezone": "notavalidtimezone",
+      "expectedValid": false
+    }
+  ]
+}

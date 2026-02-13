@@ -1,0 +1,24 @@
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Secrets — never commit
+.env
+.env.local
+.env.*.local
+
+# User config (create from config.example.json)
+config/config.json
+
+# Runtime data
+workspace/
+bun.lock
+
+# Database
+*.db
+*.db-wal
+*.db-shm
+
+# IDE / local config
+.claude/
+.cursor/
