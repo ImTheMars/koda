@@ -12,14 +12,15 @@ what's coming next for koda. ordered roughly by priority.
 
 things that should have shipped in v1 but didn't make the cut. all small, all high-impact.
 
-- [ ] **telegram voice reply** — currently koda transcribes voice notes but replies with text. wire up TTS so voice messages get voice replies end-to-end. the `sendVoice` path is already in telegram.ts, just needs the reply trigger.
-- [ ] **docker-compose** — added. mount workspace volume + config as read-only. production-ready with health checks and restart policy.
-- [ ] **context compaction** — when tool step count exceeds 10, compact older messages in the conversation to free up context window. the `prepareStep` hook is already there, just needs the compaction logic.
-- [ ] **usage dashboard** — `/usage` command in telegram that shows token counts, costs by tier, and cost trends over the last 7/30 days. the data is already in the usage table.
-- [ ] **heartbeat file** — the proactive system checks for HEARTBEAT.md but the file format and agent assessment loop aren't wired up yet.
-- [ ] **skill hot-reload** — skills load at boot but don't watch for file changes. add file watcher like soul.md has.
-- [ ] **message dedup by hash** — current dedup is time-based. switch to content hash to prevent exact duplicates regardless of timing.
-- [ ] **graceful telegram reconnect** — grammy handles most reconnection but long network outages can leave the bot dead. add exponential backoff retry.
+- [x] **telegram voice reply** — voice messages now get voice-only replies (cartesia sonic 3 TTS). text fallback when TTS unavailable.
+- [x] **docker-compose** — added. mount workspace volume + config as read-only. production-ready with health checks and restart policy.
+- [x] **context compaction** — when tool step count exceeds 10, older messages are spliced to keep the last 6. prevents context window exhaustion on deep tool chains.
+- [x] **usage dashboard** — `/usage` command in telegram shows today/month/all-time request counts and costs.
+- [x] **heartbeat file** — heartbeat now parses `- [ ]` / `- [x]` checkboxes, sends only pending items with structured count to agent.
+- [x] **skill hot-reload** — no-op: skills already reload on-demand. `loadSkill()` reads fresh every call, no cache to invalidate.
+- [x] **message dedup by hash** — switched from message_id to content hash via `Bun.hash()`. identical content with different IDs now correctly deduped.
+- [x] **graceful telegram reconnect** — exponential backoff retry loop with jitter. consecutive error tracking auto-restarts bot after 5 failures.
+- [x] **voice pipeline upgrade** — STT moved from groq whisper to gemini 3 flash via openrouter (reuses existing API key). TTS moved from openai tts-1 to cartesia sonic 3 (lower latency, better quality).
 
 ## v1.2 — learning + adaptive routing
 

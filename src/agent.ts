@@ -244,11 +244,12 @@ export function createAgent(deps: AgentDeps) {
         });
 
         // Persist messages
+        const fallback = "aight that's handled.";
         dbMessages.append(input.sessionKey, "user", input.content);
-        dbMessages.append(input.sessionKey, "assistant", result.text || "done.", [...new Set(toolsUsed)]);
+        dbMessages.append(input.sessionKey, "assistant", result.text || fallback, [...new Set(toolsUsed)]);
 
         return {
-          text: result.text || "done.",
+          text: result.text || fallback,
           tier: currentTier,
           toolsUsed: [...new Set(toolsUsed)],
           usage: { promptTokens, completionTokens, cost },

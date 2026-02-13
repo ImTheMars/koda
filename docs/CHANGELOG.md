@@ -4,6 +4,23 @@ all notable changes to koda.
 
 ---
 
+## v1.1.2 — reminder reliability + character consistency (2026-02-13)
+
+fixes reminders silently failing outside active hours (8am–11pm) and the bot breaking character when apologizing.
+
+### fixed
+
+- **reminders now fire 24/7** — `checkTasks()` was gated behind `isActiveHours()`, so any reminder set for nighttime (e.g. 1:19 AM) would silently never fire. scheduler checks are now outside the active hours gate; only the heartbeat respects quiet hours.
+- **near-term reminder precision** — reminders set < 5 minutes out now get a precise `setTimeout` via `scheduleNudge()` instead of relying on the 30s poll interval. "remind me in 1 min" fires on time, not up to 30s late.
+- **"done." fallback** — when the LLM returned empty text, the agent sent the literal string "done." which confused users. replaced with "aight that's handled." to stay in character.
+
+### changed
+
+- **soul: error/apology guidance** — added 4 rules to `response.md` for handling mistakes in-character: own it casually, never apologize formally, stay lowercase, don't over-explain.
+- **version bump to 1.1.2** — updated `package.json` and health endpoint.
+
+---
+
 ## v1.1.1 — dev logging + emoji tuning + cleanup (2026-02-13)
 
 small quality-of-life release. adds opt-in debug logging for the full message lifecycle, tones down emoji usage in soul files, and cleans up stale v1.0 references.

@@ -115,7 +115,7 @@ const server = Bun.serve({
   fetch(req) {
     const url = new URL(req.url);
     if (url.pathname === "/health") {
-      return Response.json({ status: "ok", version: "1.1.1", uptime: process.uptime() });
+      return Response.json({ status: "ok", version: "1.1.2", uptime: process.uptime() });
     }
     return new Response("Not found", { status: 404 });
   },

@@ -6,6 +6,7 @@ import { tool, type ToolSet } from "ai";
 import { z } from "zod";
 import { tasks as dbTasks } from "../db.js";
 import { parseCronNext } from "../time.js";
+import { scheduleNudge } from "../proactive.js";
 
 export function registerScheduleTools(deps: {
   timezone: string;
@@ -31,6 +32,9 @@ export function registerScheduleTools(deps: {
         userId: getUserId(), nextRunAt: nextRunAt.toISOString(), prompt: description,
         description, enabled: true, oneShot: true,
       });
+
+      // Near-term reminders get a precise setTimeout so they fire on time, not up to 30s late
+      scheduleNudge(nextRunAt);
 
       return { success: true, id, firesAt: nextRunAt.toISOString(), description };
     },

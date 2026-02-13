@@ -11,8 +11,29 @@ import { parseCronNext, isActiveHours } from "./time.js";
 import { log } from "./log.js";
 
 const HEARTBEAT_INTERVAL_MS = 30 * 60 * 1000;
+const NEAR_TERM_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes
 
 const INITIAL_HEARTBEAT = `# tasks\n\nadd tasks below. koda checks this every 30 minutes.\n\n- [ ] example: research flights to tokyo\n`;
+
+// Module-level nudge — allows schedule tools to trigger a precise check for near-term reminders
+let _checkTasksFn: (() => Promise<void>) | null = null;
+const _pendingTimers = new Set<ReturnType<typeof setTimeout>>();
+
+/**
+ * Schedule a precise check at the given time (for near-term reminders).
+ * Falls back gracefully to the regular tick if proactive hasn't started yet.
+ */
+export function scheduleNudge(at: Date): void {
+  if (!_checkTasksFn) return;
+  const delayMs = Math.max(0, at.getTime() - Date.now());
+  if (delayMs > NEAR_TERM_THRESHOLD_MS) return; // only for near-term; regular tick handles the rest
+  const fn = _checkTasksFn;
+  const timer = setTimeout(() => {
+    _pendingTimers.delete(timer);
+    fn().catch(console.error);
+  }, delayMs);
+  _pendingTimers.add(timer);
+}
 
 export interface ProactiveDeps {
   runAgent: (input: { content: string; senderId: string; chatId: string; channel: string; sessionKey: string; source?: string }) => Promise<{ text: string }>;
@@ -120,9 +141,12 @@ export function startProactive(deps: ProactiveDeps): { stop: () => void } {
 
   const tick = async () => {
     log("proactive", "tick");
-    if (!isActiveHours(config.scheduler.timezone, config.proactive.activeHoursStart, config.proactive.activeHoursEnd)) return;
 
+    // Reminders ALWAYS fire — user explicitly scheduled them, regardless of hour
     if (config.features.scheduler) await checkTasks();
+
+    // Heartbeat is bot-initiated proactive behavior — respect active hours
+    if (!isActiveHours(config.scheduler.timezone, config.proactive.activeHoursStart, config.proactive.activeHoursEnd)) return;
 
     const now = Date.now();
     if (config.features.heartbeat && now - lastHeartbeatCheck >= HEARTBEAT_INTERVAL_MS) {
@@ -130,6 +154,9 @@ export function startProactive(deps: ProactiveDeps): { stop: () => void } {
       await checkHeartbeat();
     }
   };
+
+  // Register module-level nudge so schedule tools can trigger precise checks
+  _checkTasksFn = checkTasks;
 
   // Init
   (async () => {
@@ -143,7 +170,14 @@ export function startProactive(deps: ProactiveDeps): { stop: () => void } {
   tick().catch(console.error);
   const timer = setInterval(() => tick().catch(console.error), config.proactive.tickIntervalMs);
 
-  return { stop: () => clearInterval(timer) };
+  return {
+    stop: () => {
+      clearInterval(timer);
+      _checkTasksFn = null;
+      for (const t of _pendingTimers) clearTimeout(t);
+      _pendingTimers.clear();
+    },
+  };
 }
 
 function isEffectivelyEmpty(content: string): boolean {
