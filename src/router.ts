@@ -56,7 +56,6 @@ export function classifyTier(text: string): Tier {
   const wordCount = lower.split(/\s+/).length;
   if (
     wordCount < 20 &&
-    countMatches(lower, TOOL_HINTS) === 0 &&
     countMatches(lower, CODE_WORDS) === 0 &&
     countMatches(lower, DEEP_WORDS) === 0
   ) {
@@ -64,6 +63,11 @@ export function classifyTier(text: string): Tier {
   }
 
   return "standard";
+}
+
+export function needsTools(text: string): boolean {
+  const lower = text.toLowerCase();
+  return countMatches(lower, TOOL_HINTS) > 0 || countMatches(lower, CODE_WORDS) > 0;
 }
 
 export function classifyIntent(text: string): RequestIntent {

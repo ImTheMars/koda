@@ -4,6 +4,47 @@ all notable changes to koda.
 
 ---
 
+## v1.2.0 — leaner runtime + multimodal fixes (2026-02-16)
+
+focuses on removing low-value surface area, fixing image handling, and tightening runtime reliability.
+
+### removed
+
+- **stagehand browser tools** — removed `src/tools/browser.ts` and `@browserbasehq/stagehand` dependency to reduce runtime size and optional complexity.
+- **heartbeat file loop** — removed HEARTBEAT.md polling/parsing from proactive jobs; scheduler is now the only proactive mechanism.
+- **unused memory deletion path** — removed `deleteMemory` tool and provider delete method.
+- **dead db API** — removed `messages.rewrite()` from the sqlite layer.
+
+### fixed
+
+- **photo understanding** — telegram photo handler now downloads the image and passes base64 image attachments to the agent for multimodal responses.
+- **usage accounting** — token cost now uses the actual response model id (including failover) instead of assumed tier model.
+- **typing race** — typing indicator is now ref-counted per chat to avoid concurrent request collisions.
+- **exec memory growth** — capped process stdout/stderr buffers and added cleanup for completed process entries.
+
+### changed
+
+- **response formatting** — telegram now sends html-formatted messages instead of stripping markdown; links/code/bold are preserved.
+- **message delimiter** — switched multi-message delimiter from `|||` to `<|msg|>` across agent and channels.
+- **fast-tier optimization** — fast chat requests skip heavy memory/skills/learnings context fetch for lower latency and cost.
+- **routing behavior** — short tool-hint prompts can stay on the fast tier unless code/deep complexity signals are present.
+- **soul guardrail** — `updateSoul` rejects edits to a `security` section input.
+- **learnings auto-capture** — obvious user correction messages are now written into the learnings table.
+- **retention + db hot paths** — added 90-day message cleanup at boot and cached prepared statements for hot message/usage writes.
+- **llm resilience** — added an OpenRouter circuit-breaker response path after consecutive failures.
+- **help command** — added `/help` telegram command.
+- **version bump to 1.2.0** — updated `package.json` and health endpoint.
+
+---
+
+## v1.1.3 — outgoing message deduplication (2026-02-16)
+
+### added
+
+- **outgoing message deduplication** — `sendReply()` now checks `sentMessages` Set before sending. identical outgoing messages (same chatId + content hash via `Bun.hash()`) are skipped within a 5-minute window. prevents duplicate bot replies from retry logic or double calls.
+
+---
+
 ## v1.1.2 — reminder reliability + character consistency (2026-02-13)
 
 fixes reminders silently failing outside active hours (8am–11pm) and the bot breaking character when apologizing.

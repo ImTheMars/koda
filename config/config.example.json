@@ -2,8 +2,6 @@
   "mode": "private",
   "features": {
     "scheduler": true,
-    "heartbeat": true,
-    "browser": false,
     "debug": false
   },
   "owner": {
@@ -46,9 +44,6 @@
     "tickIntervalMs": 30000,
     "activeHoursStart": 8,
     "activeHoursEnd": 23
-  },
-  "browser": {
-    "headless": true
   },
   "workspace": "~/.koda"
 }

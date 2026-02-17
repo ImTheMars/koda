@@ -12,6 +12,7 @@ import { log } from "../log.js";
 export interface TelegramDeps {
   runAgent: (input: {
     content: string; senderId: string; chatId: string; channel: string;
+    attachments?: Array<{ type: "image"; mimeType: string; data: string }>;
     sessionKey: string; source?: string;
     onAck?: (text: string) => void;
     onTypingStart?: () => void;
@@ -24,6 +25,7 @@ export interface TelegramDeps {
 const TYPING_TIMEOUT_MS = 120_000;
 const DEDUP_CLEANUP_MS = 5 * 60_000;
 const RATE_LIMIT = { maxRequests: 10, windowMs: 60_000 };
+const MESSAGE_DELIMITER = "<|msg|>";
 
 export function startTelegram(deps: TelegramDeps): { stop: () => Promise<void>; sendDirect: (chatId: string, text: string) => Promise<void> } {
   const { config } = deps;
@@ -31,11 +33,16 @@ export function startTelegram(deps: TelegramDeps): { stop: () => Promise<void>; 
   const bot = new Bot(token);
   const allowFrom = new Set(config.telegram.allowFrom);
   const processedMessages = new Set<string>();
+  const sentMessages = new Set<string>();
   const rateCounts = new Map<string, { count: number; resetAt: number }>();
+  const typingRefCounts = new Map<string, number>();
   const typingIntervals = new Map<string, ReturnType<typeof setInterval>>();
   const typingTimeouts = new Map<string, ReturnType<typeof setTimeout>>();
 
-  const dedupTimer = setInterval(() => processedMessages.clear(), DEDUP_CLEANUP_MS);
+  const dedupTimer = setInterval(() => {
+    processedMessages.clear();
+    sentMessages.clear();
+  }, DEDUP_CLEANUP_MS);
 
   const isAllowed = (userId: string) => allowFrom.size === 0 || allowFrom.has(userId);
 
@@ -48,26 +55,47 @@ export function startTelegram(deps: TelegramDeps): { stop: () => Promise<void>; 
   };
 
   const startTyping = (chatId: string) => {
-    if (typingIntervals.has(chatId)) return;
+    const nextCount = (typingRefCounts.get(chatId) ?? 0) + 1;
+    typingRefCounts.set(chatId, nextCount);
+    if (nextCount > 1) return;
     const send = () => bot.api.sendChatAction(Number(chatId), "typing").catch(() => {});
     send();
     typingIntervals.set(chatId, setInterval(send, 4000));
-    typingTimeouts.set(chatId, setTimeout(() => stopTyping(chatId), TYPING_TIMEOUT_MS));
+    typingTimeouts.set(chatId, setTimeout(() => {
+      typingRefCounts.set(chatId, 0);
+      stopTyping(chatId);
+    }, TYPING_TIMEOUT_MS));
   };
 
   const stopTyping = (chatId: string) => {
+    const current = typingRefCounts.get(chatId) ?? 0;
+    if (current > 1) {
+      typingRefCounts.set(chatId, current - 1);
+      return;
+    }
+    typingRefCounts.delete(chatId);
     const iv = typingIntervals.get(chatId);
     if (iv) { clearInterval(iv); typingIntervals.delete(chatId); }
     const to = typingTimeouts.get(chatId);
     if (to) { clearTimeout(to); typingTimeouts.delete(chatId); }
   };
 
-  const stripMarkdown = (text: string): string =>
-    text.replace(/^#{1,6}\s+/gm, "").replace(/\*\*(.+?)\*\*/g, "$1").replace(/\*(.+?)\*/g, "$1")
-      .replace(/__(.+?)__/g, "$1").replace(/_(.+?)_/g, "$1").replace(/~~(.+?)~~/g, "$1")
-      .replace(/`{3}[\s\S]*?`{3}/g, (m) => m.replace(/^`{3}\w*\n?/, "").replace(/\n?`{3}$/, ""))
-      .replace(/`(.+?)`/g, "$1").replace(/^\s*[-*+]\s+/gm, "").replace(/^\s*\d+\.\s+/gm, "")
-      .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1").replace(/^>\s?/gm, "").replace(/^---+$/gm, "").replace(/\n{3,}/g, "\n\n");
+  const escapeHtml = (text: string): string =>
+    text
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;");
+
+  const markdownToTelegramHtml = (text: string): string => {
+    let html = escapeHtml(text);
+    html = html.replace(/```[\w-]*\n([\s\S]*?)```/g, (_m, code: string) => `<pre><code>${code.trim()}</code></pre>`);
+    html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
+    html = html.replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>");
+    html = html.replace(/\*([^*]+)\*/g, "<i>$1</i>");
+    html = html.replace(/~~([^~]+)~~/g, "<s>$1</s>");
+    html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '<a href="$2">$1</a>');
+    return html.replace(/\n{3,}/g, "\n\n");
+  };
 
   const chunkMessage = (text: string, maxLen = 4000): string[] => {
     if (text.length <= maxLen) return [text];
@@ -84,10 +112,17 @@ export function startTelegram(deps: TelegramDeps): { stop: () => Promise<void>; 
   };
 
   const sendReply = async (chatId: number, text: string) => {
-    const segments = text.split("|||").map((s) => stripMarkdown(s.trim())).filter(Boolean);
+    const outgoingKey = `${chatId}:${Bun.hash(text)}`;
+    if (sentMessages.has(outgoingKey)) {
+      log("telegram", "dedup: skipping duplicate outgoing message");
+      return;
+    }
+    sentMessages.add(outgoingKey);
+
+    const segments = text.split(MESSAGE_DELIMITER).map((s) => s.trim()).filter(Boolean);
     for (let i = 0; i < segments.length; i++) {
       for (const chunk of chunkMessage(segments[i]!)) {
-        await bot.api.sendMessage(chatId, chunk);
+        await bot.api.sendMessage(chatId, markdownToTelegramHtml(chunk), { parse_mode: "HTML" });
       }
       if (i < segments.length - 1) await new Promise((r) => setTimeout(r, 600 + Math.random() * 600));
     }
@@ -188,6 +223,18 @@ export function startTelegram(deps: TelegramDeps): { stop: () => Promise<void>; 
     await ctx.reply("Conversation cleared.");
   });
 
+  bot.command("help", async (ctx) => {
+    const senderId = String(ctx.from?.id);
+    if (!isAllowed(senderId)) return;
+    await ctx.reply(
+      "commands:\n" +
+      "/help - this message\n" +
+      "/clear - reset conversation\n" +
+      "/usage - see token usage and costs\n\n" +
+      "i can also search the web, remember things, run code, set reminders, manage files, and load skills.",
+    );
+  });
+
   bot.command("usage", async (ctx) => {
     const senderId = String(ctx.from?.id);
     if (!isAllowed(senderId)) return;
@@ -259,7 +306,7 @@ export function startTelegram(deps: TelegramDeps): { stop: () => Promise<void>; 
       consecutiveErrors = 0;
 
       // Voice reply first, text as fallback
-      const audioBuffer = await synthesize(result.text.replace(/\|\|\|/g, " ").slice(0, 4096));
+      const audioBuffer = await synthesize(result.text.replace(new RegExp(MESSAGE_DELIMITER, "g"), " ").slice(0, 4096));
       if (audioBuffer) {
         log("telegram", "tts: %d bytes", audioBuffer.length);
         await ctx.replyWithVoice(new Blob([new Uint8Array(audioBuffer)], { type: "audio/mpeg" }) as any);
@@ -285,9 +332,32 @@ export function startTelegram(deps: TelegramDeps): { stop: () => Promise<void>; 
     if (isRateLimited(chatId)) { await ctx.reply("slow down!"); return; }
 
     const caption = ctx.message.caption ?? "What's in this image?";
+    const photos = ctx.message.photo;
+    if (!photos.length) {
+      await ctx.reply("I couldn't read that image.");
+      return;
+    }
+    const largest = photos.at(-1);
+    if (!largest) {
+      await ctx.reply("I couldn't read that image.");
+      return;
+    }
+    const file = await ctx.api.getFile(largest.file_id);
+    if (!file.file_path) {
+      await ctx.reply("I couldn't access that image.");
+      return;
+    }
+    const url = `https://api.telegram.org/file/bot${token}/${file.file_path}`;
+    const response = await fetch(url);
+    if (!response.ok) {
+      await ctx.reply("I couldn't download that image.");
+      return;
+    }
+    const buffer = Buffer.from(await response.arrayBuffer());
 
     const result = await deps.runAgent({
       content: caption,
+      attachments: [{ type: "image", mimeType: "image/jpeg", data: buffer.toString("base64") }],
       senderId, chatId, channel: "telegram",
       sessionKey: `telegram_${chatId}`,
       onAck: (text) => ctx.reply(text).catch(() => {}),
@@ -326,6 +396,7 @@ export function startTelegram(deps: TelegramDeps): { stop: () => Promise<void>; 
       for (const chatId of typingIntervals.keys()) stopTyping(chatId);
       clearInterval(dedupTimer);
       processedMessages.clear();
+      sentMessages.clear();
       await bot.stop();
     },
   };

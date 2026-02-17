@@ -7,7 +7,7 @@
 import { mkdir } from "fs/promises";
 import { resolve } from "path";
 import { loadConfig } from "./config.js";
-import { initDb, closeDb } from "./db.js";
+import { initDb, closeDb, messages as dbMessages } from "./db.js";
 import { createAgent, type AgentDeps } from "./agent.js";
 import { SoulLoader } from "./tools/soul.js";
 import { SkillLoader } from "./tools/skills.js";
@@ -35,6 +35,10 @@ await mkdir(config.workspace, { recursive: true });
 
 const dbPath = resolve(config.workspace, "koda.db");
 initDb(dbPath);
+const cleanedMessages = dbMessages.cleanup(90);
+if (cleanedMessages > 0) {
+  console.log(`[boot] Cleaned ${cleanedMessages} messages older than 90 days`);
+}
 console.log("[boot] Database initialized");
 
 // --- Providers ---
@@ -84,7 +88,7 @@ if (config.mode === "cli-only") {
 
 // --- Proactive ---
 let proactive: ReturnType<typeof startProactive> | null = null;
-if (config.features.scheduler || config.features.heartbeat) {
+if (config.features.scheduler) {
   const defaultOwner = config.telegram.adminIds[0] ?? config.owner.id;
   const defaultChannel = telegram ? "telegram" : "cli";
 
@@ -115,7 +119,7 @@ const server = Bun.serve({
   fetch(req) {
     const url = new URL(req.url);
     if (url.pathname === "/health") {
-      return Response.json({ status: "ok", version: "1.1.2", uptime: process.uptime() });
+      return Response.json({ status: "ok", version: "1.2.0", uptime: process.uptime() });
     }
     return new Response("Not found", { status: 404 });
   },

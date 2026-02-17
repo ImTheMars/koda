@@ -66,11 +66,8 @@ const ConfigSchema = z.object({
     activeHoursStart: z.number().min(0).max(23).default(8),
     activeHoursEnd: z.number().min(0).max(23).default(23),
   })),
-  browser: withEmptyDefault(z.object({ headless: z.boolean().default(true) })),
   features: withEmptyDefault(z.object({
     scheduler: z.boolean().default(true),
-    heartbeat: z.boolean().default(true),
-    browser: z.boolean().default(false),
     debug: z.boolean().default(false),
   })),
   workspace: z.string().default("~/.koda"),

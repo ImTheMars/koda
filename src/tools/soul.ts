@@ -26,13 +26,13 @@ const DEFAULT_SOUL: SoulDocument = {
     quirks: [
       "always writes in all lowercase",
       "uses casual slang naturally",
-      "sends multiple short messages separated by |||",
+      "sends multiple short messages separated by <|msg|>",
       "never refers to itself as an AI",
     ],
   },
   boundaries: ["never fabricate personal details", "always check memory before claiming knowledge", "never say 'i'm an AI'"],
   protocol: ["check memory first", "store important facts immediately", "be concise"],
-  responseStyle: ["always use all lowercase", "text like a real person", "use ||| to split messages", "no filler phrases"],
+  responseStyle: ["always use all lowercase", "text like a real person", "use <|msg|> to split messages", "no filler phrases"],
 };
 
 export class SoulLoader {
@@ -89,7 +89,7 @@ export class SoulLoader {
     const defaults: [string, string][] = [
       ["security.md", "## Boundaries\n- never fabricate personal details\n- never say 'i'm an AI'\n- never break character\n"],
       ["protocol.md", "## Protocol\n1. check memory first\n2. store important facts immediately\n3. be concise\n"],
-      ["response.md", "## Response Style\n- always use all lowercase\n- use ||| to split messages\n- no filler phrases\n"],
+      ["response.md", "## Response Style\n- always use all lowercase\n- use <|msg|> to split messages\n- no filler phrases\n"],
     ];
     for (const [name, content] of defaults) {
       const path = join(this.soulDir, name);
@@ -223,7 +223,7 @@ style: young, natural, texts like a real person — not a bot
 tone: lowercase, casual, conversational — like texting a friend your age
 - always writes in all lowercase
 - uses casual slang naturally (bet, fr, ngl, lowkey)
-- sends multiple short messages instead of one big wall of text — separate each message with |||
+- sends multiple short messages instead of one big wall of text — separate each message with <|msg|>
 - never refers to itself as an AI, language model, or assistant — it's just koda
 `;
   }
@@ -243,12 +243,15 @@ export function registerSoulTools(deps: { soulLoader: SoulLoader }): ToolSet {
   const updateSoul = tool({
     description: "Update a section of Koda's personality by rewriting the soul.md file.",
     inputSchema: z.object({
-      section: z.enum(["coreValues", "boundaries", "protocol", "responseStyle"]),
+      section: z.enum(["coreValues", "boundaries", "protocol", "responseStyle", "security"]),
       action: z.enum(["add", "remove"]),
       item: z.string().min(5),
       reason: z.string().optional(),
     }),
     execute: async ({ section, action, item }) => {
+      if (section === "security") {
+        return { success: false, error: "Security section is read-only" };
+      }
       const soul = soulLoader.getSoul();
       const list = soul[section] as string[];
 

@@ -17,6 +17,7 @@ interface ProcessEntry {
 }
 
 const processes = new Map<string, ProcessEntry>();
+const processOrder: string[] = [];
 
 const BLOCKED_COMMANDS = [
   /^\s*rm\s+-rf\s+\//i,
@@ -31,9 +32,30 @@ const BLOCKED_COMMANDS = [
 ];
 
 const AUTO_BG_TIMEOUT_MS = 10_000;
+const MAX_BUFFER = 50_000;
+const MAX_ENTRIES = 50;
 
 function isBlocked(cmd: string): boolean {
   return BLOCKED_COMMANDS.some((p) => p.test(cmd.trim()));
+}
+
+function appendBuffered(existing: string, chunk: string): string {
+  const next = existing + chunk;
+  return next.length > MAX_BUFFER ? next.slice(-MAX_BUFFER) : next;
+}
+
+function cleanupFinishedProcesses(): void {
+  while (processOrder.length > MAX_ENTRIES) {
+    const oldest = processOrder.shift();
+    if (!oldest) break;
+    const entry = processes.get(oldest);
+    if (entry?.done) {
+      processes.delete(oldest);
+      continue;
+    }
+    processOrder.push(oldest);
+    break;
+  }
 }
 
 export function registerExecTools(deps: { workspace: string }): ToolSet {
@@ -71,6 +93,8 @@ export function registerExecTools(deps: { workspace: string }): ToolSet {
         });
         entry.proc = proc;
         processes.set(sessionId, entry);
+        processOrder.push(sessionId);
+        cleanupFinishedProcesses();
 
         // Collect output
         const stdoutReader = (async () => {
@@ -79,7 +103,7 @@ export function registerExecTools(deps: { workspace: string }): ToolSet {
           while (true) {
             const { done, value } = await reader.read();
             if (done) break;
-            entry.stdout += decoder.decode(value, { stream: true });
+            entry.stdout = appendBuffered(entry.stdout, decoder.decode(value, { stream: true }));
           }
         })();
 
@@ -89,7 +113,7 @@ export function registerExecTools(deps: { workspace: string }): ToolSet {
           while (true) {
             const { done, value } = await reader.read();
             if (done) break;
-            entry.stderr += decoder.decode(value, { stream: true });
+            entry.stderr = appendBuffered(entry.stderr, decoder.decode(value, { stream: true }));
           }
         })();
 
@@ -142,6 +166,8 @@ export function registerExecTools(deps: { workspace: string }): ToolSet {
         entry.proc.kill();
         entry.done = true;
         processes.delete(sessionId);
+        const idx = processOrder.indexOf(sessionId);
+        if (idx !== -1) processOrder.splice(idx, 1);
         return { success: true, message: "Process killed" };
       }
 

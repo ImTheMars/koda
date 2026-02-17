@@ -4,16 +4,12 @@
  * One-shot reminders: send directly. Recurring tasks: run through agent.
  */
 
-import { join } from "path";
 import type { Config } from "./config.js";
 import { tasks as dbTasks, messages as dbMessages } from "./db.js";
-import { parseCronNext, isActiveHours } from "./time.js";
+import { parseCronNext } from "./time.js";
 import { log } from "./log.js";
 
-const HEARTBEAT_INTERVAL_MS = 30 * 60 * 1000;
 const NEAR_TERM_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes
-
-const INITIAL_HEARTBEAT = `# tasks\n\nadd tasks below. koda checks this every 30 minutes.\n\n- [ ] example: research flights to tokyo\n`;
 
 // Module-level nudge — allows schedule tools to trigger a precise check for near-term reminders
 let _checkTasksFn: (() => Promise<void>) | null = null;
@@ -45,10 +41,7 @@ export interface ProactiveDeps {
 }
 
 export function startProactive(deps: ProactiveDeps): { stop: () => void } {
-  const { config, defaultUserId, defaultChatId, defaultChannel } = deps;
-  const heartbeatPath = join(config.workspace, "HEARTBEAT.md");
-  let lastHeartbeatHash: number | null = null;
-  let lastHeartbeatCheck = 0;
+  const { config } = deps;
 
   // Catch-up: fire missed one-shot reminders on startup
   const catchUp = async () => {
@@ -100,59 +93,11 @@ export function startProactive(deps: ProactiveDeps): { stop: () => void } {
     }
   };
 
-  const checkHeartbeat = async () => {
-    const file = Bun.file(heartbeatPath);
-    if (!(await file.exists())) return;
-
-    try {
-      const content = await file.text();
-      if (isEffectivelyEmpty(content)) return;
-
-      const hash = Number(Bun.hash(content));
-      if (hash === lastHeartbeatHash) return;
-      lastHeartbeatHash = hash;
-
-      const pending: string[] = [];
-      const completed: string[] = [];
-      for (const line of content.split("\n")) {
-        const trimmed = line.trim();
-        if (/^[-*]\s*\[\s\]/.test(trimmed)) pending.push(trimmed.replace(/^[-*]\s*\[\s\]\s*/, ""));
-        else if (/^[-*]\s*\[x\]/i.test(trimmed)) completed.push(trimmed.replace(/^[-*]\s*\[x\]\s*/i, ""));
-      }
-
-      log("proactive", "heartbeat: %d pending %d completed", pending.length, completed.length);
-      if (pending.length === 0) return;
-
-      const taskList = pending.map((t, i) => `${i + 1}. ${t}`).join("\n");
-      const prompt = `[heartbeat] you have ${pending.length} pending task${pending.length > 1 ? "s" : ""}${completed.length ? ` (${completed.length} completed)` : ""}. review and act on them:\n\n${taskList}`;
-
-      await deps.runAgent({
-        content: prompt,
-        senderId: defaultUserId,
-        chatId: defaultChatId,
-        channel: defaultChannel,
-        sessionKey: `${defaultChannel}_${defaultChatId}`,
-        source: "heartbeat",
-      });
-    } catch (err) {
-      console.error("[proactive] Heartbeat error:", err);
-    }
-  };
-
   const tick = async () => {
     log("proactive", "tick");
 
-    // Reminders ALWAYS fire — user explicitly scheduled them, regardless of hour
+    // Reminders ALWAYS fire — user explicitly scheduled them.
     if (config.features.scheduler) await checkTasks();
-
-    // Heartbeat is bot-initiated proactive behavior — respect active hours
-    if (!isActiveHours(config.scheduler.timezone, config.proactive.activeHoursStart, config.proactive.activeHoursEnd)) return;
-
-    const now = Date.now();
-    if (config.features.heartbeat && now - lastHeartbeatCheck >= HEARTBEAT_INTERVAL_MS) {
-      lastHeartbeatCheck = now;
-      await checkHeartbeat();
-    }
   };
 
   // Register module-level nudge so schedule tools can trigger precise checks
@@ -160,10 +105,6 @@ export function startProactive(deps: ProactiveDeps): { stop: () => void } {
 
   // Init
   (async () => {
-    // Create HEARTBEAT.md if it doesn't exist
-    if (config.features.heartbeat && !(await Bun.file(heartbeatPath).exists())) {
-      await Bun.write(heartbeatPath, INITIAL_HEARTBEAT);
-    }
     if (config.features.scheduler) await catchUp();
   })();
 
@@ -178,15 +119,4 @@ export function startProactive(deps: ProactiveDeps): { stop: () => void } {
       _pendingTimers.clear();
     },
   };
-}
-
-function isEffectivelyEmpty(content: string): boolean {
-  for (const line of content.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith("#") || /example:/i.test(trimmed) || /^add tasks|^koda checks/i.test(trimmed)) continue;
-    if (/^[-*]\s*\[x\]/i.test(trimmed) || /^[-*]\s*$/.test(trimmed) || /^<!--.*-->$/.test(trimmed)) continue;
-    if (/^[-*]\s*\[\s\]/.test(trimmed) || /^[-*]\s+\S/.test(trimmed)) return false;
-    if (trimmed.length > 0) return false;
-  }
-  return true;
 }

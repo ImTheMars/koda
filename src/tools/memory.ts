@@ -29,7 +29,6 @@ function recordSuccess(): void { failures = 0; }
 export interface MemoryProvider {
   store(userId: string, content: string, tags?: string[]): Promise<{ id: string }>;
   recall(userId: string, query: string, limit?: number, sessionKey?: string): Promise<string[]>;
-  delete(memoryId: string): Promise<boolean>;
   healthCheck(): Promise<boolean>;
   readonly isDegraded: boolean;
 }
@@ -81,11 +80,6 @@ export function createMemoryProvider(apiKey: string): MemoryProvider {
       }
     },
 
-    async delete(memoryId) {
-      try { await client.memories.delete(memoryId); return true; }
-      catch { return false; }
-    },
-
     async healthCheck() {
       try { await client.search.memories({ q: "health", limit: 1 }); return true; }
       catch { return false; }
@@ -121,11 +115,5 @@ export function registerMemoryTools(deps: { memory: MemoryProvider; getUserId: (
     },
   });
 
-  const deleteMemory = tool({
-    description: "Delete a specific memory by ID.",
-    inputSchema: z.object({ memoryId: z.string() }),
-    execute: async ({ memoryId }) => ({ success: await memory.delete(memoryId) }),
-  });
-
-  return { remember, recall, deleteMemory };
+  return { remember, recall };
 }

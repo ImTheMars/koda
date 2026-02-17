@@ -14,7 +14,6 @@ import { registerMemoryTools } from "./memory.js";
 import { registerSearchTools } from "./search.js";
 import { registerFilesystemTools } from "./filesystem.js";
 import { registerExecTools } from "./exec.js";
-import { registerBrowserTools } from "./browser.js";
 import { registerScheduleTools } from "./schedule.js";
 import { registerSkillTools } from "./skills.js";
 import { registerSoulTools, SoulLoader } from "./soul.js";
@@ -72,11 +71,6 @@ export function buildTools(deps: {
     getChatId: () => getToolContext().chatId,
     getChannel: () => getToolContext().channel,
   }));
-
-  // Browser (optional)
-  if (config.features.browser) {
-    Object.assign(tools, registerBrowserTools({ headless: config.browser.headless }));
-  }
 
   // Soul
   if (deps.soulLoader) {

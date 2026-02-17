@@ -15,6 +15,7 @@ import { log } from "./log.js";
 
 export interface AgentInput {
   content: string;
+  attachments?: Array<{ type: "image"; mimeType: string; data: string }>;
   senderId: string;
   chatId: string;
   channel: string;
@@ -46,12 +47,28 @@ const ACK_TEMPLATES = [
   "on it - give me a sec to work through that.",
   "bet - i'll handle this and report back.",
 ];
+const MESSAGE_DELIMITER = "<|msg|>";
+const CORRECTION_PATTERN = /^(no[,.]?\s|wrong\b|not what\b|actually[,.]?\s|i meant\b|that's not\b)/i;
+
+let llmFailures = 0;
+let lastLlmFailure = 0;
+const LLM_FAILURE_THRESHOLD = 3;
+const LLM_RESET_MS = 120_000;
 
 let openrouter: ReturnType<typeof createOpenRouter> | null = null;
 
 function getProvider(apiKey: string) {
   if (!openrouter) openrouter = createOpenRouter({ apiKey });
   return openrouter;
+}
+
+function isLlmCircuitOpen(): boolean {
+  if (llmFailures < LLM_FAILURE_THRESHOLD) return false;
+  if (Date.now() - lastLlmFailure >= LLM_RESET_MS) {
+    llmFailures = 0;
+    return false;
+  }
+  return true;
 }
 
 function buildSystemPrompt(deps: {
@@ -82,13 +99,13 @@ IMPORTANT: this is the REAL current time, refreshed every message.
 ${deps.workspace}
 
 ## HOW YOU RESPOND — CRITICAL
-you MUST split your replies into multiple short messages using ||| as a separator.
+you MUST split your replies into multiple short messages using ${MESSAGE_DELIMITER} as a separator.
 do NOT send one big block of text. text like a real person — short, separate messages.
 
-example output: yo i can help with that|||what kind of stuff you need?
+example output: yo i can help with that${MESSAGE_DELIMITER}what kind of stuff you need?
 
 rules:
-- put ||| between each separate message you want to send
+- put ${MESSAGE_DELIMITER} between each separate message you want to send
 - each message = 1-2 sentences MAX
 - 2-4 messages per reply is ideal
 - simple one-word or one-line answers don't need splitting
@@ -139,11 +156,14 @@ export function createAgent(deps: AgentDeps) {
     }
 
     // Build context
-    const [memories, skillsSummary, recentLearnings] = await Promise.all([
-      deps.getMemories(input.senderId, input.content, input.sessionKey),
-      deps.getSkillsSummary(),
-      Promise.resolve(dbLearnings.getRecent(input.senderId, 5)),
-    ]);
+    const skipContext = tier === "fast" && intent === "chat";
+    const [memories, skillsSummary, recentLearnings] = skipContext
+      ? [[], null, [] as Array<{ type: string; content: string }>]
+      : await Promise.all([
+        deps.getMemories(input.senderId, input.content, input.sessionKey),
+        deps.getSkillsSummary(),
+        Promise.resolve(dbLearnings.getRecent(input.senderId, 5)),
+      ]);
 
     const systemPrompt = buildSystemPrompt({
       soulPrompt: deps.getSoulPrompt(),
@@ -157,9 +177,15 @@ export function createAgent(deps: AgentDeps) {
 
     // Build message history
     const history = dbMessages.getHistory(input.sessionKey, 30);
+    const userContent = input.attachments?.length
+      ? [
+        ...input.attachments.map((a) => ({ type: "image" as const, image: a.data, mimeType: a.mimeType })),
+        { type: "text" as const, text: input.content },
+      ]
+      : input.content;
     const messageList: ModelMessage[] = [
       ...history.map((h) => ({ role: h.role as "user" | "assistant", content: h.content })),
-      { role: "user" as const, content: input.content },
+      { role: "user" as const, content: userContent },
     ];
 
     // Typing indicator
@@ -226,7 +252,8 @@ export function createAgent(deps: AgentDeps) {
           },
         });
 
-        const finalModelId = getModelId(currentTier, config);
+        llmFailures = 0;
+        const finalModelId = result.response?.modelId ?? getModelId(currentTier, config);
         const promptTokens = result.usage?.inputTokens ?? 0;
         const completionTokens = result.usage?.outputTokens ?? 0;
         const cost = calculateCost(finalModelId, promptTokens, completionTokens);
@@ -247,6 +274,16 @@ export function createAgent(deps: AgentDeps) {
         const fallback = "aight that's handled.";
         dbMessages.append(input.sessionKey, "user", input.content);
         dbMessages.append(input.sessionKey, "assistant", result.text || fallback, [...new Set(toolsUsed)]);
+        if (CORRECTION_PATTERN.test(input.content) && history.length > 0) {
+          const lastAssistant = [...history].reverse().find((m) => m.role === "assistant");
+          if (lastAssistant) {
+            dbLearnings.add(
+              input.senderId,
+              "correction",
+              `user corrected: "${lastAssistant.content.slice(0, 100)}" -> "${input.content.slice(0, 200)}"`,
+            );
+          }
+        }
 
         return {
           text: result.text || fallback,
@@ -257,8 +294,12 @@ export function createAgent(deps: AgentDeps) {
       });
     } catch (err) {
       console.error("[agent] LLM generate error:", err);
+      llmFailures += 1;
+      lastLlmFailure = Date.now();
       return {
-        text: "i ran into an issue processing that. could you try again?",
+        text: isLlmCircuitOpen()
+          ? "i'm having trouble connecting right now. try again in a couple minutes."
+          : "i ran into an issue processing that. could you try again?",
         tier: currentTier,
         toolsUsed: [],
         usage: { promptTokens: 0, completionTokens: 0, cost: 0 },

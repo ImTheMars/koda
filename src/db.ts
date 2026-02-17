@@ -8,6 +8,9 @@
 import { Database } from "bun:sqlite";
 
 let db: Database | null = null;
+let stmtAppendMessage: ReturnType<Database["prepare"]> | null = null;
+let stmtGetHistory: ReturnType<Database["prepare"]> | null = null;
+let stmtTrackUsage: ReturnType<Database["prepare"]> | null = null;
 
 export function initDb(dbPath: string): Database {
   db = new Database(dbPath, { create: true });
@@ -70,6 +73,10 @@ export function initDb(dbPath: string): Database {
     );
   `);
 
+  stmtAppendMessage = db.prepare("INSERT INTO messages (session_key, role, content, tools_used) VALUES (?, ?, ?, ?)");
+  stmtGetHistory = db.prepare("SELECT role, content FROM messages WHERE session_key = ? ORDER BY id DESC LIMIT ?");
+  stmtTrackUsage = db.prepare("INSERT INTO usage (user_id, model, input_tokens, output_tokens, cost, tools_used, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)");
+
   return db;
 }
 
@@ -81,22 +88,22 @@ export function getDb(): Database {
 export function closeDb(): void {
   db?.close();
   db = null;
+  stmtAppendMessage = null;
+  stmtGetHistory = null;
+  stmtTrackUsage = null;
 }
 
 // --- Messages ---
 
 export const messages = {
   append(sessionKey: string, role: "user" | "assistant" | "system", content: string, toolsUsed?: string[]): void {
-    getDb().run(
-      "INSERT INTO messages (session_key, role, content, tools_used) VALUES (?, ?, ?, ?)",
-      [sessionKey, role, content, toolsUsed?.length ? JSON.stringify(toolsUsed) : null],
-    );
+    if (!stmtAppendMessage) throw new Error("Database statements not initialized");
+    stmtAppendMessage.run(sessionKey, role, content, toolsUsed?.length ? JSON.stringify(toolsUsed) : null);
   },
 
   getHistory(sessionKey: string, limit = 30): Array<{ role: string; content: string }> {
-    const rows = getDb()
-      .query("SELECT role, content FROM messages WHERE session_key = ? ORDER BY id DESC LIMIT ?")
-      .all(sessionKey, limit) as Array<{ role: string; content: string }>;
+    if (!stmtGetHistory) throw new Error("Database statements not initialized");
+    const rows = stmtGetHistory.all(sessionKey, limit) as Array<{ role: string; content: string }>;
     return rows.reverse();
   },
 
@@ -111,29 +118,40 @@ export const messages = {
     return row?.cnt ?? 0;
   },
 
-  rewrite(sessionKey: string, newHistory: Array<{ role: string; content: string }>): void {
-    const d = getDb();
-    d.run("DELETE FROM messages WHERE session_key = ?", [sessionKey]);
-    const stmt = d.prepare("INSERT INTO messages (session_key, role, content) VALUES (?, ?, ?)");
-    for (const msg of newHistory) stmt.run(sessionKey, msg.role, msg.content);
+  cleanup(daysOld = 90): number {
+    const result = getDb().run(
+      "DELETE FROM messages WHERE datetime(created_at) < datetime('now', ?)",
+      [`-${daysOld} days`],
+    );
+    return result.changes;
   },
 };
 
 // --- Tasks ---
 
+type TaskInput = {
+  id: string;
+  userId: string;
+  chatId: string;
+  channel: string;
+  type: "reminder" | "recurring";
+  description: string;
+  prompt?: string;
+  cron?: string;
+  nextRunAt: string;
+  enabled?: boolean;
+  oneShot?: boolean;
+};
+
 export const tasks = {
-  create(task: {
-    id: string; userId: string; chatId: string; channel: string;
-    type: "reminder" | "recurring"; description: string; prompt?: string;
-    cron?: string; nextRunAt: string; enabled?: boolean; oneShot?: boolean;
-  }): void {
+  create(task: TaskInput): void {
     getDb().run(
       "INSERT INTO tasks (id, user_id, chat_id, channel, type, description, prompt, cron, next_run_at, enabled, one_shot) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
       [task.id, task.userId, task.chatId, task.channel, task.type, task.description, task.prompt ?? null, task.cron ?? null, task.nextRunAt, task.enabled !== false ? 1 : 0, task.oneShot ? 1 : 0],
     );
   },
 
-  createBatch(items: Array<Parameters<typeof tasks.create>[0]>): void {
+  createBatch(items: TaskInput[]): void {
     const d = getDb();
     const stmt = d.prepare(
       "INSERT INTO tasks (id, user_id, chat_id, channel, type, description, prompt, cron, next_run_at, enabled, one_shot) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -184,9 +202,15 @@ export const tasks = {
 
 export const usage = {
   track(data: { userId: string; model: string; inputTokens: number; outputTokens: number; cost: number; toolsUsed?: string[] }): void {
-    getDb().run(
-      "INSERT INTO usage (user_id, model, input_tokens, output_tokens, cost, tools_used, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-      [data.userId, data.model, data.inputTokens, data.outputTokens, data.cost, data.toolsUsed?.length ? JSON.stringify(data.toolsUsed) : null, new Date().toISOString()],
+    if (!stmtTrackUsage) throw new Error("Database statements not initialized");
+    stmtTrackUsage.run(
+      data.userId,
+      data.model,
+      data.inputTokens,
+      data.outputTokens,
+      data.cost,
+      data.toolsUsed?.length ? JSON.stringify(data.toolsUsed) : null,
+      new Date().toISOString(),
     );
   },
 
