@@ -1,28 +1,26 @@
 /**
- * Proactive system — 30s tick loop for scheduled tasks + heartbeat.
+ * Proactive system — 30s tick loop for scheduled tasks + memory maintenance.
  *
  * One-shot reminders: send directly. Recurring tasks: run through agent.
+ * Memory decay: daily sweep (Ebbinghaus). Reflection: weekly compression.
  */
 
 import type { Config } from "./config.js";
 import { tasks as dbTasks, messages as dbMessages } from "./db.js";
 import { parseCronNext } from "./time.js";
 import { log } from "./log.js";
+import type { MemoryProvider } from "./memory/index.js";
+import { shouldRunDecay, shouldRunReflection } from "./memory/decay.js";
 
-const NEAR_TERM_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes
+const NEAR_TERM_THRESHOLD_MS = 5 * 60 * 1000;
 
-// Module-level nudge — allows schedule tools to trigger a precise check for near-term reminders
 let _checkTasksFn: (() => Promise<void>) | null = null;
 const _pendingTimers = new Set<ReturnType<typeof setTimeout>>();
 
-/**
- * Schedule a precise check at the given time (for near-term reminders).
- * Falls back gracefully to the regular tick if proactive hasn't started yet.
- */
 export function scheduleNudge(at: Date): void {
   if (!_checkTasksFn) return;
   const delayMs = Math.max(0, at.getTime() - Date.now());
-  if (delayMs > NEAR_TERM_THRESHOLD_MS) return; // only for near-term; regular tick handles the rest
+  if (delayMs > NEAR_TERM_THRESHOLD_MS) return;
   const fn = _checkTasksFn;
   const timer = setTimeout(() => {
     _pendingTimers.delete(timer);
@@ -38,12 +36,12 @@ export interface ProactiveDeps {
   defaultUserId: string;
   defaultChatId: string;
   defaultChannel: string;
+  memoryProvider: MemoryProvider;
 }
 
 export function startProactive(deps: ProactiveDeps): { stop: () => void } {
-  const { config } = deps;
+  const { config, memoryProvider } = deps;
 
-  // Catch-up: fire missed one-shot reminders on startup
   const catchUp = async () => {
     const now = new Date();
     const ready = dbTasks.getReady(now.toISOString());
@@ -75,7 +73,6 @@ export function startProactive(deps: ProactiveDeps): { stop: () => void } {
         dbMessages.append(`${task.channel}_${task.chatId}`, "assistant", text);
         dbTasks.delete(task.id);
       } else {
-        // Recurring: run through agent
         await deps.runAgent({
           content: `[scheduled task] ${task.prompt}`,
           senderId: task.userId,
@@ -93,17 +90,43 @@ export function startProactive(deps: ProactiveDeps): { stop: () => void } {
     }
   };
 
-  const tick = async () => {
-    log("proactive", "tick");
+  const checkMemoryMaintenance = async () => {
+    const userId = deps.defaultUserId;
 
-    // Reminders ALWAYS fire — user explicitly scheduled them.
-    if (config.features.scheduler) await checkTasks();
+    // Daily decay sweep
+    if (shouldRunDecay(userId)) {
+      try {
+        const result = await memoryProvider.decay(userId);
+        if (result.archived > 0 || result.reinforced > 0) {
+          log("proactive", "decay: archived=%d reinforced=%d", result.archived, result.reinforced);
+        }
+      } catch (err) {
+        log("proactive", "decay error: %s", (err as Error).message);
+      }
+    }
+
+    // Weekly/daily reflection
+    if (shouldRunReflection(userId, config.memory.reflectionSchedule)) {
+      try {
+        const result = await memoryProvider.reflect(userId);
+        if (result.reflected > 0) {
+          log("proactive", "reflection: %d insights from %d episodics", result.reflected, result.compressed);
+        }
+      } catch (err) {
+        log("proactive", "reflection error: %s", (err as Error).message);
+      }
+    }
   };
 
-  // Register module-level nudge so schedule tools can trigger precise checks
+  const tick = async () => {
+    log("proactive", "tick");
+    if (config.features.scheduler) await checkTasks();
+    // Memory maintenance runs on every tick but self-gates via shouldRunDecay/shouldRunReflection
+    await checkMemoryMaintenance();
+  };
+
   _checkTasksFn = checkTasks;
 
-  // Init
   (async () => {
     if (config.features.scheduler) await catchUp();
   })();

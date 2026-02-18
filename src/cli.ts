@@ -13,7 +13,7 @@ import { homedir } from "os";
 import { validateTimezone } from "./time.js";
 import { readEnvFile } from "./env.js";
 
-const VERSION = "1.1.1";
+const VERSION = "2.0.0";
 const REPO = "ImTheMars/koda";
 
 function getWorkspacePath(): string {
@@ -75,26 +75,9 @@ async function runSetup(): Promise<void> {
   if (valid) keySpinner.succeed("OpenRouter key validated");
   else { keySpinner.fail("key rejected"); return; }
 
-  // Supermemory key
-  const supermemoryKey = await clack.text({
-    message: "Supermemory API key:",
-    validate: (v) => v ? undefined : "Required",
-  });
-  if (clack.isCancel(supermemoryKey)) { clack.outro("cancelled"); return; }
-
-  // Tavily key
-  const tavilyKey = await clack.text({ message: "Tavily API key (for web search):", placeholder: "optional" });
-  if (clack.isCancel(tavilyKey)) { clack.outro("cancelled"); return; }
-
-  // Cartesia key (voice TTS)
-  const cartesiaKey = await clack.text({ message: "Cartesia API key (for voice TTS):", placeholder: "optional" });
-  if (clack.isCancel(cartesiaKey)) { clack.outro("cancelled"); return; }
-
-  const cartesiaVoiceId = await clack.text({
-    message: "Cartesia voice ID:",
-    placeholder: "694f9389-aac1-45b6-b726-9d9369183238",
-  });
-  if (clack.isCancel(cartesiaVoiceId)) { clack.outro("cancelled"); return; }
+  // Exa key (optional web search)
+  const exaKey = await clack.text({ message: "Exa API key (for web search):", placeholder: "optional — press Enter to skip" });
+  if (clack.isCancel(exaKey)) { clack.outro("cancelled"); return; }
 
   // Telegram (conditional)
   let telegramToken = "";
@@ -131,10 +114,7 @@ async function runSetup(): Promise<void> {
   const envPath = resolve(workspace, ".env");
   const envLines: string[] = [];
   envLines.push(`KODA_OPENROUTER_API_KEY=${openrouterKey}`);
-  envLines.push(`KODA_SUPERMEMORY_API_KEY=${supermemoryKey}`);
-  if (tavilyKey) envLines.push(`KODA_TAVILY_API_KEY=${tavilyKey}`);
-  if (cartesiaKey) envLines.push(`KODA_CARTESIA_API_KEY=${cartesiaKey}`);
-  if (cartesiaVoiceId) envLines.push(`KODA_CARTESIA_VOICE_ID=${cartesiaVoiceId}`);
+  if (exaKey) envLines.push(`KODA_EXA_API_KEY=${exaKey}`);
   if (telegramToken) envLines.push(`KODA_TELEGRAM_TOKEN=${telegramToken}`);
   await writeFile(envPath, envLines.join("\n") + "\n", "utf-8");
   try { await chmod(envPath, 0o600); } catch {}
@@ -194,9 +174,11 @@ async function runDoctor(): Promise<void> {
         return res.ok ? { status: "ok", detail: "OpenRouter reachable" } : { status: "fail", detail: `OpenRouter returned ${res.status}` }; }
       catch (e) { return { status: "fail", detail: `OpenRouter unreachable` }; }
     }},
-    { label: "Supermemory", async run() {
-      const key = getEnv("KODA_SUPERMEMORY_API_KEY");
-      return key ? { status: "ok", detail: "Supermemory key present" } : { status: "fail", detail: "Supermemory key not set" };
+    { label: "LanceDB storage", async run() {
+      const { mkdir } = await import("fs/promises");
+      const lanceDir = resolve(workspace, "memory.lance");
+      try { await mkdir(lanceDir, { recursive: true }); return { status: "ok", detail: `LanceDB dir ready ${chalk.dim(lanceDir)}` }; }
+      catch { return { status: "warn", detail: "LanceDB dir not writable" }; }
     }},
     { label: "SQLite", async run() {
       try { const p = resolve(workspace, "koda.db.test"); await writeFile(p, "", "utf-8"); const { unlink } = await import("fs/promises"); await unlink(p);
@@ -301,6 +283,114 @@ async function runUpgrade(): Promise<void> {
   }
 }
 
+// --- Memory CLI ---
+
+async function runMemory(subcommand?: string): Promise<void> {
+  const workspace = getWorkspacePath();
+  const dbPath = resolve(workspace, "koda.db");
+
+  if (!subcommand || subcommand === "help") {
+    console.log("Usage: koda memory <export|import|migrate|stats>");
+    console.log("  export [file]   Export all memories to JSON");
+    console.log("  import <file>   Import memories from a JSON export");
+    console.log("  migrate         Run v2→v3 migration manually");
+    console.log("  stats           Show memory statistics");
+    return;
+  }
+
+  if (subcommand === "migrate") {
+    clack.intro(chalk.cyan("koda memory migrate"));
+    const s = ora("running v2 → v3 migration").start();
+    try {
+      const { initDb } = await import("./db.js");
+      initDb(dbPath);
+      const { runV3Migration } = await import("./memory/migrate.js");
+      await runV3Migration(workspace);
+      s.succeed("migration complete");
+    } catch (err) {
+      s.fail(`migration failed: ${(err as Error).message}`);
+    }
+    return;
+  }
+
+  if (subcommand === "stats") {
+    clack.intro(chalk.cyan("koda memory stats"));
+    try {
+      const { initDb, memories: dbMem, entities: dbEnt, state: dbState } = await import("./db.js");
+      initDb(dbPath);
+      const stats = dbMem.getStats("owner");
+      const entityCount = dbEnt.count("owner");
+      const lastDecay = dbState.get<string>("last_decay_owner");
+      const lastReflect = dbState.get<string>("last_reflect_owner");
+      console.log(chalk.bold("\n  Memory Statistics"));
+      console.log(`  Total active:   ${chalk.green(stats.total)}`);
+      console.log(`  Archived:       ${chalk.dim(stats.archived)}`);
+      console.log(`  Avg strength:   ${chalk.cyan((stats.avgStrength * 100).toFixed(1))}%`);
+      console.log(`  Entities:       ${chalk.cyan(entityCount)}`);
+      console.log(`  By sector:      ${JSON.stringify(stats.bySector)}`);
+      console.log(`  Last decay:     ${lastDecay ?? chalk.dim("never")}`);
+      console.log(`  Last reflect:   ${lastReflect ?? chalk.dim("never")}`);
+      console.log();
+    } catch (err) {
+      console.error(chalk.red(`  error: ${(err as Error).message}`));
+    }
+    return;
+  }
+
+  if (subcommand === "export") {
+    const outFile = process.argv[4] ?? resolve(workspace, `memory-export-${Date.now()}.json`);
+    clack.intro(chalk.cyan("koda memory export"));
+    const s = ora("exporting memories").start();
+    try {
+      const { initDb, memories: dbMem } = await import("./db.js");
+      initDb(dbPath);
+      const rows = dbMem.listByUser("owner", { includeArchived: true, limit: 100_000 });
+      await writeFile(outFile, JSON.stringify(rows, null, 2), "utf-8");
+      s.succeed(`exported ${rows.length} memories → ${chalk.dim(outFile)}`);
+    } catch (err) {
+      s.fail(`export failed: ${(err as Error).message}`);
+    }
+    return;
+  }
+
+  if (subcommand === "import") {
+    const inFile = process.argv[4];
+    if (!inFile) { console.error("Usage: koda memory import <file.json>"); return; }
+    clack.intro(chalk.cyan("koda memory import"));
+    const s = ora(`importing from ${inFile}`).start();
+    try {
+      const { initDb, memories: dbMem } = await import("./db.js");
+      initDb(dbPath);
+      const raw = JSON.parse(await readFile(inFile, "utf-8")) as Array<Record<string, unknown>>;
+      let imported = 0;
+      for (const row of raw) {
+        try {
+          dbMem.insert({
+            id: row.id as string,
+            userId: row.userId as string ?? "owner",
+            sector: row.sector as any ?? "semantic",
+            content: row.content as string,
+            summary: row.summary as string | null ?? null,
+            tags: Array.isArray(row.tags) ? JSON.stringify(row.tags) : row.tags as string | null ?? null,
+            sessionKey: row.sessionKey as string | null ?? null,
+            eventAt: row.eventAt as string ?? new Date().toISOString(),
+            validUntil: row.validUntil as string | null ?? null,
+            strength: typeof row.strength === "number" ? row.strength : 0.8,
+          });
+          imported++;
+        } catch {}
+      }
+      s.succeed(`imported ${imported} / ${raw.length} memories`);
+    } catch (err) {
+      s.fail(`import failed: ${(err as Error).message}`);
+    }
+    return;
+  }
+
+  console.log(`Unknown memory subcommand: ${subcommand}`);
+  console.log("Run: koda memory help");
+}
+
 // --- Version ---
 
 function runVersion(): void {
@@ -315,7 +405,8 @@ export async function runCli(command: string): Promise<void> {
     case "doctor": await runDoctor(); break;
     case "upgrade": await runUpgrade(); break;
     case "version": runVersion(); break;
-    default: console.log(`Unknown command: ${command}\nAvailable: setup, doctor, upgrade, version`);
+    case "memory": await runMemory(process.argv[3]); break;
+    default: console.log(`Unknown command: ${command}\nAvailable: setup, doctor, upgrade, version, memory`);
   }
 }
 

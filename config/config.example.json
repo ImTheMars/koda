@@ -11,6 +11,15 @@
     "fastModel": "google/gemini-3-flash-preview",
     "deepModel": "anthropic/claude-sonnet-4.6"
   },
+  "memory": {
+    "provider": "local",
+    "embeddingModel": "openai/text-embedding-3-large",
+    "decayAggressiveness": 1.0,
+    "reflectionSchedule": "weekly",
+    "maxMemories": 100000,
+    "archiveThreshold": 0.20,
+    "graphDepth": 2
+  },
   "telegram": {
     "allowFrom": ["your-telegram-user-id"],
     "adminIds": ["your-telegram-user-id"]

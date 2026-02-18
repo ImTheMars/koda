@@ -7,21 +7,23 @@
 import { mkdir } from "fs/promises";
 import { resolve } from "path";
 import { loadConfig } from "./config.js";
-import { initDb, closeDb, messages as dbMessages, state as dbState } from "./db.js";
+import { initDb, closeDb, messages as dbMessages } from "./db.js";
 import { createAgent, createStreamAgent, type AgentDeps } from "./agent.js";
 import { SoulLoader } from "./tools/soul.js";
 import { SkillLoader } from "./tools/skills.js";
-import { createMemoryProvider } from "./tools/memory.js";
+import { createLocalMemoryProvider } from "./memory/index.js";
+import { runV3Migration } from "./memory/migrate.js";
 import { startRepl } from "./channels/repl.js";
 import { startTelegram } from "./channels/telegram.js";
 import { startProactive } from "./proactive.js";
 import { buildTools } from "./tools/index.js";
 import { enableDebug } from "./log.js";
 import { createMCPClient } from "@ai-sdk/mcp";
+import type { Config } from "./config.js";
 
 // --- CLI routing ---
 const command = process.argv[2];
-if (command === "setup" || command === "doctor" || command === "upgrade" || command === "version") {
+if (command === "setup" || command === "doctor" || command === "upgrade" || command === "version" || command === "memory") {
   const { runCli } = await import("./cli.js");
   await runCli(command);
   process.exit(0);
@@ -42,8 +44,13 @@ if (cleanedMessages > 0) {
 }
 console.log("[boot] Database initialized");
 
+// --- v2 → v3 migration (runs once, non-blocking) ---
+runV3Migration(config.workspace).catch((err) => {
+  console.warn("[boot] Migration warning:", (err as Error).message);
+});
+
 // --- Providers ---
-const memoryProvider = createMemoryProvider(config.supermemory.apiKey);
+const memoryProvider = createLocalMemoryProvider(config, config.workspace);
 const soulLoader = new SoulLoader(config.soul.path, config.soul.dir);
 await soulLoader.initialize();
 console.log(`[boot] Soul: ${soulLoader.getSoul().identity.name}`);
@@ -51,34 +58,6 @@ console.log(`[boot] Soul: ${soulLoader.getSoul().identity.name}`);
 const skillLoader = new SkillLoader(config.workspace);
 const skills = await skillLoader.listSkills();
 console.log(`[boot] Skills: ${skills.length} loaded`);
-
-// --- One-time Supermemory filter prompt setup ---
-(async () => {
-  const FILTER_KEY = "supermemory_filter_set_v1";
-  if (!dbState.get(FILTER_KEY)) {
-    try {
-      await (memoryProvider.client as any).settings.update({
-        shouldLLMFilter: true,
-        filterPrompt: `Personal AI assistant called Koda. Prioritize:
-- User preferences and habits (response style, tools, languages, workflows)
-- Corrections and clarifications the user makes to Koda's responses
-- Important personal facts (name, timezone, projects, roles, goals)
-- Action items and outcomes (what worked, what didn't)
-- Recurring topics and interests
-
-Skip:
-- Casual greetings and small talk with no informational content
-- Tool call noise and intermediate processing steps
-- System messages and error outputs
-- Duplicate information already captured`,
-      });
-      dbState.set(FILTER_KEY, true);
-      console.log("[boot] Supermemory filter prompt configured");
-    } catch (err) {
-      console.warn("[boot] Supermemory filter setup skipped:", (err as Error).message);
-    }
-  }
-})();
 
 // --- Tools ---
 const tools = buildTools({ config, memoryProvider, skillLoader, workspace: config.workspace, soulLoader });
@@ -145,9 +124,6 @@ const agentDeps: AgentDeps = {
   ingestConversation: (sessionKey, userId, messages) => memoryProvider.ingestConversation(sessionKey, userId, messages),
 };
 
-// Setup entity context for owner on first boot
-memoryProvider.setupEntityContext(config.owner.id).catch(() => {});
-
 const runAgent = createAgent(agentDeps);
 const streamAgentFn = createStreamAgent(agentDeps);
 
@@ -193,6 +169,7 @@ if (config.features.scheduler) {
     defaultUserId: defaultOwner,
     defaultChatId: defaultOwner,
     defaultChannel,
+    memoryProvider,
   });
   console.log("[boot] Proactive: started");
 }
@@ -203,7 +180,7 @@ const server = Bun.serve({
   fetch(req) {
     const url = new URL(req.url);
     if (url.pathname === "/health") {
-      return Response.json({ status: "ok", version: "1.3.3", uptime: process.uptime() });
+      return Response.json({ status: "ok", version: "2.0.0", uptime: process.uptime(), memory: config.memory.provider });
     }
     return new Response("Not found", { status: 404 });
   },

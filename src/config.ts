@@ -1,7 +1,7 @@
 /**
  * Koda configuration — Zod-validated with env override for secrets.
  *
- * 3-tier LLM: fast/standard/deep. Voice via Gemini STT (OpenRouter) + Cartesia TTS.
+ * 2-tier LLM: fast (Gemini) / deep (Claude Sonnet). Local memory via LanceDB + SQLite.
  */
 
 import { z } from "zod";
@@ -23,9 +23,16 @@ const ConfigSchema = z.object({
     fastModel: z.string().default("google/gemini-3-flash-preview"),
     deepModel: z.string().default("anthropic/claude-sonnet-4.6"),
   }),
-  supermemory: z.object({
-    apiKey: z.string().min(1, "Supermemory API key is required"),
-  }),
+  memory: withEmptyDefault(z.object({
+    provider: z.enum(["local", "hybrid"]).default("local"),
+    embeddingModel: z.string().default("openai/text-embedding-3-large"),
+    decayAggressiveness: z.number().min(0.1).max(5).default(1.0),
+    reflectionSchedule: z.enum(["daily", "weekly", "never"]).default("weekly"),
+    maxMemories: z.number().int().min(100).default(100_000),
+    archiveThreshold: z.number().min(0).max(1).default(0.20),
+    graphDepth: z.number().int().min(1).max(5).default(2),
+    supermemoryApiKey: z.string().optional(),
+  })),
   exa: withEmptyDefault(z.object({ apiKey: z.string().optional(), numResults: z.number().min(1).max(20).default(5) })),
   telegram: withEmptyDefault(z.object({
     token: z.string().optional(),
@@ -125,9 +132,9 @@ function applyEnvOverrides(raw: Record<string, unknown>): Record<string, unknown
 
   const mappings: [string, string[]][] = [
     ["KODA_OPENROUTER_API_KEY", ["openrouter", "apiKey"]],
-    ["KODA_SUPERMEMORY_API_KEY", ["supermemory", "apiKey"]],
     ["KODA_EXA_API_KEY", ["exa", "apiKey"]],
     ["KODA_TELEGRAM_TOKEN", ["telegram", "token"]],
+    ["KODA_MEMORY_EMBEDDING_MODEL", ["memory", "embeddingModel"]],
   ];
 
   function setNested(obj: Record<string, unknown>, path: string[], value: unknown): void {

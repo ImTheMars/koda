@@ -5,6 +5,44 @@ all notable changes to koda.
 ---
 
 ## 2026-02-18
+### v2.0.0 — local-first memory system (LanceDB + SQLite + Ebbinghaus decay)
+
+replaces Supermemory (cloud) with a fully local, multi-sector memory system. all data stays on-device. no new vendor keys required.
+
+#### added
+
+- **`src/memory/`** — new memory subsystem with 4 modules:
+  - `embedding.ts` — OpenRouter embeddings client (`openai/text-embedding-3-large` default), batched, content-hash cached in SQLite state KV.
+  - `graph.ts` — entity extraction via fast LLM, typed relations (`prefers`, `knows`, `updated_from`, `part_of`, `contradicts`), graph enrichment on recall.
+  - `decay.ts` — Ebbinghaus decay per sector (episodic=7d, semantic=60d, factual=365d, procedural=90d, reflective=180d). recall reinforces strength. proactive archival below configurable threshold (default 0.20).
+  - `migrate.ts` — one-shot v2→v3 migration: `learnings` → semantic memories, last 500 message pairs → episodic memories. auto-runs on first boot. backs up `koda.db` first.
+- **`src/memory/index.ts`** — `LocalMemoryProvider`: LanceDB vector search + SQLite metadata. drops into the existing `MemoryProvider` interface; `agent.ts` and `channels/` need no changes.
+- **weekly reflection** — proactive scheduler compresses old episodic memories into reflective insights via deep model call, then archives the originals.
+- **5 memory tools** — `remember` (sector+tags), `recall` (semantic search with sector filter), `forgetMemory`, `memoryGraph`, `memoryTimeline`.
+- **`koda memory` CLI** — `export`, `import`, `migrate`, `stats` subcommands.
+- **3 new SQLite tables** — `memories`, `memory_entities`, `memory_relations`. schema version bumped to 2.
+- **memory config block** — `provider`, `embeddingModel`, `decayAggressiveness`, `reflectionSchedule`, `maxMemories`, `archiveThreshold`, `graphDepth`.
+- **status tool** — now reports memory stats: total, by sector, avg strength, entity count, last decay/reflection timestamps.
+
+#### changed
+
+- **`supermemory` → `memory` config** — `KODA_SUPERMEMORY_API_KEY` no longer required. `KODA_MEMORY_EMBEDDING_MODEL` optionally overrides the embedding model.
+- **`@lancedb/lancedb@0.26.2`** added; `supermemory`, `@supermemory/tools` removed.
+- **`src/index.ts`** — version `2.0.0`, boots `LocalMemoryProvider` instead of Supermemory. Supermemory filter-prompt setup block removed.
+- **`src/proactive.ts`** — memory decay runs daily, reflection runs weekly, both self-gated via state KV.
+- **`src/cli.ts`** — setup no longer asks for Supermemory/Tavily/Cartesia keys. doctor checks LanceDB dir instead of Supermemory key.
+- **`src/tools/memory.ts`** — pure tool registrations; imports from `src/memory/index.ts`.
+- **`.env.example`** — `KODA_SUPERMEMORY_API_KEY` removed. `KODA_MEMORY_EMBEDDING_MODEL` documented as optional.
+
+#### removed
+
+- **Supermemory dependency** — `supermemory` SDK and `@supermemory/tools` removed entirely.
+- **`config.supermemory`** — replaced by `config.memory`.
+- **Supermemory filter-prompt boot step** — no longer needed.
+
+---
+
+## 2026-02-18
 ### v1.3.3 — 2-tier router: Grok 4.1 Fast + Claude Sonnet 4.6
 
 collapses the 3-tier model router (fast/standard/deep) into 2 tiers. Grok 4.1 Fast handles all default traffic; Claude Sonnet 4.6 handles explicit thinking/deep requests.
