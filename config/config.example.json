@@ -33,7 +33,21 @@
     "voice": 60000
   },
   "mcp": {
-    "servers": []
+    "servers": [
+      {
+        "name": "filesystem",
+        "transport": "stdio",
+        "command": "npx",
+        "args": ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"],
+        "autoRestart": true
+      },
+      {
+        "name": "my-api",
+        "transport": "sse",
+        "url": "http://localhost:8000/sse",
+        "autoRestart": true
+      }
+    ]
   },
   "soul": {
     "path": "./config/soul.md",

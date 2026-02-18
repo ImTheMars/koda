@@ -455,44 +455,46 @@ export function createStreamAgent(deps: AgentDeps) {
       });
     });
 
-    const finishedPromise = streamResult.then(async (result) => {
-      llmFailures = 0;
-      const finalModelId = result.response?.modelId ?? getModelId(currentTier, config);
-      const promptTokens = result.totalUsage?.inputTokens ?? result.usage?.inputTokens ?? 0;
-      const completionTokens = result.totalUsage?.outputTokens ?? result.usage?.outputTokens ?? 0;
-      const cost = calculateCost(finalModelId, promptTokens, completionTokens);
+    // StreamTextResult has .text, .usage, .response as Promises (not itself a Promise)
+    const finishedPromise = Promise.all([streamResult.text, streamResult.usage, streamResult.response] as const).then(
+      async ([text, usage, response]) => {
+        llmFailures = 0;
+        const finalModelId = (await response)?.modelId ?? getModelId(currentTier, config);
+        const promptTokens = (usage as any)?.inputTokens ?? 0;
+        const completionTokens = (usage as any)?.outputTokens ?? 0;
+        const cost = calculateCost(finalModelId, promptTokens, completionTokens);
 
-      log("agent", "stream done tokens=%d/%d cost=$%s tools=[%s]", promptTokens, completionTokens, cost.toFixed(4), [...new Set(toolsUsed)].join(","));
+        log("agent", "stream done tokens=%d/%d cost=$%s tools=[%s]", promptTokens, completionTokens, cost.toFixed(4), [...new Set(toolsUsed)].join(","));
 
-      dbUsage.track({
-        userId: input.senderId,
-        model: finalModelId,
-        inputTokens: promptTokens,
-        outputTokens: completionTokens,
-        cost,
-        toolsUsed: [...new Set(toolsUsed)],
-      });
+        dbUsage.track({
+          userId: input.senderId,
+          model: finalModelId,
+          inputTokens: promptTokens,
+          outputTokens: completionTokens,
+          cost,
+          toolsUsed: [...new Set(toolsUsed)],
+        });
 
-      const fallback = "aight that's handled.";
-      const responseText = result.text || fallback;
-      dbMessages.append(input.sessionKey, "user", input.content);
-      dbMessages.append(input.sessionKey, "assistant", responseText, [...new Set(toolsUsed)]);
+        const fallback = "aight that's handled.";
+        const responseText = text || fallback;
+        dbMessages.append(input.sessionKey, "user", input.content);
+        dbMessages.append(input.sessionKey, "assistant", responseText, [...new Set(toolsUsed)]);
 
-      const allMessages = [...history, { role: "user", content: input.content }, { role: "assistant", content: responseText }];
-      deps.ingestConversation(input.sessionKey, input.senderId, allMessages).catch(() => {});
+        const allMessages = [...history, { role: "user", content: input.content }, { role: "assistant", content: responseText }];
+        deps.ingestConversation(input.sessionKey, input.senderId, allMessages).catch(() => {});
 
-      return {
-        text: responseText,
-        tier: currentTier,
-        toolsUsed: [...new Set(toolsUsed)],
-        usage: { promptTokens, completionTokens, cost },
-      };
-    });
+        return {
+          text: responseText,
+          tier: currentTier,
+          toolsUsed: [...new Set(toolsUsed)],
+          usage: { promptTokens, completionTokens, cost },
+        };
+      },
+    );
 
     // Yield text chunks from the stream
     async function* textChunks() {
-      const result = await streamResult;
-      for await (const chunk of result.textStream) {
+      for await (const chunk of streamResult.textStream) {
         yield chunk;
       }
     }

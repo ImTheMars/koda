@@ -54,12 +54,30 @@ const ConfigSchema = z.object({
     voice: z.number().min(5000).default(60_000),
   })),
   mcp: withEmptyDefault(z.object({
-    servers: z.array(z.object({
-      name: z.string(),
-      transport: z.enum(["sse", "http"]),
-      url: z.string().url(),
-      headers: z.record(z.string()).optional(),
-    })).default([]),
+    servers: z.array(z.discriminatedUnion("transport", [
+      z.object({
+        name: z.string(),
+        transport: z.literal("sse"),
+        url: z.string().url(),
+        headers: z.record(z.string(), z.string()).optional(),
+        autoRestart: z.boolean().default(true),
+      }),
+      z.object({
+        name: z.string(),
+        transport: z.literal("http"),
+        url: z.string().url(),
+        headers: z.record(z.string(), z.string()).optional(),
+        autoRestart: z.boolean().default(true),
+      }),
+      z.object({
+        name: z.string(),
+        transport: z.literal("stdio"),
+        command: z.string(),
+        args: z.array(z.string()).default([]),
+        env: z.record(z.string(), z.string()).optional(),
+        autoRestart: z.boolean().default(true),
+      }),
+    ])).default([]),
   })),
   soul: withEmptyDefault(z.object({
     path: z.string().default("./config/soul.md"),

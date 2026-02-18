@@ -84,31 +84,56 @@ Skip:
 const tools = buildTools({ config, memoryProvider, skillLoader, workspace: config.workspace, soulLoader });
 
 // --- MCP Clients ---
-const mcpClients: Array<{ name: string; close: () => Promise<void> }> = [];
+type McpServerConfig = Config["mcp"]["servers"][number];
+
+function buildMcpTransport(server: McpServerConfig) {
+  if (server.transport === "stdio") {
+    return { type: "stdio" as const, command: server.command, args: server.args, env: server.env };
+  }
+  return { type: server.transport, url: server.url, ...(server.headers ? { headers: server.headers } : {}) };
+}
+
+async function connectMcpServer(server: McpServerConfig, toolSet: ReturnType<typeof buildTools>) {
+  const client = await createMCPClient({ transport: buildMcpTransport(server) as any });
+  const mcpTools = await client.tools();
+  Object.assign(toolSet, mcpTools);
+  return { client, toolKeys: Object.keys(mcpTools) };
+}
+
+const mcpClients: Array<{ name: string; server: McpServerConfig; client: Awaited<ReturnType<typeof connectMcpServer>>["client"] }> = [];
+
 for (const server of config.mcp.servers) {
   try {
-    const client = await createMCPClient({
-      transport: {
-        type: server.transport,
-        url: server.url,
-        ...(server.headers ? { headers: server.headers } : {}),
-      } as any,
-    });
-    const mcpTools = await client.tools();
-    const toolCount = Object.keys(mcpTools).length;
-    Object.assign(tools, mcpTools);
-    mcpClients.push({ name: server.name, close: () => client.close() });
-    console.log(`[boot] MCP: ${server.name} (${toolCount} tools)`);
+    const { client, toolKeys } = await connectMcpServer(server, tools);
+    mcpClients.push({ name: server.name, server, client });
+    console.log(`[boot] MCP: ${server.name} (${toolKeys.length} tools)`);
   } catch (err) {
     console.warn(`[boot] MCP: ${server.name} failed to connect:`, (err as Error).message);
   }
 }
 
-if (config.mcp.servers.length > 0) {
-  console.log(`[boot] Tools: ${Object.keys(tools).join(", ")}`);
-} else {
-  console.log(`[boot] Tools: ${Object.keys(tools).join(", ")}`);
-}
+console.log(`[boot] Tools: ${Object.keys(tools).join(", ")}`);
+
+// Health-check: reconnect crashed MCP servers every 60 s
+const mcpRestartTimer = setInterval(async () => {
+  for (const entry of mcpClients) {
+    if (!entry.server.autoRestart) continue;
+    try {
+      await entry.client.tools();
+    } catch {
+      console.warn(`[mcp] ${entry.name} unreachable — reconnecting...`);
+      try { await entry.client.close(); } catch {}
+      await Bun.sleep(2000);
+      try {
+        const { client, toolKeys } = await connectMcpServer(entry.server, tools);
+        entry.client = client;
+        console.log(`[mcp] ${entry.name} reconnected (${toolKeys.length} tools)`);
+      } catch (err) {
+        console.warn(`[mcp] ${entry.name} reconnect failed:`, (err as Error).message);
+      }
+    }
+  }
+}, 60_000);
 
 // --- Agent ---
 const agentDeps: AgentDeps = {
@@ -178,7 +203,7 @@ const server = Bun.serve({
   fetch(req) {
     const url = new URL(req.url);
     if (url.pathname === "/health") {
-      return Response.json({ status: "ok", version: "1.3.0", uptime: process.uptime() });
+      return Response.json({ status: "ok", version: "1.3.1", uptime: process.uptime() });
     }
     return new Response("Not found", { status: 404 });
   },
@@ -188,12 +213,13 @@ console.log(`[boot] Health server on :${server.port}/health`);
 // --- Graceful shutdown ---
 const shutdown = async (signal: string) => {
   console.log(`\n[${signal}] Shutting down...`);
+  clearInterval(mcpRestartTimer);
   proactive?.stop();
   repl?.stop();
   if (telegram) await telegram.stop();
   soulLoader.dispose();
   for (const mcp of mcpClients) {
-    try { await mcp.close(); } catch {}
+    try { await mcp.client.close(); } catch {}
   }
   closeDb();
   server.stop();

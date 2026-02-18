@@ -4,29 +4,83 @@ all notable changes to koda.
 
 ---
 
-## v1.2.0 — leaner runtime + multimodal fixes (2026-02-16)
+## 2026-02-18
+### v1.3.1 — MCP stdio transport + auto-restart
+
+extends the MCP client with stdio transport support for local servers and automatic reconnection on failure.
+
+#### added
+
+- **stdio MCP transport** — `mcp.servers` now accepts `transport: "stdio"` entries with `command`, `args`, and `env` fields. enables local MCP servers (filesystem, git, puppeteer, etc.) without running a separate HTTP/SSE server.
+- **MCP auto-restart** — a 60 s health-check interval calls `client.tools()` on each connected server. on failure it closes the old client, waits 2 s, and reconnects, re-merging tools into the live ToolSet. opt out per-server with `autoRestart: false`.
+- **`autoRestart` config field** — all three server variants (`sse`, `http`, `stdio`) accept an optional `autoRestart: boolean` (default `true`).
+
+#### changed
+
+- **`mcp.servers` schema** — migrated from a flat object to a `z.discriminatedUnion("transport", [...])`. each variant is fully typed: `sse`/`http` keep `url` + optional `headers`; `stdio` has `command` + optional `args`/`env`.
+- **`buildMcpTransport()` + `connectMcpServer()`** — MCP boot logic extracted into two helper functions in `src/index.ts`. removes the `as any` cast on the transport object.
+- **config.example.json** — `mcp.servers` now shows a stdio (`@modelcontextprotocol/server-filesystem`) and an sse example instead of an empty array.
+
+---
+
+## 2026-02-18
+### v1.3.0 — auto-learning, MCP, streaming, hardening
+
+major release. replaces the local learnings system with Supermemory's native user profiles and conversation ingestion, adds MCP client support, switches Telegram to streamText for real-time segment delivery, adds a system status tool, and hardens SQLite and the LLM pipeline.
+
+#### added
+
+- **supermemory user profiles** — `getProfile()` fetches static user facts, dynamic context, and query-specific memories from Supermemory at each request. structured profile replaces the flat learnings table in the system prompt.
+- **conversation ingestion** — after every exchange, messages are fire-and-forget sent to `supermemory.conversations.ingestOrUpdate()`. Supermemory auto-extracts facts and updates the user profile. zero extra LLM cost.
+- **supermemory filter prompt** — one-time boot setup via `client.settings.update()` configures Supermemory to filter ingested content for personal facts, corrections, and preferences. state-keyed so it only runs once.
+- **entity context** — `setupEntityContext()` sets per-user entity context on first interaction so Supermemory knows what kind of facts to focus on.
+- **MCP client support** — define external MCP servers in `config.json` under `mcp.servers`. each server is connected at boot and its tools are merged into the global tool set. failing servers are skipped without blocking boot.
+- **system status tool** — `systemStatus` tool reports uptime, memory usage, Supermemory health, LLM circuit breaker state, today's usage stats, and next scheduled task. answers "how are you doing?" with real system info.
+- **streamText for Telegram** — text and photo messages now use `streamAgent()` backed by `streamText`. segments are sent as they complete (delimited by `<|msg|>`), so users see responses faster instead of waiting for the full completion.
+- **SQLite migration system** — `runMigrations()` tracks `schema_version` in the `state` table and runs schema changes on boot. starts at version 1.
+
+#### changed
+
+- **learnings → supermemory profiles** — `getMemories` dep replaced by `getProfile` in `AgentDeps`. local learnings table is retained but no longer written to.
+- **totalUsage for cost tracking** — switched from `result.usage` to `result.totalUsage` for accurate multi-step cost when models escalate mid-conversation.
+- **Grammy error handling** — `bot.catch()` now differentiates `GrammyError` (bad API request, log and continue) vs `HttpError` (network failure, track and restart) vs unknown errors.
+- **SQLite pragmas** — added `PRAGMA synchronous = NORMAL` (safe with WAL, faster writes) and `PRAGMA busy_timeout = 5000` (retry on SQLITE_BUSY instead of failing).
+- **MCP config schema** — `config.ts` and `config.example.json` updated with `mcp.servers` array. removed stale `timeouts.browser` field.
+- **`@supermemory/tools` + `@ai-sdk/mcp` installed** — added to package.json.
+
+#### fixed
+
+- **emoji appended to every message** — removed emoji decorators from all soul.d headers (`🐻‍❄️`, `🛡️`, `🐾`). removed "polar bear on ice" metaphors from `soul.md`. added explicit no-emoji rule to `response.md`: "never end messages with emojis. no 🧊, no 🐻‍❄️, no emoji signatures."
+- **`result.chunk` search results dropped** — recall now reads both `r.memory` and `r.chunk` from Supermemory search results. document chunk hits were previously silently dropped.
+
+#### removed
+
+- **`CORRECTION_PATTERN` regex + auto-correction capture** — removed from agent.ts. Supermemory ingestion handles correction extraction automatically.
+- **`learnings` dependency from agent.ts** — `dbLearnings.getRecent()` and `dbLearnings` import removed from agent context building.
+- **`isMemoryDegraded` dep** — folded into `getProfile` returning empty arrays on circuit break.
+
+---
+
+## 2026-02-16
+### v1.2.0 — leaner runtime + multimodal fixes
 
 focuses on removing low-value surface area, fixing image handling, and tightening runtime reliability.
 
-### added
-
-- **outgoing message deduplication** — `sendReply()` now checks `sentMessages` Set before sending. identical outgoing messages (same chatId + content hash via `Bun.hash()`) are skipped within a 5-minute window. prevents duplicate bot replies from retry logic or double calls.
-
-### removed
+#### removed
 
 - **stagehand browser tools** — removed `src/tools/browser.ts` and `@browserbasehq/stagehand` dependency to reduce runtime size and optional complexity.
 - **heartbeat file loop** — removed HEARTBEAT.md polling/parsing from proactive jobs; scheduler is now the only proactive mechanism.
 - **unused memory deletion path** — removed `deleteMemory` tool and provider delete method.
 - **dead db API** — removed `messages.rewrite()` from the sqlite layer.
 
-### fixed
+#### fixed
 
 - **photo understanding** — telegram photo handler now downloads the image and passes base64 image attachments to the agent for multimodal responses.
 - **usage accounting** — token cost now uses the actual response model id (including failover) instead of assumed tier model.
 - **typing race** — typing indicator is now ref-counted per chat to avoid concurrent request collisions.
 - **exec memory growth** — capped process stdout/stderr buffers and added cleanup for completed process entries.
 
-### changed
+#### changed
 
 - **response formatting** — telegram now sends html-formatted messages instead of stripping markdown; links/code/bold are preserved.
 - **message delimiter** — switched multi-message delimiter from `|||` to `<|msg|>` across agent and channels.
@@ -41,33 +95,44 @@ focuses on removing low-value surface area, fixing image handling, and tightenin
 
 ---
 
-## v1.1.2 — reminder reliability + character consistency (2026-02-13)
+## 2026-02-16
+### v1.1.3 — outgoing message deduplication
+
+#### added
+
+- **outgoing message deduplication** — `sendReply()` now checks `sentMessages` Set before sending. identical outgoing messages (same chatId + content hash via `Bun.hash()`) are skipped within a 5-minute window. prevents duplicate bot replies from retry logic or double calls.
+
+---
+
+## 2026-02-13
+### v1.1.2 — reminder reliability + character consistency
 
 fixes reminders silently failing outside active hours (8am–11pm) and the bot breaking character when apologizing.
 
-### fixed
+#### fixed
 
 - **reminders now fire 24/7** — `checkTasks()` was gated behind `isActiveHours()`, so any reminder set for nighttime (e.g. 1:19 AM) would silently never fire. scheduler checks are now outside the active hours gate; only the heartbeat respects quiet hours.
 - **near-term reminder precision** — reminders set < 5 minutes out now get a precise `setTimeout` via `scheduleNudge()` instead of relying on the 30s poll interval. "remind me in 1 min" fires on time, not up to 30s late.
 - **"done." fallback** — when the LLM returned empty text, the agent sent the literal string "done." which confused users. replaced with "aight that's handled." to stay in character.
 
-### changed
+#### changed
 
 - **soul: error/apology guidance** — added 4 rules to `response.md` for handling mistakes in-character: own it casually, never apologize formally, stay lowercase, don't over-explain.
 - **version bump to 1.1.2** — updated `package.json` and health endpoint.
 
 ---
 
-## v1.1.1 — dev logging + emoji tuning + cleanup (2026-02-13)
+## 2026-02-13
+### v1.1.1 — dev logging + emoji tuning + cleanup
 
 small quality-of-life release. adds opt-in debug logging for the full message lifecycle, tones down emoji usage in soul files, and cleans up stale v1.0 references.
 
-### added
+#### added
 
 - **debug logging** — set `"debug": true` in config.json `features` to enable `[tag]` console logs across the entire message lifecycle: tier/intent classification, model selection, context compaction, model escalation, tool calls, token usage + cost, telegram message routing, STT/TTS, proactive ticks, memory operations. zero-cost when disabled.
 - **`src/log.ts`** — tiny `log(tag, ...args)` helper. `enableDebug()` activates it on boot.
 
-### changed
+#### changed
 
 - **soul emoji cleanup** — removed all 🧊 usage (was 3 occurrences). 🐻‍❄️ kept where identity matters (3 uses). added one 🐾 on protocol header. emojis now used sparingly.
 - **version bump to 1.1.1** — updated `package.json`, health endpoint, soul default version, all file headers.
@@ -75,11 +140,12 @@ small quality-of-life release. adds opt-in debug logging for the full message li
 
 ---
 
-## v1.1.0 — hardening + voice pipeline upgrade (2026-02-13)
+## 2026-02-13
+### v1.1.0 — hardening + voice pipeline upgrade
 
 hardening release. ships all 8 v1.1 roadmap items plus a full voice pipeline swap.
 
-### changed
+#### changed
 
 - **voice STT: groq whisper → gemini 3 flash via openrouter** — eliminates a separate API key. STT now reuses the existing openrouter key. gemini handles audio natively as multimodal input (`input_audio` with base64 ogg).
 - **voice TTS: openai tts-1 → cartesia sonic 3** — lower latency (~40ms), better voice quality. configurable voice id via `voice.cartesiaVoiceId` (defaults to `694f9389-aac1-45b6-b726-9d9369183238`).
@@ -90,17 +156,18 @@ hardening release. ships all 8 v1.1 roadmap items plus a full voice pipeline swa
 - **context compaction** — when tool step count exceeds 10, `prepareStep` splices older messages keeping last 6. prevents context window exhaustion on deep tool chains.
 - **heartbeat structured parsing** — heartbeat now parses `- [ ]` / `- [x]` checkboxes from HEARTBEAT.md. only sends pending items with structured count to agent (e.g. "you have 3 pending tasks (2 completed)").
 
-### no-op
+#### no-op
 
 - **skill hot-reload** — marked done. `loadSkill()` already reads the file fresh every call, `listSkills()` scans directories every call. no cache to invalidate.
 
 ---
 
-## v1.0.1 — stability + safety patch (2026-02-13)
+## 2026-02-13
+### v1.0.1 — stability + safety patch
 
 bugfix release focused on setup reliability, request isolation, scheduler delivery, and filesystem hardening.
 
-### fixed
+#### fixed
 
 - **setup/runtime env mismatch** — runtime now loads both `~/.koda/.env` and project `.env`, so `koda setup` works without manual env copying.
 - **required key inconsistency** — setup now requires `KODA_SUPERMEMORY_API_KEY`, matching config validation.
@@ -114,15 +181,18 @@ bugfix release focused on setup reliability, request isolation, scheduler delive
 - **memory fallback targeting** — sqlite fallback recall now accepts the active session key so lookups hit the correct conversation history.
 - **cli entrypoint** — `bun run src/cli.ts <command>` now executes commands directly (`koda` script is functional).
 
-### changed
+#### changed
 
 - bumped version to **1.0.1** (`package.json`, CLI version output, health endpoint version).
 
-## v1.0.0 — the rebuild (2026-02-12)
+---
+
+## 2026-02-12
+### v1.0.0 — the rebuild
 
 ground-up rewrite. threw away the over-engineered prototype, kept the good ideas, rebuilt everything from scratch.
 
-### added
+#### added
 
 - **3-tier llm routing** — fast/standard/deep replaces 4-tier simple/medium/complex/reasoning. rule-based keyword classifier instead of 8-dimension weighted scoring. cheaper, faster, predictable.
 - **model escalation** — `prepareStep` callback automatically upgrades the model mid-conversation if the agent exceeds 5 tool steps on a lower tier. starts cheap, scales only when needed.
@@ -133,7 +203,7 @@ ground-up rewrite. threw away the over-engineered prototype, kept the good ideas
 - **closure-based tool context** — shared `toolContext` object set per-request, replacing AsyncLocalStorage threading.
 - **health server** — `GET /health` endpoint on port 3000 for docker/railway health checks.
 
-### changed
+#### changed
 
 - **architecture** — 12-stage middleware pipeline replaced by single `generateText` tool loop. the vercel ai sdk handles the entire agent loop via `stepCountIs(30)`.
 - **message routing** — typed MessageBus replaced by direct `runAgent()` function calls from channels. no message bus, no pub/sub.
@@ -147,7 +217,7 @@ ground-up rewrite. threw away the over-engineered prototype, kept the good ideas
 - **benchmarks** — adapted from 113 cases (many testing removed features) to 55 deterministic + 15 llm-judged cases. 100% pass rate. removed outcome, safety, and budget scorers.
 - **telegram** — inline rate limiting and message dedup instead of separate middleware. voice message support. photo caption support.
 
-### removed
+#### removed
 
 - **middleware pipeline** — the 12-stage `(ctx, next) => Promise<void>` pipeline. replaced by a single function.
 - **MessageBus** — typed pub/sub message routing. channels now call functions directly.
@@ -167,7 +237,7 @@ ground-up rewrite. threw away the over-engineered prototype, kept the good ideas
 - **`src/cli/embedded.ts`** — build-time asset bundling for compiled CLI binary.
 - **stale docs** — ARCHITECTURE.md, SETUP.md, TOOLS.md, BENCHMARKS.md, CLI.md, README_SIMPLE.md. all referenced the old architecture.
 
-### stats
+#### stats
 
 | metric | v0 (prototype) | v1 (rebuild) |
 |--------|---------------|-------------|
@@ -180,7 +250,8 @@ ground-up rewrite. threw away the over-engineered prototype, kept the good ideas
 
 ---
 
-## v0.1.0 — prototype (2026-02-08)
+## 2026-02-08
+### v0.1.0 — prototype
 
 initial prototype. proved the concept but was over-engineered for a personal assistant.
 

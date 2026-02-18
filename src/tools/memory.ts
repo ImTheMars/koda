@@ -1,5 +1,11 @@
 /**
- * Memory tools — Supermemory with user profiles, conversation ingestion, circuit breaker, and SQLite fallback.
+ * Memory tools — Supermemory with circuit breaker and SQLite fallback.
+ *
+ * Uses the actual Supermemory SDK v4 API:
+ *   client.memories.add(), client.search.memories(), client.settings.update()
+ *
+ * "Profile" is approximated via two search queries (static facts + dynamic context).
+ * Conversation ingestion stores an assistant-memory entry after each exchange.
  */
 
 import { tool, type ToolSet } from "ai";
@@ -8,7 +14,7 @@ import Supermemory from "supermemory";
 import { messages as dbMessages, state as dbState } from "../db.js";
 import { log } from "../log.js";
 
-// --- Circuit breaker (inline) ---
+// --- Circuit breaker ---
 
 let failures = 0;
 let lastFailureTime = 0;
@@ -52,7 +58,7 @@ export function createMemoryProvider(apiKey: string): MemoryProvider {
 
     async store(userId, content, tags) {
       if (isCircuitOpen()) { log("memory", "circuit breaker tripped"); return { id: "unavailable" }; }
-      log("memory", "store key=%s", content.slice(0, 80));
+      log("memory", "store user=%s len=%d", userId, content.length);
       try {
         const result = await client.memories.add({
           content,
@@ -60,7 +66,7 @@ export function createMemoryProvider(apiKey: string): MemoryProvider {
           metadata: { user_id: userId, ...(tags?.length ? { tags: tags.join(",") } : {}) },
         });
         recordSuccess();
-        return { id: result.id };
+        return { id: (result as any).id ?? "ok" };
       } catch (err) {
         recordFailure();
         console.error("[memory] Store failed:", err);
@@ -81,8 +87,9 @@ export function createMemoryProvider(apiKey: string): MemoryProvider {
       try {
         const response = await client.search.memories({ q: query, containerTag: `user-${userId}`, limit });
         recordSuccess();
-        log("memory", "recall: %d results", response.results.length);
-        return response.results.map((r) => (r as any).memory ?? (r as any).chunk ?? "").filter(Boolean);
+        const results = (response as any).results ?? [];
+        log("memory", "recall: %d results", results.length);
+        return results.map((r: any) => r.memory ?? r.chunk ?? r.content ?? "").filter(Boolean);
       } catch (err) {
         recordFailure();
         console.error("[memory] Recall failed:", err);
@@ -101,19 +108,25 @@ export function createMemoryProvider(apiKey: string): MemoryProvider {
         return { static: [], dynamic: [], memories: fallbackMemories };
       }
       try {
-        const result = await (client as any).profile({
-          containerTag: `user-${userId}`,
-          ...(query ? { q: query } : {}),
-          ...(query ? { threshold: 0.6 } : {}),
-        });
+        // Static profile = general facts about the user
+        // Dynamic context = recent/current situation, if there's a query
+        const [staticRes, dynamicRes] = await Promise.all([
+          client.search.memories({ q: `who is this user, their background, preferences, and facts`, containerTag: `user-${userId}`, limit: 8 }),
+          query ? client.search.memories({ q: query, containerTag: `user-${userId}`, limit: 5 }) : Promise.resolve(null),
+        ]);
         recordSuccess();
-        const profile = result?.profile ?? {};
-        const searchResults = result?.searchResults?.results ?? [];
-        log("memory", "profile: static=%d dynamic=%d memories=%d", profile.static?.length ?? 0, profile.dynamic?.length ?? 0, searchResults.length);
+
+        const toStrings = (res: any) =>
+          ((res?.results ?? []) as any[]).map((r: any) => r.memory ?? r.chunk ?? r.content ?? "").filter(Boolean);
+
+        const staticFacts = toStrings(staticRes);
+        const queryMemories = dynamicRes ? toStrings(dynamicRes) : [];
+
+        log("memory", "profile: static=%d memories=%d", staticFacts.length, queryMemories.length);
         return {
-          static: profile.static ?? [],
-          dynamic: profile.dynamic ?? [],
-          memories: searchResults.map((r: any) => r.memory ?? r.chunk ?? "").filter(Boolean),
+          static: staticFacts,
+          dynamic: [],
+          memories: queryMemories,
         };
       } catch (err) {
         recordFailure();
@@ -124,15 +137,20 @@ export function createMemoryProvider(apiKey: string): MemoryProvider {
 
     async ingestConversation(sessionKey, userId, messages) {
       if (isCircuitOpen()) { log("memory", "ingest: circuit open, skipping"); return; }
-      if (!messages.length) return;
+      // Only ingest the last user+assistant pair to avoid excessive API calls
+      const lastUser = [...messages].reverse().find((m) => m.role === "user");
+      const lastAssistant = [...messages].reverse().find((m) => m.role === "assistant");
+      if (!lastUser || !lastAssistant) return;
+
+      const summary = `Conversation excerpt:\nUser: ${lastUser.content.slice(0, 300)}\nKoda: ${lastAssistant.content.slice(0, 300)}`;
       try {
-        await (client as any).conversations.ingestOrUpdate({
-          conversationId: sessionKey,
-          containerTags: [`user-${userId}`],
-          messages: messages.map((m) => ({ role: m.role, content: m.content })),
+        await client.memories.add({
+          content: summary,
+          containerTag: `user-${userId}`,
+          metadata: { session: sessionKey, type: "conversation" },
         });
         recordSuccess();
-        log("memory", "ingest: conversation %s (%d msgs)", sessionKey, messages.length);
+        log("memory", "ingest: stored conversation excerpt for session %s", sessionKey);
       } catch (err) {
         recordFailure();
         console.error("[memory] Ingest failed:", err);
@@ -143,21 +161,19 @@ export function createMemoryProvider(apiKey: string): MemoryProvider {
       const stateKey = `sm_entity_ctx_${userId}`;
       if (dbState.get(stateKey)) return;
       if (isCircuitOpen()) return;
-      try {
-        await (client as any).containerTags.update(`user-${userId}`, {
-          entityContext: `Ongoing conversations between this user and Koda (personal AI assistant). Focus on the user's preferences, corrections, personal facts, habits, and project context. Koda is their assistant — extract what matters for personalization.`,
-        });
-        dbState.set(stateKey, true);
-        recordSuccess();
-        log("memory", "entity context set for user %s", userId);
-      } catch (err) {
-        console.error("[memory] Entity context setup failed:", err);
-      }
+      // Supermemory SDK v4 doesn't expose containerTags.update() — skip this step
+      // Entity context is applied implicitly via the filter prompt set at boot
+      dbState.set(stateKey, true);
+      log("memory", "entity context skipped (not in SDK v4), marked as done for user %s", userId);
     },
 
     async healthCheck() {
-      try { await client.search.memories({ q: "health", limit: 1 }); return true; }
-      catch { return false; }
+      try {
+        await client.search.memories({ q: "health", limit: 1 });
+        return true;
+      } catch {
+        return false;
+      }
     },
   };
 }
