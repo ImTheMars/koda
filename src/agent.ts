@@ -79,6 +79,7 @@ function buildSystemPrompt(deps: {
   isProfileDegraded: boolean;
   workspace: string;
   timezone: string;
+  hasWebSearch: boolean;
 }): string {
   const now = new Date();
   const formatted = formatUserTime(now, deps.timezone);
@@ -138,6 +139,19 @@ rules:
     } else {
       parts.push(`<static_profile>\nNo profile yet. If asked about personal info, say you don't have that stored.\n</static_profile>`);
     }
+  }
+
+  // Web search guidance
+  if (deps.hasWebSearch) {
+    parts.push(`## web search
+you have the webSearch tool. use it whenever asked about:
+- current events, news, or anything happening in the world
+- who currently holds a position (president, CEO, etc.)
+- prices, rankings, scores, or any live/changing data
+- recent releases, announcements, or updates
+- any fact that could have changed since 2024
+
+your training data is outdated. for anything time-sensitive — search first, answer second.`);
   }
 
   // Skills
@@ -235,6 +249,7 @@ export function createAgent(deps: AgentDeps) {
       isProfileDegraded: false,
       workspace: config.workspace,
       timezone: config.scheduler.timezone,
+      hasWebSearch: "webSearch" in tools,
     });
 
     const history = dbMessages.getHistory(input.sessionKey, 30);
@@ -384,6 +399,7 @@ export function createStreamAgent(deps: AgentDeps) {
       isProfileDegraded: false,
       workspace: config.workspace,
       timezone: config.scheduler.timezone,
+      hasWebSearch: "webSearch" in tools,
     });
 
     const history = dbMessages.getHistory(input.sessionKey, 30);
