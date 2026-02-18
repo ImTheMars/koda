@@ -2,7 +2,7 @@
  * Memory tools — Supermemory with circuit breaker and SQLite fallback.
  *
  * Uses the actual Supermemory SDK v4 API:
- *   client.memories.add(), client.search.memories(), client.settings.update()
+ *   client.documents.add(), client.search.memories(), client.settings.update()
  *
  * "Profile" is approximated via two search queries (static facts + dynamic context).
  * Conversation ingestion stores an assistant-memory entry after each exchange.
@@ -60,7 +60,7 @@ export function createMemoryProvider(apiKey: string): MemoryProvider {
       if (isCircuitOpen()) { log("memory", "circuit breaker tripped"); return { id: "unavailable" }; }
       log("memory", "store user=%s len=%d", userId, content.length);
       try {
-        const result = await client.memories.add({
+        const result = await client.documents.add({
           content,
           containerTag: `user-${userId}`,
           metadata: { user_id: userId, ...(tags?.length ? { tags: tags.join(",") } : {}) },
@@ -144,7 +144,7 @@ export function createMemoryProvider(apiKey: string): MemoryProvider {
 
       const summary = `Conversation excerpt:\nUser: ${lastUser.content.slice(0, 300)}\nKoda: ${lastAssistant.content.slice(0, 300)}`;
       try {
-        await client.memories.add({
+        await client.documents.add({
           content: summary,
           containerTag: `user-${userId}`,
           metadata: { session: sessionKey, type: "conversation" },
