@@ -17,6 +17,7 @@ import { registerExecTools } from "./exec.js";
 import { registerScheduleTools } from "./schedule.js";
 import { registerSkillTools } from "./skills.js";
 import { registerSoulTools, SoulLoader } from "./soul.js";
+import { registerStatusTools } from "./status.js";
 
 interface ToolRuntimeContext {
   userId: string;
@@ -76,6 +77,9 @@ export function buildTools(deps: {
   if (deps.soulLoader) {
     Object.assign(tools, registerSoulTools({ soulLoader: deps.soulLoader }));
   }
+
+  // Status
+  Object.assign(tools, registerStatusTools({ memory: memoryProvider }));
 
   return tools;
 }

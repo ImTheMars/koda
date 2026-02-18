@@ -52,7 +52,14 @@ const ConfigSchema = z.object({
     memory: z.number().min(1000).default(10_000),
     search: z.number().min(1000).default(30_000),
     voice: z.number().min(5000).default(60_000),
-    browser: z.number().min(5000).default(60_000),
+  })),
+  mcp: withEmptyDefault(z.object({
+    servers: z.array(z.object({
+      name: z.string(),
+      transport: z.enum(["sse", "http"]),
+      url: z.string().url(),
+      headers: z.record(z.string()).optional(),
+    })).default([]),
   })),
   soul: withEmptyDefault(z.object({
     path: z.string().default("./config/soul.md"),

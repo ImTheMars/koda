@@ -1,12 +1,14 @@
 /**
  * Telegram channel — Grammy bot with voice pipeline (Gemini STT via OpenRouter + Cartesia TTS).
  *
- * Direct ctx.reply() after runAgent(), no MessageBus.
+ * Uses streamAgent for text/photo messages so segments send as they complete.
+ * Voice messages use runAgent (can't stream TTS).
  */
 
-import { Bot } from "grammy";
+import { Bot, GrammyError, HttpError } from "grammy";
 import type { Config } from "../config.js";
 import { messages as dbMessages, usage as dbUsage } from "../db.js";
+import type { StreamAgentResult } from "../agent.js";
 import { log } from "../log.js";
 
 export interface TelegramDeps {
@@ -18,6 +20,14 @@ export interface TelegramDeps {
     onTypingStart?: () => void;
     onTypingStop?: () => void;
   }) => Promise<{ text: string }>;
+  streamAgent: (input: {
+    content: string; senderId: string; chatId: string; channel: string;
+    attachments?: Array<{ type: "image"; mimeType: string; data: string }>;
+    sessionKey: string; source?: string;
+    onAck?: (text: string) => void;
+    onTypingStart?: () => void;
+    onTypingStop?: () => void;
+  }) => Promise<StreamAgentResult>;
   config: Config;
 }
 
@@ -26,6 +36,7 @@ const TYPING_TIMEOUT_MS = 120_000;
 const DEDUP_CLEANUP_MS = 5 * 60_000;
 const RATE_LIMIT = { maxRequests: 10, windowMs: 60_000 };
 const MESSAGE_DELIMITER = "<|msg|>";
+const SEGMENT_DELAY_MS = 400;
 
 export function startTelegram(deps: TelegramDeps): { stop: () => Promise<void>; sendDirect: (chatId: string, text: string) => Promise<void> } {
   const { config } = deps;
@@ -111,20 +122,50 @@ export function startTelegram(deps: TelegramDeps): { stop: () => Promise<void>; 
     return chunks;
   };
 
-  const sendReply = async (chatId: number, text: string) => {
+  const sendSegment = async (chatId: number, text: string) => {
     const outgoingKey = `${chatId}:${Bun.hash(text)}`;
     if (sentMessages.has(outgoingKey)) {
       log("telegram", "dedup: skipping duplicate outgoing message");
       return;
     }
     sentMessages.add(outgoingKey);
+    for (const chunk of chunkMessage(text)) {
+      await bot.api.sendMessage(chatId, markdownToTelegramHtml(chunk), { parse_mode: "HTML" });
+    }
+  };
 
+  const sendReply = async (chatId: number, text: string) => {
     const segments = text.split(MESSAGE_DELIMITER).map((s) => s.trim()).filter(Boolean);
     for (let i = 0; i < segments.length; i++) {
-      for (const chunk of chunkMessage(segments[i]!)) {
-        await bot.api.sendMessage(chatId, markdownToTelegramHtml(chunk), { parse_mode: "HTML" });
+      await sendSegment(chatId, segments[i]!);
+      if (i < segments.length - 1) await new Promise((r) => setTimeout(r, SEGMENT_DELAY_MS + Math.random() * 200));
+    }
+  };
+
+  // Stream segments to Telegram as they arrive — send each segment immediately when delimiter found
+  const sendStreamReply = async (chatId: number, stream: AsyncIterable<string>, onStop: () => void) => {
+    let buffer = "";
+    try {
+      for await (const chunk of stream) {
+        buffer += chunk;
+        // Check for complete segments delimited by MESSAGE_DELIMITER
+        const parts = buffer.split(MESSAGE_DELIMITER);
+        // All parts except the last are complete segments
+        for (let i = 0; i < parts.length - 1; i++) {
+          const segment = parts[i]!.trim();
+          if (segment) {
+            await sendSegment(chatId, segment);
+            await new Promise((r) => setTimeout(r, SEGMENT_DELAY_MS + Math.random() * 200));
+          }
+        }
+        // Last part is still accumulating
+        buffer = parts[parts.length - 1] ?? "";
       }
-      if (i < segments.length - 1) await new Promise((r) => setTimeout(r, 600 + Math.random() * 600));
+      // Send any remaining content
+      const remaining = buffer.trim();
+      if (remaining) await sendSegment(chatId, remaining);
+    } finally {
+      onStop();
     }
   };
 
@@ -201,13 +242,29 @@ export function startTelegram(deps: TelegramDeps): { stop: () => Promise<void>; 
   let consecutiveErrors = 0;
 
   bot.catch(async (err) => {
-    console.error("[telegram] Grammy error:", err.error ?? err);
-    consecutiveErrors++;
-    if (consecutiveErrors > 5) {
-      console.error("[telegram] Too many errors, restarting bot...");
-      consecutiveErrors = 0;
-      try { await bot.stop(); } catch {}
-      startWithRetry();
+    const e = err.error;
+    if (e instanceof GrammyError) {
+      // Bad API request — log and continue, don't restart
+      console.error(`[telegram] API error ${e.error_code}: ${e.description}`);
+    } else if (e instanceof HttpError) {
+      // Network failure — track and potentially restart
+      console.error("[telegram] Network error:", e.message);
+      consecutiveErrors++;
+      if (consecutiveErrors > 5) {
+        console.error("[telegram] Too many network errors, restarting bot...");
+        consecutiveErrors = 0;
+        try { await bot.stop(); } catch {}
+        startWithRetry();
+      }
+    } else {
+      console.error("[telegram] Unknown error:", e ?? err);
+      consecutiveErrors++;
+      if (consecutiveErrors > 5) {
+        console.error("[telegram] Too many errors, restarting bot...");
+        consecutiveErrors = 0;
+        try { await bot.stop(); } catch {}
+        startWithRetry();
+      }
     }
   });
 
@@ -246,7 +303,7 @@ export function startTelegram(deps: TelegramDeps): { stop: () => Promise<void>; 
     await ctx.reply(`usage summary:\n\ntoday: ${today.totalRequests} requests, ${fmt(today.totalCost)}\nthis month: ${month.totalRequests} requests, ${fmt(month.totalCost)}\nall time: ${allTime.totalRequests} requests, ${fmt(allTime.totalCost)}`);
   });
 
-  // --- Text messages ---
+  // --- Text messages (streaming) ---
   bot.on("message:text", async (ctx) => {
     const senderId = String(ctx.from?.id);
     if (!isAllowed(senderId)) return;
@@ -257,20 +314,27 @@ export function startTelegram(deps: TelegramDeps): { stop: () => Promise<void>; 
     log("telegram", "text from=%s chat=%s len=%d", senderId, chatId, ctx.message.text.length);
     if (isRateLimited(chatId)) { await ctx.reply("slow down! you're sending messages too fast."); return; }
 
-    const result = await deps.runAgent({
-      content: ctx.message.text,
-      senderId, chatId, channel: "telegram",
-      sessionKey: `telegram_${chatId}`,
-      onAck: (text) => ctx.reply(text).catch(() => {}),
-      onTypingStart: () => startTyping(chatId),
-      onTypingStop: () => stopTyping(chatId),
-    });
+    startTyping(chatId);
+    try {
+      const streamResult = await deps.streamAgent({
+        content: ctx.message.text,
+        senderId, chatId, channel: "telegram",
+        sessionKey: `telegram_${chatId}`,
+        onAck: (text) => ctx.reply(text).catch(() => {}),
+      });
 
-    consecutiveErrors = 0;
-    await sendReply(Number(chatId), result.text);
+      consecutiveErrors = 0;
+      await sendStreamReply(Number(chatId), streamResult.fullStream, () => stopTyping(chatId));
+      // Await finished for any side effects (db writes, ingestion) but result already sent
+      await streamResult.finishedPromise.catch(console.error);
+    } catch (err) {
+      stopTyping(chatId);
+      console.error("[telegram] Stream error:", err);
+      await ctx.reply("ran into an issue, try again?").catch(() => {});
+    }
   });
 
-  // --- Voice messages ---
+  // --- Voice messages (non-streaming, needs full text for TTS) ---
   bot.on("message:voice", async (ctx) => {
     const senderId = String(ctx.from?.id);
     if (!isAllowed(senderId)) return;
@@ -305,7 +369,6 @@ export function startTelegram(deps: TelegramDeps): { stop: () => Promise<void>; 
 
       consecutiveErrors = 0;
 
-      // Voice reply first, text as fallback
       const audioBuffer = await synthesize(result.text.replace(new RegExp(MESSAGE_DELIMITER, "g"), " ").slice(0, 4096));
       if (audioBuffer) {
         log("telegram", "tts: %d bytes", audioBuffer.length);
@@ -320,7 +383,7 @@ export function startTelegram(deps: TelegramDeps): { stop: () => Promise<void>; 
     }
   });
 
-  // --- Photo messages ---
+  // --- Photo messages (streaming) ---
   bot.on("message:photo", async (ctx) => {
     const senderId = String(ctx.from?.id);
     if (!isAllowed(senderId)) return;
@@ -355,18 +418,24 @@ export function startTelegram(deps: TelegramDeps): { stop: () => Promise<void>; 
     }
     const buffer = Buffer.from(await response.arrayBuffer());
 
-    const result = await deps.runAgent({
-      content: caption,
-      attachments: [{ type: "image", mimeType: "image/jpeg", data: buffer.toString("base64") }],
-      senderId, chatId, channel: "telegram",
-      sessionKey: `telegram_${chatId}`,
-      onAck: (text) => ctx.reply(text).catch(() => {}),
-      onTypingStart: () => startTyping(chatId),
-      onTypingStop: () => stopTyping(chatId),
-    });
+    startTyping(chatId);
+    try {
+      const streamResult = await deps.streamAgent({
+        content: caption,
+        attachments: [{ type: "image", mimeType: "image/jpeg", data: buffer.toString("base64") }],
+        senderId, chatId, channel: "telegram",
+        sessionKey: `telegram_${chatId}`,
+        onAck: (text) => ctx.reply(text).catch(() => {}),
+      });
 
-    consecutiveErrors = 0;
-    await sendReply(Number(chatId), result.text);
+      consecutiveErrors = 0;
+      await sendStreamReply(Number(chatId), streamResult.fullStream, () => stopTyping(chatId));
+      await streamResult.finishedPromise.catch(console.error);
+    } catch (err) {
+      stopTyping(chatId);
+      console.error("[telegram] Photo stream error:", err);
+      await ctx.reply("ran into an issue, try again?").catch(() => {});
+    }
   });
 
   // --- Start polling with retry ---

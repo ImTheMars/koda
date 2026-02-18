@@ -8,6 +8,10 @@ all notable changes to koda.
 
 focuses on removing low-value surface area, fixing image handling, and tightening runtime reliability.
 
+### added
+
+- **outgoing message deduplication** — `sendReply()` now checks `sentMessages` Set before sending. identical outgoing messages (same chatId + content hash via `Bun.hash()`) are skipped within a 5-minute window. prevents duplicate bot replies from retry logic or double calls.
+
 ### removed
 
 - **stagehand browser tools** — removed `src/tools/browser.ts` and `@browserbasehq/stagehand` dependency to reduce runtime size and optional complexity.
@@ -34,14 +38,6 @@ focuses on removing low-value surface area, fixing image handling, and tightenin
 - **llm resilience** — added an OpenRouter circuit-breaker response path after consecutive failures.
 - **help command** — added `/help` telegram command.
 - **version bump to 1.2.0** — updated `package.json` and health endpoint.
-
----
-
-## v1.1.3 — outgoing message deduplication (2026-02-16)
-
-### added
-
-- **outgoing message deduplication** — `sendReply()` now checks `sentMessages` Set before sending. identical outgoing messages (same chatId + content hash via `Bun.hash()`) are skipped within a 5-minute window. prevents duplicate bot replies from retry logic or double calls.
 
 ---
 

@@ -12,9 +12,13 @@ let stmtAppendMessage: ReturnType<Database["prepare"]> | null = null;
 let stmtGetHistory: ReturnType<Database["prepare"]> | null = null;
 let stmtTrackUsage: ReturnType<Database["prepare"]> | null = null;
 
+const SCHEMA_VERSION = 1;
+
 export function initDb(dbPath: string): Database {
   db = new Database(dbPath, { create: true });
   db.exec("PRAGMA journal_mode = WAL");
+  db.exec("PRAGMA synchronous = NORMAL");
+  db.exec("PRAGMA busy_timeout = 5000");
   db.exec("PRAGMA foreign_keys = ON");
 
   db.exec(`
@@ -77,7 +81,24 @@ export function initDb(dbPath: string): Database {
   stmtGetHistory = db.prepare("SELECT role, content FROM messages WHERE session_key = ? ORDER BY id DESC LIMIT ?");
   stmtTrackUsage = db.prepare("INSERT INTO usage (user_id, model, input_tokens, output_tokens, cost, tools_used, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)");
 
+  runMigrations(db);
+
   return db;
+}
+
+function runMigrations(database: Database): void {
+  const versionRow = database.query("SELECT value FROM state WHERE key = 'schema_version'").get() as { value: string } | null;
+  const currentVersion = versionRow ? parseInt(versionRow.value, 10) : 0;
+
+  if (currentVersion >= SCHEMA_VERSION) return;
+
+  // v1 → (current schema — no ALTER TABLE needed, just record version)
+  if (currentVersion < 1) {
+    database.run(
+      "INSERT OR REPLACE INTO state (key, value, updated_at) VALUES ('schema_version', '1', datetime('now'))",
+    );
+    console.log("[db] Migrated to schema version 1");
+  }
 }
 
 export function getDb(): Database {

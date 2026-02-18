@@ -30,8 +30,10 @@
     "llm": 120000,
     "memory": 10000,
     "search": 30000,
-    "voice": 60000,
-    "browser": 60000
+    "voice": 60000
+  },
+  "mcp": {
+    "servers": []
   },
   "soul": {
     "path": "./config/soul.md",

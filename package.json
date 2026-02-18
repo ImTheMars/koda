@@ -16,8 +16,10 @@
     "bench:full": "bun run bench/runner.ts --suite all --format json"
   },
   "dependencies": {
+    "@ai-sdk/mcp": "^1.0.21",
     "@clack/prompts": "^0.9.1",
     "@openrouter/ai-sdk-provider": "^2.1.1",
+    "@supermemory/tools": "^1.4.0",
     "@tavily/core": "^0.7.1",
     "ai": "^6.0.0",
     "chalk": "^5.4.1",
