@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Koda — Memory Graph</title>
+  <script src="https://unpkg.com/vis-network@9.1.9/standalone/umd/vis-network.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #0e0e10;
+      color: #e2e2e5;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 13px;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 18px;
+      background: #17171a;
+      border-bottom: 1px solid #2a2a30;
+      flex-shrink: 0;
+    }
+
+    .logo {
+      font-weight: 700;
+      font-size: 15px;
+      letter-spacing: -0.3px;
+      color: #fff;
+    }
+    .logo span { color: #7c6dfa; }
+
+    .header-right {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+
+    .badge {
+      font-size: 11px;
+      background: #252528;
+      border: 1px solid #333;
+      border-radius: 5px;
+      padding: 3px 8px;
+      color: #aaa;
+    }
+
+    #refresh-btn {
+      font-size: 11px;
+      background: #252528;
+      border: 1px solid #333;
+      border-radius: 5px;
+      padding: 3px 10px;
+      color: #ccc;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    #refresh-btn:hover { background: #2e2e34; }
+
+    .main {
+      display: flex;
+      flex: 1;
+      overflow: hidden;
+    }
+
+    /* ── Stats sidebar ── */
+    .sidebar {
+      width: 220px;
+      flex-shrink: 0;
+      background: #131316;
+      border-right: 1px solid #2a2a30;
+      padding: 14px 12px;
+      overflow-y: auto;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    .sidebar-section h3 {
+      font-size: 10px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.8px;
+      color: #666;
+      margin-bottom: 8px;
+    }
+
+    .stat-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 4px 0;
+      border-bottom: 1px solid #1e1e22;
+    }
+    .stat-label { color: #888; }
+    .stat-value { font-weight: 600; color: #e2e2e5; }
+
+    .sector-bar {
+      margin-top: 4px;
+    }
+    .sector-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 3px 0;
+    }
+    .sector-dot {
+      width: 8px; height: 8px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+    .sector-name { color: #999; flex: 1; }
+    .sector-count { font-weight: 600; }
+
+    .legend {
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+    }
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .legend-swatch {
+      width: 12px; height: 12px;
+      border-radius: 3px;
+      flex-shrink: 0;
+    }
+    .legend-label { color: #aaa; }
+
+    /* ── Graph canvas ── */
+    #graph-container {
+      flex: 1;
+      position: relative;
+    }
+
+    #graph {
+      width: 100%;
+      height: 100%;
+    }
+
+    #empty-state {
+      position: absolute;
+      inset: 0;
+      display: none;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      color: #555;
+    }
+    #empty-state .icon { font-size: 40px; }
+    #empty-state p { font-size: 13px; }
+
+    /* ── Node detail tooltip ── */
+    #detail-panel {
+      position: absolute;
+      bottom: 16px;
+      right: 16px;
+      background: #1a1a1e;
+      border: 1px solid #2e2e36;
+      border-radius: 8px;
+      padding: 12px 14px;
+      min-width: 200px;
+      max-width: 300px;
+      display: none;
+      font-size: 12px;
+    }
+    #detail-panel h4 { color: #fff; margin-bottom: 6px; }
+    #detail-panel .detail-row { display: flex; justify-content: space-between; padding: 2px 0; }
+    #detail-panel .detail-key { color: #777; }
+    #detail-panel .detail-val { color: #ccc; text-align: right; }
+
+    /* ── Loading overlay ── */
+    #loading {
+      position: absolute;
+      inset: 0;
+      background: rgba(14,14,16,0.85);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 13px;
+      color: #666;
+    }
+
+    .spinner {
+      width: 18px; height: 18px;
+      border: 2px solid #333;
+      border-top-color: #7c6dfa;
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+      margin-right: 10px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .last-updated {
+      font-size: 10px;
+      color: #555;
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <div class="logo">koda <span>memory</span></div>
+  <div class="header-right">
+    <span class="badge" id="entity-count-badge">— entities</span>
+    <span class="last-updated" id="last-updated">—</span>
+    <button id="refresh-btn" onclick="loadGraph()">↻ refresh</button>
+  </div>
+</header>
+
+<div class="main">
+  <!-- Sidebar -->
+  <div class="sidebar">
+    <div class="sidebar-section">
+      <h3>Memory Stats</h3>
+      <div class="stat-row"><span class="stat-label">Total</span><span class="stat-value" id="s-total">—</span></div>
+      <div class="stat-row"><span class="stat-label">Archived</span><span class="stat-value" id="s-archived">—</span></div>
+      <div class="stat-row"><span class="stat-label">Avg strength</span><span class="stat-value" id="s-strength">—</span></div>
+      <div class="stat-row"><span class="stat-label">Entities</span><span class="stat-value" id="s-entities">—</span></div>
+    </div>
+
+    <div class="sidebar-section">
+      <h3>By Sector</h3>
+      <div class="sector-bar" id="sector-bars"></div>
+    </div>
+
+    <div class="sidebar-section">
+      <h3>Maintenance</h3>
+      <div class="stat-row"><span class="stat-label">Last decay</span><span class="stat-value" id="s-decay">—</span></div>
+      <div class="stat-row"><span class="stat-label">Last reflect</span><span class="stat-value" id="s-reflect">—</span></div>
+    </div>
+
+    <div class="sidebar-section">
+      <h3>Legend</h3>
+      <div class="legend">
+        <div class="legend-item"><div class="legend-swatch" style="background:#8b5cf6"></div><span class="legend-label">person</span></div>
+        <div class="legend-item"><div class="legend-swatch" style="background:#3b82f6"></div><span class="legend-label">project</span></div>
+        <div class="legend-item"><div class="legend-swatch" style="background:#10b981"></div><span class="legend-label">place</span></div>
+        <div class="legend-item"><div class="legend-swatch" style="background:#f59e0b"></div><span class="legend-label">preference</span></div>
+        <div class="legend-item"><div class="legend-swatch" style="background:#6b7280"></div><span class="legend-label">topic</span></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Graph -->
+  <div id="graph-container">
+    <div id="graph"></div>
+    <div id="empty-state">
+      <div class="icon">🧠</div>
+      <p>No entities in memory yet.</p>
+      <p style="color:#444">Tell Koda something memorable to get started.</p>
+    </div>
+    <div id="loading"><div class="spinner"></div> loading graph…</div>
+    <div id="detail-panel">
+      <h4 id="dp-name">—</h4>
+      <div class="detail-row"><span class="detail-key">Type</span><span class="detail-val" id="dp-type">—</span></div>
+      <div class="detail-row"><span class="detail-key">Relations</span><span class="detail-val" id="dp-rels">—</span></div>
+    </div>
+  </div>
+</div>
+
+<script>
+  const COLORS = {
+    person:     { bg: '#8b5cf6', border: '#6d28d9' },
+    project:    { bg: '#3b82f6', border: '#1d4ed8' },
+    place:      { bg: '#10b981', border: '#047857' },
+    preference: { bg: '#f59e0b', border: '#b45309' },
+    topic:      { bg: '#6b7280', border: '#4b5563' },
+  };
+
+  const SECTOR_COLORS = {
+    episodic:   '#f472b6',
+    semantic:   '#7c6dfa',
+    factual:    '#34d399',
+    procedural: '#60a5fa',
+    reflective: '#fbbf24',
+  };
+
+  let network = null;
+
+  function fmtDate(iso) {
+    if (!iso || iso === 'never') return 'never';
+    const d = new Date(iso);
+    return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+  }
+
+  function fmtAgo(iso) {
+    if (!iso || iso === 'never') return 'never';
+    const diff = Date.now() - new Date(iso).getTime();
+    const hours = Math.floor(diff / 3600000);
+    if (hours < 1) return 'just now';
+    if (hours < 24) return `${hours}h ago`;
+    return `${Math.floor(hours/24)}d ago`;
+  }
+
+  async function loadGraph() {
+    document.getElementById('loading').style.display = 'flex';
+    document.getElementById('detail-panel').style.display = 'none';
+
+    try {
+      const data = await fetch('/api/graph').then(r => r.json());
+
+      // Update stats
+      const s = data.stats || {};
+      document.getElementById('s-total').textContent = s.total ?? 0;
+      document.getElementById('s-archived').textContent = s.archived ?? 0;
+      document.getElementById('s-strength').textContent = s.avgStrength != null ? (s.avgStrength * 100).toFixed(0) + '%' : '—';
+      document.getElementById('s-entities').textContent = s.entityCount ?? 0;
+      document.getElementById('s-decay').textContent = fmtAgo(s.lastDecay);
+      document.getElementById('s-reflect').textContent = fmtAgo(s.lastReflection);
+      document.getElementById('entity-count-badge').textContent = `${data.nodes.length} entities`;
+      document.getElementById('last-updated').textContent = 'updated ' + fmtDate(new Date().toISOString());
+
+      // Sector bars
+      const bySector = s.bySector || {};
+      const sectorHtml = Object.entries(SECTOR_COLORS).map(([name, color]) => `
+        <div class="sector-item">
+          <div class="sector-dot" style="background:${color}"></div>
+          <span class="sector-name">${name}</span>
+          <span class="sector-count">${bySector[name] ?? 0}</span>
+        </div>
+      `).join('');
+      document.getElementById('sector-bars').innerHTML = sectorHtml;
+
+      // Render graph
+      if (!data.nodes.length) {
+        document.getElementById('empty-state').style.display = 'flex';
+        document.getElementById('loading').style.display = 'none';
+        return;
+      }
+      document.getElementById('empty-state').style.display = 'none';
+
+      const visNodes = new vis.DataSet(data.nodes.map(n => {
+        const c = COLORS[n.group] || COLORS.topic;
+        return {
+          id: n.id,
+          label: n.label.length > 18 ? n.label.slice(0, 16) + '…' : n.label,
+          fullLabel: n.label,
+          group: n.group,
+          relations: n.relations || [],
+          color: { background: c.bg, border: c.border, highlight: { background: c.bg, border: '#fff' } },
+          font: { color: '#fff', size: 12, face: '-apple-system, sans-serif' },
+          shape: 'dot',
+          size: 14 + Math.min(n.relations?.length || 0, 8) * 2,
+          borderWidth: 2,
+        };
+      }));
+
+      const visEdges = new vis.DataSet(data.edges.map(e => ({
+        from: e.from,
+        to: e.to,
+        label: e.label,
+        color: { color: '#333', highlight: '#7c6dfa', opacity: 0.7 },
+        font: { color: '#666', size: 10, align: 'middle' },
+        arrows: { to: { enabled: true, scaleFactor: 0.5 } },
+        smooth: { type: 'curvedCW', roundness: 0.1 },
+        width: 1.5,
+      })));
+
+      const container = document.getElementById('graph');
+      const graphData = { nodes: visNodes, edges: visEdges };
+      const options = {
+        layout: { improvedLayout: true },
+        physics: {
+          enabled: true,
+          barnesHut: { gravitationalConstant: -3000, springLength: 130, damping: 0.4 },
+          stabilization: { iterations: 150 },
+        },
+        interaction: { hover: true, tooltipDelay: 200, zoomView: true, dragView: true },
+        nodes: { shadow: { enabled: true, color: 'rgba(0,0,0,0.4)', size: 8, x: 2, y: 2 } },
+        edges: { shadow: false },
+      };
+
+      if (network) {
+        network.setData(graphData);
+      } else {
+        network = new vis.Network(container, graphData, options);
+
+        network.on('click', (params) => {
+          if (!params.nodes.length) { document.getElementById('detail-panel').style.display = 'none'; return; }
+          const node = visNodes.get(params.nodes[0]);
+          document.getElementById('dp-name').textContent = node.fullLabel;
+          document.getElementById('dp-type').textContent = node.group;
+          document.getElementById('dp-rels').textContent = node.relations.join(', ') || 'none';
+          document.getElementById('detail-panel').style.display = 'block';
+        });
+
+        network.on('deselectNode', () => {
+          document.getElementById('detail-panel').style.display = 'none';
+        });
+      }
+
+    } catch (err) {
+      console.error('Graph load error:', err);
+    } finally {
+      document.getElementById('loading').style.display = 'none';
+    }
+  }
+
+  // Initial load + auto-refresh every 60s
+  loadGraph();
+  setInterval(loadGraph, 60_000);
+</script>
+</body>
+</html>

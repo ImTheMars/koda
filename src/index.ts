@@ -5,9 +5,9 @@
  */
 
 import { mkdir } from "fs/promises";
-import { resolve } from "path";
+import { resolve, join } from "path";
 import { loadConfig } from "./config.js";
-import { initDb, closeDb, messages as dbMessages } from "./db.js";
+import { initDb, closeDb, messages as dbMessages, entities as dbEntities, relations as dbRelations, memories as dbMemoriesTable, state as dbState } from "./db.js";
 import { createAgent, createStreamAgent, type AgentDeps } from "./agent.js";
 import { SoulLoader } from "./tools/soul.js";
 import { SkillLoader } from "./tools/skills.js";
@@ -174,18 +174,75 @@ if (config.features.scheduler) {
   console.log("[boot] Proactive: started");
 }
 
-// --- Health server ---
+// --- Health + Web UI server ---
+const GRAPH_HTML = Bun.file(join(import.meta.dir, "../public/graph.html"));
+
+function buildGraphApiResponse(userId: string): Response {
+  const ents = dbEntities.listByUser(userId);
+  const stats = dbMemoriesTable.getStats(userId);
+  const entityCount = dbEntities.count(userId);
+
+  const nodes = ents.map((e) => {
+    const rels = dbRelations.listFromEntity(e.id);
+    return {
+      id: e.id,
+      label: e.name,
+      group: e.type,
+      relations: rels.map((r) => r.relation),
+    };
+  });
+
+  const edgeSet = new Set<string>();
+  const edges: Array<{ from: string; to: string; label: string }> = [];
+
+  for (const e of ents) {
+    const rels = dbRelations.listFromEntity(e.id);
+    for (const r of rels) {
+      if (!r.toEntity) continue;
+      const key = `${e.id}::${r.toEntity}::${r.relation}`;
+      if (edgeSet.has(key)) continue;
+      edgeSet.add(key);
+      edges.push({ from: e.id, to: r.toEntity, label: r.relation });
+    }
+  }
+
+  const lastDecay = dbState.get<string>(`last_decay_${userId}`) ?? null;
+  const lastReflection = dbState.get<string>(`last_reflect_${userId}`) ?? null;
+
+  return Response.json({
+    nodes,
+    edges,
+    stats: { ...stats, entityCount, lastDecay, lastReflection },
+  });
+}
+
 const server = Bun.serve({
   port: Number(process.env.PORT ?? 3000),
-  fetch(req) {
+  async fetch(req) {
     const url = new URL(req.url);
+
     if (url.pathname === "/health") {
       return Response.json({ status: "ok", version: "2.0.0", uptime: process.uptime(), memory: config.memory.provider });
     }
+
+    if (url.pathname === "/graph") {
+      return new Response(GRAPH_HTML, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+    }
+
+    if (url.pathname === "/api/graph") {
+      try {
+        const userId = config.telegram.adminIds[0] ?? config.owner.id;
+        return buildGraphApiResponse(userId);
+      } catch (err) {
+        return Response.json({ error: (err as Error).message }, { status: 500 });
+      }
+    }
+
     return new Response("Not found", { status: 404 });
   },
 });
 console.log(`[boot] Health server on :${server.port}/health`);
+console.log(`[boot] Memory graph  on :${server.port}/graph`);
 
 // --- Graceful shutdown ---
 const shutdown = async (signal: string) => {
