@@ -5,6 +5,32 @@ all notable changes to koda.
 ---
 
 ## 2026-02-18
+### v1.3.2 — Exa search + voice pipeline removal
+
+replaces Tavily web search with Exa Instant, removes the entire voice/TTS pipeline from Telegram, and cleans up the config schema.
+
+#### added
+
+- **Exa web search** — `webSearch` and `extractUrl` tools now use `exa-js`. `searchAndContents()` fetches results + summaries in one call; `getContents()` handles URL extraction. set `KODA_EXA_API_KEY` in `.env` to enable.
+- **`exa.numResults` config field** — controls default result count per search (1–20, default 5).
+
+#### changed
+
+- **`@tavily/core` → `exa-js`** — `@tavily/core` removed from dependencies.
+- **`config.tavily` → `config.exa`** — schema field renamed. `KODA_TAVILY_API_KEY` env var replaced by `KODA_EXA_API_KEY`.
+- **`config.voice` removed** — `cartesiaApiKey` and `cartesiaVoiceId` fields dropped from config schema and env mappings.
+- **`config.timeouts.voice` removed** — voice timeout field dropped.
+- **status tool** — `searchProvider: "exa"` added to `systemStatus` output.
+
+#### removed
+
+- **voice pipeline** — `transcribe()` (Gemini STT via OpenRouter) and `synthesize()` (Cartesia Sonic 3 TTS) functions deleted from `src/channels/telegram.ts`. Voice message handler (`bot.on("message:voice")`) deleted.
+- **`runAgent` from `TelegramDeps`** — voice was the only path calling `runAgent`; interface now only requires `streamAgent`.
+- **`KODA_CARTESIA_API_KEY` / `KODA_CARTESIA_VOICE_ID`** env vars — removed from `.env.example` and config mappings.
+
+---
+
+## 2026-02-18
 ### v1.3.1 — MCP stdio transport + auto-restart
 
 extends the MCP client with stdio transport support for local servers and automatic reconnection on failure.

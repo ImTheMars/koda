@@ -1,8 +1,7 @@
 /**
- * Telegram channel — Grammy bot with voice pipeline (Gemini STT via OpenRouter + Cartesia TTS).
+ * Telegram channel — Grammy bot with streaming text and photo support.
  *
  * Uses streamAgent for text/photo messages so segments send as they complete.
- * Voice messages use runAgent (can't stream TTS).
  */
 
 import { Bot, GrammyError, HttpError } from "grammy";
@@ -12,14 +11,6 @@ import type { StreamAgentResult } from "../agent.js";
 import { log } from "../log.js";
 
 export interface TelegramDeps {
-  runAgent: (input: {
-    content: string; senderId: string; chatId: string; channel: string;
-    attachments?: Array<{ type: "image"; mimeType: string; data: string }>;
-    sessionKey: string; source?: string;
-    onAck?: (text: string) => void;
-    onTypingStart?: () => void;
-    onTypingStop?: () => void;
-  }) => Promise<{ text: string }>;
   streamAgent: (input: {
     content: string; senderId: string; chatId: string; channel: string;
     attachments?: Array<{ type: "image"; mimeType: string; data: string }>;
@@ -171,73 +162,6 @@ export function startTelegram(deps: TelegramDeps): { stop: () => Promise<void>; 
 
   const dedupKey = (chatId: number, messageId: number) => `${chatId}:${messageId}`;
 
-  // --- STT: Gemini 3 Flash via OpenRouter ---
-  const transcribe = async (audioBuffer: Buffer): Promise<string | null> => {
-    try {
-      const base64Audio = audioBuffer.toString("base64");
-      const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${config.openrouter.apiKey}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          model: "google/gemini-3-flash-preview",
-          messages: [{
-            role: "user",
-            content: [
-              { type: "text", text: "Transcribe this audio exactly as spoken. Return only the transcription, nothing else." },
-              { type: "input_audio", input_audio: { data: base64Audio, format: "ogg" } },
-            ],
-          }],
-        }),
-        signal: AbortSignal.timeout(config.timeouts.voice),
-      });
-
-      if (!res.ok) return null;
-      const data = await res.json() as { choices?: Array<{ message?: { content?: string } }> };
-      return data.choices?.[0]?.message?.content?.trim() || null;
-    } catch {
-      return null;
-    }
-  };
-
-  // --- TTS: Cartesia Sonic 3 ---
-  const synthesize = async (text: string): Promise<Buffer | null> => {
-    const cartesiaKey = config.voice.cartesiaApiKey;
-    if (!cartesiaKey) return null;
-
-    try {
-      const res = await fetch("https://api.cartesia.ai/tts/bytes", {
-        method: "POST",
-        headers: {
-          "X-API-Key": cartesiaKey,
-          "Cartesia-Version": "2025-04-16",
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          model_id: "sonic-3",
-          transcript: text.slice(0, 4096),
-          voice: {
-            mode: "id",
-            id: config.voice.cartesiaVoiceId,
-          },
-          output_format: {
-            container: "mp3",
-            encoding: "pcm_f32le",
-            sample_rate: 44100,
-          },
-        }),
-        signal: AbortSignal.timeout(config.timeouts.voice),
-      });
-
-      if (!res.ok) return null;
-      return Buffer.from(await res.arrayBuffer());
-    } catch {
-      return null;
-    }
-  };
-
   // --- Error tracking + reconnect ---
   let consecutiveErrors = 0;
 
@@ -331,55 +255,6 @@ export function startTelegram(deps: TelegramDeps): { stop: () => Promise<void>; 
       stopTyping(chatId);
       console.error("[telegram] Stream error:", err);
       await ctx.reply("ran into an issue, try again?").catch(() => {});
-    }
-  });
-
-  // --- Voice messages (non-streaming, needs full text for TTS) ---
-  bot.on("message:voice", async (ctx) => {
-    const senderId = String(ctx.from?.id);
-    if (!isAllowed(senderId)) return;
-    const key = dedupKey(ctx.chat.id, ctx.message.message_id);
-    if (processedMessages.has(key)) return;
-    processedMessages.add(key);
-    const chatId = String(ctx.chat.id);
-    log("telegram", "voice from=%s chat=%s", senderId, chatId);
-    if (isRateLimited(chatId)) { await ctx.reply("slow down!"); return; }
-
-    try {
-      const file = await ctx.getFile();
-      if (!file.file_path) { await ctx.reply("I couldn't access that voice message."); return; }
-
-      const url = `https://api.telegram.org/file/bot${token}/${file.file_path}`;
-      const response = await fetch(url);
-      if (!response.ok) throw new Error(`Failed to fetch voice (${response.status})`);
-      const buffer = Buffer.from(await response.arrayBuffer());
-
-      const transcription = await transcribe(buffer);
-      if (!transcription) { await ctx.reply("I couldn't transcribe that audio."); return; }
-      log("telegram", "stt: %d chars", transcription.length);
-
-      const result = await deps.runAgent({
-        content: transcription,
-        senderId, chatId, channel: "telegram",
-        sessionKey: `telegram_${chatId}`, source: "voice",
-        onAck: (text) => ctx.reply(text).catch(() => {}),
-        onTypingStart: () => startTyping(chatId),
-        onTypingStop: () => stopTyping(chatId),
-      });
-
-      consecutiveErrors = 0;
-
-      const audioBuffer = await synthesize(result.text.replace(new RegExp(MESSAGE_DELIMITER, "g"), " ").slice(0, 4096));
-      if (audioBuffer) {
-        log("telegram", "tts: %d bytes", audioBuffer.length);
-        await ctx.replyWithVoice(new Blob([new Uint8Array(audioBuffer)], { type: "audio/mpeg" }) as any);
-      } else {
-        log("telegram", "tts: unavailable, text fallback");
-        await sendReply(Number(chatId), result.text);
-      }
-    } catch (err) {
-      console.error("[telegram] Voice processing error:", err);
-      await ctx.reply("Failed to process voice message.");
     }
   });
 

@@ -60,9 +60,9 @@ export function buildTools(deps: {
     ...registerSkillTools({ skillLoader, workspace }),
   };
 
-  // Search (optional — needs Tavily key)
-  if (config.tavily.apiKey) {
-    Object.assign(tools, registerSearchTools({ apiKey: config.tavily.apiKey }));
+  // Search (optional — needs Exa key)
+  if (config.exa.apiKey) {
+    Object.assign(tools, registerSearchTools({ apiKey: config.exa.apiKey, numResults: config.exa.numResults }));
   }
 
   // Schedule

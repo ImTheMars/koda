@@ -26,11 +26,13 @@
     "maxTokens": 8192,
     "temperature": 0.7
   },
+  "exa": {
+    "numResults": 5
+  },
   "timeouts": {
     "llm": 120000,
     "memory": 10000,
-    "search": 30000,
-    "voice": 60000
+    "search": 30000
   },
   "mcp": {
     "servers": [

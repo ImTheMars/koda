@@ -156,7 +156,7 @@ let telegram: { stop: () => Promise<void>; sendDirect: (chatId: string, text: st
 let repl: { stop: () => void } | null = null;
 
 if (config.mode !== "cli-only" && config.telegram.token) {
-  telegram = startTelegram({ runAgent, streamAgent: streamAgentFn, config });
+  telegram = startTelegram({ streamAgent: streamAgentFn, config });
   console.log("[boot] Channel: telegram enabled");
 }
 
@@ -203,7 +203,7 @@ const server = Bun.serve({
   fetch(req) {
     const url = new URL(req.url);
     if (url.pathname === "/health") {
-      return Response.json({ status: "ok", version: "1.3.1", uptime: process.uptime() });
+      return Response.json({ status: "ok", version: "1.3.2", uptime: process.uptime() });
     }
     return new Response("Not found", { status: 404 });
   },

@@ -27,11 +27,7 @@ const ConfigSchema = z.object({
   supermemory: z.object({
     apiKey: z.string().min(1, "Supermemory API key is required"),
   }),
-  tavily: withEmptyDefault(z.object({ apiKey: z.string().optional() })),
-  voice: withEmptyDefault(z.object({
-    cartesiaApiKey: z.string().optional(),
-    cartesiaVoiceId: z.string().default("694f9389-aac1-45b6-b726-9d9369183238"),
-  })),
+  exa: withEmptyDefault(z.object({ apiKey: z.string().optional(), numResults: z.number().min(1).max(20).default(5) })),
   telegram: withEmptyDefault(z.object({
     token: z.string().optional(),
     allowFrom: z.array(z.string()).default([]),
@@ -51,7 +47,6 @@ const ConfigSchema = z.object({
     llm: z.number().min(5000).default(120_000),
     memory: z.number().min(1000).default(10_000),
     search: z.number().min(1000).default(30_000),
-    voice: z.number().min(5000).default(60_000),
   })),
   mcp: withEmptyDefault(z.object({
     servers: z.array(z.discriminatedUnion("transport", [
@@ -132,10 +127,8 @@ function applyEnvOverrides(raw: Record<string, unknown>): Record<string, unknown
   const mappings: [string, string[]][] = [
     ["KODA_OPENROUTER_API_KEY", ["openrouter", "apiKey"]],
     ["KODA_SUPERMEMORY_API_KEY", ["supermemory", "apiKey"]],
-    ["KODA_TAVILY_API_KEY", ["tavily", "apiKey"]],
+    ["KODA_EXA_API_KEY", ["exa", "apiKey"]],
     ["KODA_TELEGRAM_TOKEN", ["telegram", "token"]],
-    ["KODA_CARTESIA_API_KEY", ["voice", "cartesiaApiKey"]],
-    ["KODA_CARTESIA_VOICE_ID", ["voice", "cartesiaVoiceId"]],
   ];
 
   function setNested(obj: Record<string, unknown>, path: string[], value: unknown): void {

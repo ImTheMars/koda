@@ -8,7 +8,7 @@ import { tasks as dbTasks, usage as dbUsage } from "../db.js";
 import type { MemoryProvider } from "./memory.js";
 import { isLlmCircuitOpen } from "../agent.js";
 
-const VERSION = "1.3.0";
+const VERSION = "1.3.2";
 
 export function registerStatusTools(deps: { memory: MemoryProvider }): ToolSet {
   const { memory } = deps;
@@ -44,6 +44,7 @@ export function registerStatusTools(deps: { memory: MemoryProvider }): ToolSet {
           status: memory.isDegraded ? "degraded" : "healthy",
         },
         llmCircuitBreaker: isLlmCircuitOpen() ? "open (degraded)" : "closed (healthy)",
+        searchProvider: "exa",
         todayUsage: {
           requests: todayUsage.totalRequests,
           cost: `$${todayUsage.totalCost.toFixed(4)}`,
