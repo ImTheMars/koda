@@ -1,11 +1,11 @@
 <h1 align="center">koda</h1>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/v1.0-stable-10b981?style=flat-square" alt="v1.0" />
+  <img src="https://img.shields.io/badge/v1.3-stable-10b981?style=flat-square" alt="v1.3" />
   <img src="https://img.shields.io/badge/bun-runtime-f472b6?style=flat-square" alt="Bun" />
   <img src="https://img.shields.io/badge/typescript-strict-3178c6?style=flat-square" alt="TypeScript" />
   <img src="https://img.shields.io/badge/bench-55%2F55_passing-10b981?style=flat-square" alt="55/55" />
-  <img src="https://img.shields.io/badge/files-19-white?style=flat-square" alt="19 files" />
+  <img src="https://img.shields.io/badge/files-21-white?style=flat-square" alt="21 files" />
   <img src="https://img.shields.io/badge/license-MIT-yellow?style=flat-square" alt="MIT" />
 </p>
 
@@ -20,7 +20,7 @@ most ai assistants feel like talking to a help desk. koda feels like texting you
 
 koda is a long-running assistant that connects to telegram or a local cli, routes every message through the right model for the job, remembers your preferences via semantic memory, creates its own skills, schedules reminders, browses the web, executes code locally, and replies with voice notes.
 
-built on bun. runs on a $5 vps. 19 files. no bloat.
+built on bun. runs on a $5 vps. 21 files. no bloat.
 
 ## why koda
 
@@ -59,8 +59,8 @@ you (telegram / cli / voice)
    ┌──────────────────────────────┐
    │  tools                       │
    │  memory · search · exec     │
-   │  filesystem · browser       │
-   │  schedule · skills · soul   │
+   │  filesystem · schedule      │
+   │  skills · soul · status     │
    └──────────────────────────────┘
          |
          v
@@ -70,7 +70,7 @@ you (telegram / cli / voice)
    └──────────┘
 ```
 
-no message bus. no middleware pipeline. no AsyncLocalStorage. the agent calls `generateText` with tools, the ai sdk handles the loop, and channels call `runAgent()` directly. that's it.
+no message bus. no middleware pipeline. the agent calls `generateText` or `streamText` with tools, the ai sdk handles the loop, and channels call `runAgent()` or `streamAgent()` directly. tool context (userId, chatId, channel) is threaded via AsyncLocalStorage so every tool knows who it's serving without passing state around. that's it.
 
 the old prototype had 46 files, a 12-stage pipeline, 4-tier routing with 8-dimension weighted scoring, typed message bus, and cloud sandboxing. we threw it all away and rebuilt from scratch. the result is faster, cheaper, and fits in your head.
 
@@ -149,30 +149,33 @@ koda/
 │   ├── config.ts             zod-validated 3-tier config
 │   ├── db.ts                 sqlite with 5 tables
 │   ├── router.ts             rule-based classifier + pricing
-│   ├── agent.ts              generateText tool loop core
+│   ├── agent.ts              generateText / streamText loop core
 │   ├── time.ts               cron parsing + timezone utils
-│   ├── proactive.ts          30s tick loop + heartbeat
+│   ├── proactive.ts          30s tick loop + scheduler
 │   ├── cli.ts                setup / doctor / upgrade / version
+│   ├── env.ts                zero-dep .env parser
+│   ├── log.ts                debug logger
 │   ├── channels/
 │   │   ├── repl.ts           local cli channel
 │   │   └── telegram.ts       grammy bot + voice pipeline
 │   └── tools/
-│       ├── index.ts          tool composition + context
+│       ├── index.ts          tool registry + AsyncLocalStorage context
 │       ├── memory.ts         supermemory + circuit breaker
 │       ├── search.ts         tavily web search
 │       ├── filesystem.ts     workspace-scoped file ops
-│       ├── exec.ts           local code execution
-│       ├── browser.ts        stagehand headless browser
+│       ├── exec.ts           local code execution + auto-background
 │       ├── schedule.ts       reminders + recurring tasks
 │       ├── skills.ts         self-evolving skill system
-│       └── soul.ts           personality loader + editor
+│       ├── soul.ts           personality loader + hot-reload editor
+│       └── status.ts         system health reporter
 ├── bench/                    55+ deterministic + llm-judge cases
-├── config/                   soul.md, config.example.json
+├── config/                   soul.md, soul.d/, config.example.json
+├── skills/                   skill-creator, morning-briefing, web-research
 ├── Dockerfile                production container
 └── railway.toml              one-click railway deploy
 ```
 
-**19 files · 2,862 lines of typescript · 8 tool modules · 70 benchmark cases**
+**21 files · 3,723 lines of typescript · 9 tool modules · 70 benchmark cases**
 
 ## models
 
@@ -198,10 +201,10 @@ all models are configurable. swap in any openrouter-supported model.
 | **webSearch** / **extractUrl** | tavily-powered search + page content extraction. |
 | **readFile** / **writeFile** / **listFiles** | workspace-scoped filesystem. blocked patterns for .env, secrets, node_modules. |
 | **exec** / **process** | local code execution via Bun.spawn. auto-backgrounds after 10s. poll, view logs, or kill running processes. |
-| **browseUrl** / **browserAct** / **browserExtract** / **browserScreenshot** / **browserClose** | stagehand headless browser. navigate, click, fill forms, extract data, take screenshots. |
 | **createReminder** / **createRecurringTask** / **listTasks** / **deleteTask** | timezone-aware scheduling with cron-style recurrence. |
 | **skills** | list, load, or create SKILL.md files. koda teaches itself new abilities at runtime. |
-| **getSoul** / **updateSoul** | read or rewrite personality sections. hot-reloaded. |
+| **getSoul** / **updateSoul** | read or rewrite personality sections. hot-reloaded without restart. |
+| **systemStatus** | uptime, memory usage, supermemory health, circuit breaker state, today's cost, next scheduled task. |
 
 ## deploy
 
@@ -241,28 +244,29 @@ runs on anything that runs bun. 128mb ram is plenty.
 | telegram | [grammy](https://grammy.dev) |
 | database | sqlite via bun:sqlite (wal mode) |
 | validation | [zod v4](https://zod.dev) |
-| browser | [stagehand](https://github.com/browserbase/stagehand) |
+| mcp | [@ai-sdk/mcp](https://sdk.vercel.ai/docs/ai-sdk-core/mcp) — external tool servers |
 | search | [tavily](https://tavily.com) |
-| voice stt | [gemini 3 flash](https://openrouter.ai) via openrouter (multimodal audio) |
+| voice stt | [gemini flash](https://openrouter.ai) via openrouter (multimodal audio) |
 | voice tts | [cartesia](https://cartesia.ai) sonic 3 (raw fetch) |
 | cli ui | [@clack/prompts](https://github.com/bombshell-dev/clack) + chalk + ora |
 
 ## the v1 rebuild
 
-the prototype was over-engineered. 46 files, 5,400 lines, a 12-stage middleware pipeline, 4-tier routing with 8-dimension weighted scoring, AsyncLocalStorage context threading, typed message bus, E2B cloud sandboxing, and subsystems for focus mode, outcome learning, and budget scoring that nobody used.
+the prototype was over-engineered. 46 files, 5,400 lines, a 12-stage middleware pipeline, 4-tier routing with 8-dimension weighted scoring, a typed message bus, E2B cloud sandboxing, and subsystems for focus mode, outcome learning, and budget scoring that nobody used.
 
 we gutted it. rewrote from scratch. kept the proven patterns (semantic memory, skills, proactive scheduling, soul personality), dropped everything that added complexity without adding value.
 
 | | before (v0) | after (v1) |
 |---|---|---|
-| files | 46 | 19 |
-| lines | 5,400 | 2,862 |
-| pipeline | 12-stage middleware | single generateText loop |
+| files | 46 | 21 |
+| lines | 5,400 | 3,723 |
+| pipeline | 12-stage middleware | single generateText / streamText loop |
 | routing | 4-tier, 8-dimension weighted | 3-tier, keyword rules |
-| context | AsyncLocalStorage | closure |
+| context threading | prop drilling + message bus | AsyncLocalStorage per request |
 | sandbox | E2B cloud ($$$) | local Bun.spawn (free) |
 | message passing | typed MessageBus | direct function calls |
 | voice | none | full STT + TTS pipeline |
+| streaming | none | real-time segment delivery via streamText |
 | cli | 12 files, custom UI | 1 file, @clack/prompts |
 | benchmark | 113 cases (many untestable) | 55+15 focused cases, 100% pass |
 
