@@ -417,6 +417,31 @@ export const memories = {
       .all(userId, `%${query}%`, `%${query}%`, `%${query}%`, limit) as MemoryRow[];
   },
 
+  searchByTag(userId: string, tag: string, limit = 20): MemoryRow[] {
+    return getDb()
+      .query(
+        `SELECT id, user_id as userId, sector, content, summary, tags, session_key as sessionKey,
+                event_at as eventAt, remembered_at as rememberedAt, valid_until as validUntil,
+                strength, recall_count as recallCount, last_recalled_at as lastRecalledAt, archived
+         FROM memories WHERE user_id = ? AND archived = 0 AND tags LIKE ?
+         ORDER BY strength DESC LIMIT ?`,
+      )
+      .all(userId, `%${tag}%`, limit) as MemoryRow[];
+  },
+
+  searchByTimeRange(userId: string, after: string, before: string, limit = 20): MemoryRow[] {
+    return getDb()
+      .query(
+        `SELECT id, user_id as userId, sector, content, summary, tags, session_key as sessionKey,
+                event_at as eventAt, remembered_at as rememberedAt, valid_until as validUntil,
+                strength, recall_count as recallCount, last_recalled_at as lastRecalledAt, archived
+         FROM memories WHERE user_id = ? AND archived = 0
+         AND event_at >= ? AND event_at <= ?
+         ORDER BY event_at DESC LIMIT ?`,
+      )
+      .all(userId, after, before, limit) as MemoryRow[];
+  },
+
   getWeak(userId: string, threshold: number): MemoryRow[] {
     return getDb()
       .query(

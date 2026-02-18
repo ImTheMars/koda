@@ -11,6 +11,7 @@ import { parseCronNext } from "./time.js";
 import { log } from "./log.js";
 import type { MemoryProvider } from "./memory/index.js";
 import { shouldRunDecay, shouldRunReflection } from "./memory/decay.js";
+import { mergeNearDuplicateEntities } from "./memory/graph.js";
 
 const NEAR_TERM_THRESHOLD_MS = 5 * 60 * 1000;
 
@@ -102,6 +103,16 @@ export function startProactive(deps: ProactiveDeps): { stop: () => void } {
         }
       } catch (err) {
         log("proactive", "decay error: %s", (err as Error).message);
+      }
+    }
+
+    // Entity merge (runs with decay)
+    if (shouldRunDecay(userId)) {
+      try {
+        const merged = mergeNearDuplicateEntities(userId);
+        if (merged > 0) log("proactive", "entity merge: %d consolidated", merged);
+      } catch (err) {
+        log("proactive", "entity merge error: %s", (err as Error).message);
       }
     }
 

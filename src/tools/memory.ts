@@ -39,19 +39,25 @@ export function registerMemoryTools(deps: { memory: MemoryProvider; getUserId: (
   });
 
   const recall = tool({
-    description: "Search long-term memory for facts and preferences. Returns the most relevant memories by semantic similarity.",
+    description: "Search long-term memory for facts and preferences. Returns the most relevant memories by semantic similarity. Use 'tag' to filter by tag, 'timeframe' for temporal queries.",
     inputSchema: z.object({
       query: z.string().describe("What to search for in memory"),
       limit: z.number().min(1).max(20).optional().default(5),
       sectors: z.array(z.enum(["episodic", "semantic", "factual", "procedural", "reflective"])).optional().describe("Filter by sectors"),
       minStrength: z.number().min(0).max(1).optional().describe("Minimum memory strength (0-1)"),
+      tag: z.string().optional().describe("Filter by tag (e.g. 'food', 'work')"),
+      timeframe: z.enum(["today", "yesterday", "this_week", "last_week", "this_month", "last_month"]).optional()
+        .describe("Filter by time period"),
     }),
-    execute: async ({ query, limit, sectors, minStrength }) => {
-      const rows = await memory.recallRich(getUserId(), query, {
-        limit: limit ?? 5,
+    execute: async ({ query, limit, sectors, minStrength, tag, timeframe }) => {
+      let rows = await memory.recallRich(getUserId(), query, {
+        limit: (limit ?? 5) * 2,
         sectors: sectors as any,
         minStrength,
+        tag,
+        timeframe,
       });
+      rows = rows.slice(0, limit ?? 5);
       return {
         success: true,
         memories: rows.map((r) => ({
@@ -61,6 +67,7 @@ export function registerMemoryTools(deps: { memory: MemoryProvider; getUserId: (
           strength: Math.round(r.strength * 100) / 100,
           recallCount: r.recallCount,
           eventAt: r.eventAt,
+          tags: r.tags ? JSON.parse(r.tags) : [],
         })),
         count: rows.length,
       };

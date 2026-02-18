@@ -7,7 +7,7 @@
 import { mkdir } from "fs/promises";
 import { resolve, join } from "path";
 import { loadConfig } from "./config.js";
-import { initDb, closeDb, messages as dbMessages, entities as dbEntities, relations as dbRelations, memories as dbMemoriesTable, state as dbState } from "./db.js";
+import { initDb, closeDb, getDb, messages as dbMessages, entities as dbEntities, relations as dbRelations, memories as dbMemoriesTable, state as dbState } from "./db.js";
 import { createAgent, createStreamAgent, type AgentDeps } from "./agent.js";
 import { SoulLoader } from "./tools/soul.js";
 import { SkillLoader } from "./tools/skills.js";
@@ -177,10 +177,33 @@ if (config.features.scheduler) {
 // --- Health + Web UI server ---
 const GRAPH_HTML = Bun.file(join(import.meta.dir, "../public/graph.html"));
 
+function resolveGraphUserId(fallback: string): string {
+  try {
+    // Single-user bot: pick the first user that actually has entities in the DB
+    const row = getDb().query("SELECT user_id FROM memory_entities LIMIT 1").get() as { user_id: string } | null;
+    return row?.user_id ?? fallback;
+  } catch {
+    return fallback;
+  }
+}
+
 function buildGraphApiResponse(userId: string): Response {
   const ents = dbEntities.listByUser(userId);
   const stats = dbMemoriesTable.getStats(userId);
   const entityCount = dbEntities.count(userId);
+
+  // Map: memoryId → list of entityIds that reference it
+  const memoryToEntities = new Map<string, string[]>();
+  for (const e of ents) {
+    const rels = dbRelations.listFromEntity(e.id);
+    for (const r of rels) {
+      if (r.toMemory) {
+        const list = memoryToEntities.get(r.toMemory) ?? [];
+        list.push(e.id);
+        memoryToEntities.set(r.toMemory, list);
+      }
+    }
+  }
 
   const nodes = ents.map((e) => {
     const rels = dbRelations.listFromEntity(e.id);
@@ -192,19 +215,38 @@ function buildGraphApiResponse(userId: string): Response {
     };
   });
 
-  const edgeSet = new Set<string>();
-  const edges: Array<{ from: string; to: string; label: string }> = [];
+  // Collect all edges, preferring named relations over co_occurs
+  const edgeMap = new Map<string, { from: string; to: string; label: string }>();
 
+  // Explicit entity→entity edges from DB
   for (const e of ents) {
     const rels = dbRelations.listFromEntity(e.id);
     for (const r of rels) {
       if (!r.toEntity) continue;
-      const key = `${e.id}::${r.toEntity}::${r.relation}`;
-      if (edgeSet.has(key)) continue;
-      edgeSet.add(key);
-      edges.push({ from: e.id, to: r.toEntity, label: r.relation });
+      const key = [e.id, r.toEntity].sort().join("::");
+      const existing = edgeMap.get(key);
+      // Prefer named relations over co_occurs
+      if (!existing || (existing.label === "co_occurs" && r.relation !== "co_occurs")) {
+        edgeMap.set(key, { from: e.id, to: r.toEntity, label: r.relation });
+      }
     }
   }
+
+  // Implicit co-occurrence from shared memories (only if no edge exists yet)
+  for (const [, entityIds] of memoryToEntities) {
+    for (let i = 0; i < entityIds.length; i++) {
+      for (let j = i + 1; j < entityIds.length; j++) {
+        const a = entityIds[i]!;
+        const b = entityIds[j]!;
+        const key = [a, b].sort().join("::");
+        if (!edgeMap.has(key)) {
+          edgeMap.set(key, { from: a, to: b, label: "co_occurs" });
+        }
+      }
+    }
+  }
+
+  const edges = Array.from(edgeMap.values());
 
   const lastDecay = dbState.get<string>(`last_decay_${userId}`) ?? null;
   const lastReflection = dbState.get<string>(`last_reflect_${userId}`) ?? null;
@@ -231,7 +273,8 @@ const server = Bun.serve({
 
     if (url.pathname === "/api/graph") {
       try {
-        const userId = config.telegram.adminIds[0] ?? config.owner.id;
+        const configUserId = config.telegram.adminIds[0] ?? config.owner.id;
+        const userId = resolveGraphUserId(configUserId);
         return buildGraphApiResponse(userId);
       } catch (err) {
         return Response.json({ error: (err as Error).message }, { status: 500 });

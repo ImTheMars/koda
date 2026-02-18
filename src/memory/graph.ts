@@ -15,7 +15,7 @@ import { createOpenRouter } from "@openrouter/ai-sdk-provider";
 import { generateText } from "ai";
 
 export type EntityType = "person" | "project" | "place" | "preference" | "topic";
-export type RelationType = "prefers" | "knows" | "updated_from" | "part_of" | "contradicts";
+export type RelationType = "prefers" | "knows" | "updated_from" | "part_of" | "contradicts" | "co_occurs";
 
 export interface ExtractedEntity {
   type: EntityType;
@@ -59,12 +59,14 @@ JSON array:`,
   }
 }
 
-/** Persist extracted entities and link them to a memory record. */
+/** Persist extracted entities and link them to a memory record, plus wire entity-to-entity edges. */
 export function linkEntitiesToMemory(
   userId: string,
   memoryId: string,
   extracted: ExtractedEntity[],
 ): void {
+  const savedIds: string[] = [];
+
   for (const ent of extracted) {
     const id = `ent_${userId}_${ent.type}_${ent.name.toLowerCase().replace(/\W+/g, "_")}`;
     const finalId = dbEntities.upsert({
@@ -75,6 +77,7 @@ export function linkEntitiesToMemory(
       attributes: ent.attributes ? JSON.stringify(ent.attributes) : null,
     });
 
+    // Entity → memory link
     const relId = `rel_${finalId}_${memoryId}`;
     dbRelations.insert({
       id: relId,
@@ -83,7 +86,34 @@ export function linkEntitiesToMemory(
       toMemory: memoryId,
       relation: "part_of",
     });
+
+    savedIds.push(finalId);
   }
+
+  // Entity → entity edges: every pair that appears in the same memory
+  for (let i = 0; i < savedIds.length; i++) {
+    for (let j = i + 1; j < savedIds.length; j++) {
+      const a = savedIds[i];
+      const b = savedIds[j];
+      const aEnt = extracted[i];
+      const bEnt = extracted[j];
+
+      // Pick a meaningful relation based on entity types
+      let relation: RelationType = "co_occurs";
+      if (aEnt.type === "person" && bEnt.type === "person") relation = "knows";
+      else if (aEnt.type === "person" && bEnt.type === "preference") relation = "prefers";
+      else if (bEnt.type === "person" && aEnt.type === "preference") relation = "prefers";
+      else if (aEnt.type === "topic" && bEnt.type === "project") relation = "part_of";
+      else if (bEnt.type === "topic" && aEnt.type === "project") relation = "part_of";
+
+      const edgeId = `rel_co_${a.slice(-8)}_${b.slice(-8)}`;
+      dbRelations.insert({ id: edgeId, fromEntity: a, toEntity: b, toMemory: null, relation });
+
+      const edgeIdRev = `rel_co_${b.slice(-8)}_${a.slice(-8)}`;
+      dbRelations.insert({ id: edgeIdRev, fromEntity: b, toEntity: a, toMemory: null, relation });
+    }
+  }
+
   log("graph", "linked %d entities to memory %s", extracted.length, memoryId.slice(0, 8));
 }
 
@@ -137,6 +167,62 @@ export function graphEnrichRecall(
   }
 
   return [...coreMemories, ...extra.slice(0, 10)];
+}
+
+/** Fuzzy-merge near-duplicate entities (e.g. "box combo" vs "raising cane's box combo"). */
+export function mergeNearDuplicateEntities(userId: string): number {
+  const ents = dbEntities.listByUser(userId);
+  if (ents.length < 2) return 0;
+
+  const normalize = (s: string) => s.toLowerCase().replace(/[^a-z0-9\s]/g, "").trim();
+
+  // Group by type so we only compare within same type
+  const byType = new Map<string, typeof ents>();
+  for (const e of ents) {
+    const list = byType.get(e.type) ?? [];
+    list.push(e);
+    byType.set(e.type, list);
+  }
+
+  let merged = 0;
+  const absorbed = new Set<string>();
+
+  for (const [, group] of byType) {
+    for (let i = 0; i < group.length; i++) {
+      if (absorbed.has(group[i]!.id)) continue;
+      for (let j = i + 1; j < group.length; j++) {
+        if (absorbed.has(group[j]!.id)) continue;
+        const a = normalize(group[i]!.name);
+        const b = normalize(group[j]!.name);
+
+        // One contains the other → merge shorter into longer
+        if (a.includes(b) || b.includes(a)) {
+          const keep = a.length >= b.length ? group[i]! : group[j]!;
+          const drop = a.length >= b.length ? group[j]! : group[i]!;
+
+          // Re-point all relations from drop → keep
+          const rels = dbRelations.listFromEntity(drop.id);
+          for (const r of rels) {
+            const newId = `rel_merge_${keep.id.slice(-8)}_${r.id.slice(-8)}`;
+            dbRelations.insert({
+              id: newId,
+              fromEntity: keep.id,
+              toEntity: r.toEntity,
+              toMemory: r.toMemory,
+              relation: r.relation,
+            });
+          }
+
+          // Delete the dropped entity (soft: just re-point, keep the row for now)
+          absorbed.add(drop.id);
+          merged++;
+          log("graph", "merged entity '%s' into '%s'", drop.name, keep.name);
+        }
+      }
+    }
+  }
+
+  return merged;
 }
 
 /** Format entity graph for display. */

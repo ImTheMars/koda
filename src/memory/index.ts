@@ -10,10 +10,13 @@ import { connect, type Table, type Connection } from "@lancedb/lancedb";
 import { memories as dbMemories, entities as dbEntities, state as dbState, messages as dbMessages } from "../db.js";
 import type { MemorySector, MemoryRow } from "../db.js";
 import { EmbeddingService, cosineSimilarity } from "./embedding.js";
-import { extractEntities, linkEntitiesToMemory, graphEnrichRecall, recordContradiction } from "./graph.js";
+import { extractEntities, linkEntitiesToMemory, graphEnrichRecall, recordContradiction, mergeNearDuplicateEntities } from "./graph.js";
 import { runDecay, runReflection, reinforceMemory, shouldRunDecay, shouldRunReflection } from "./decay.js";
 import { log } from "../log.js";
 import type { Config } from "../config.js";
+
+const DEDUP_THRESHOLD = 0.92;
+const CONTRADICTION_THRESHOLD = 0.7;
 
 export interface UserProfile {
   static: string[];
@@ -46,6 +49,8 @@ export interface MemoryProvider {
     sectors?: MemorySector[];
     minStrength?: number;
     graphDepth?: number;
+    tag?: string;
+    timeframe?: string;
   }): Promise<MemoryRow[]>;
   getProfile(userId: string, query?: string, sessionKey?: string): Promise<UserProfile>;
   ingestConversation(sessionKey: string, userId: string, messages: Array<{ role: string; content: string }>): Promise<void>;
@@ -129,6 +134,36 @@ export function createLocalMemoryProvider(config: Config, workspaceDir: string):
     }
   }
 
+  async function findDuplicate(
+    userId: string,
+    content: string,
+    sector: MemorySector,
+  ): Promise<{ type: "duplicate"; row: MemoryRow } | { type: "contradiction"; row: MemoryRow } | null> {
+    try {
+      const queryVec = await embedder.embedOne(content);
+      const candidateIds = await searchVectors(queryVec, 10);
+      if (!candidateIds.length) return null;
+
+      for (const id of candidateIds) {
+        const row = dbMemories.getById(id);
+        if (!row || row.userId !== userId || row.archived) continue;
+        if (row.sector !== sector && sector !== "episodic") continue;
+
+        const rowVec = await embedder.embedOne(row.content);
+        const sim = cosineSimilarity(queryVec, rowVec);
+
+        if (sim >= DEDUP_THRESHOLD) return { type: "duplicate", row };
+
+        // Factual/semantic memories with high similarity but not identical → possible contradiction
+        if (sim >= CONTRADICTION_THRESHOLD && sim < DEDUP_THRESHOLD
+            && (sector === "factual" || sector === "semantic")) {
+          return { type: "contradiction", row };
+        }
+      }
+    } catch {}
+    return null;
+  }
+
   async function insertMemory(
     userId: string,
     content: string,
@@ -138,10 +173,48 @@ export function createLocalMemoryProvider(config: Config, workspaceDir: string):
       sessionKey?: string;
       eventAt?: string;
       validUntil?: string;
+      skipDedup?: boolean;
     } = {},
   ): Promise<string> {
-    const id = `mem_${userId}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
     const sector: MemorySector = opts.sector ?? "semantic";
+
+    // Dedup: skip for episodic (always store conversations) and reflective (auto-generated)
+    if (!opts.skipDedup && sector !== "episodic" && sector !== "reflective") {
+      const match = await findDuplicate(userId, content, sector);
+      if (match?.type === "duplicate") {
+        reinforceMemory(match.row.id, match.row.strength);
+        log("memory", "dedup: reinforced existing %s (sim>=%.2f)", match.row.id.slice(0, 12), DEDUP_THRESHOLD);
+        return match.row.id;
+      }
+      if (match?.type === "contradiction") {
+        log("memory", "contradiction: new content vs %s", match.row.id.slice(0, 12));
+        // Store the new one (it's more recent), mark contradiction
+        const id = await doInsert(userId, content, sector, opts);
+        const sharedEntities = dbEntities.listByUser(userId);
+        const relevant = sharedEntities.find((e) =>
+          content.toLowerCase().includes(e.name.toLowerCase()) ||
+          match.row.content.toLowerCase().includes(e.name.toLowerCase())
+        );
+        if (relevant) {
+          recordContradiction(id, match.row.id, relevant.id);
+          log("memory", "contradiction recorded via entity %s", relevant.name);
+        }
+        // Weaken the old memory
+        dbMemories.updateStrength(match.row.id, match.row.strength * 0.5);
+        return id;
+      }
+    }
+
+    return doInsert(userId, content, sector, opts);
+  }
+
+  async function doInsert(
+    userId: string,
+    content: string,
+    sector: MemorySector,
+    opts: { tags?: string[]; sessionKey?: string; eventAt?: string; validUntil?: string },
+  ): Promise<string> {
+    const id = `mem_${userId}_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
 
     dbMemories.insert({
       id,
@@ -156,10 +229,8 @@ export function createLocalMemoryProvider(config: Config, workspaceDir: string):
       strength: 1.0,
     });
 
-    // Embed in background (non-blocking for caller)
     embedder.embedOne(content).then((vec) => storeVector(id, vec)).catch(() => {});
 
-    // Extract entities in background
     if (sector !== "episodic") {
       extractEntities(content, config.openrouter.apiKey, config.openrouter.fastModel)
         .then((ents) => linkEntitiesToMemory(userId, id, ents))
@@ -169,13 +240,72 @@ export function createLocalMemoryProvider(config: Config, workspaceDir: string):
     return id;
   }
 
+  function resolveTimeRange(timeframe: string): { after: string; before: string } | null {
+    const now = new Date();
+    const startOfDay = (d: Date) => { d.setHours(0, 0, 0, 0); return d; };
+    let after: Date;
+    let before: Date = now;
+    switch (timeframe) {
+      case "today":
+        after = startOfDay(new Date()); break;
+      case "yesterday":
+        after = startOfDay(new Date(now.getTime() - 86400000));
+        before = startOfDay(new Date()); break;
+      case "this_week":
+        after = new Date(now.getTime() - 7 * 86400000); break;
+      case "last_week":
+        after = new Date(now.getTime() - 14 * 86400000);
+        before = new Date(now.getTime() - 7 * 86400000); break;
+      case "this_month":
+        after = new Date(now.getTime() - 30 * 86400000); break;
+      case "last_month":
+        after = new Date(now.getTime() - 60 * 86400000);
+        before = new Date(now.getTime() - 30 * 86400000); break;
+      default: return null;
+    }
+    return { after: after.toISOString(), before: before.toISOString() };
+  }
+
   async function semanticSearch(
     userId: string,
     query: string,
     limit: number,
     sectors?: MemorySector[],
     minStrength?: number,
+    tag?: string,
+    timeframe?: string,
   ): Promise<MemoryRow[]> {
+    // If tag-only or time-only query, go straight to DB
+    if (tag) {
+      const tagRows = dbMemories.searchByTag(userId, tag, limit * 3);
+      let filtered = tagRows;
+      if (sectors) filtered = filtered.filter((r) => sectors.includes(r.sector));
+      if (minStrength !== undefined) filtered = filtered.filter((r) => r.strength >= minStrength);
+      return filtered.slice(0, limit);
+    }
+
+    const timeRange = timeframe ? resolveTimeRange(timeframe) : null;
+    if (timeRange) {
+      const timeRows = dbMemories.searchByTimeRange(userId, timeRange.after, timeRange.before, limit * 3);
+      let filtered = timeRows;
+      if (sectors) filtered = filtered.filter((r) => sectors.includes(r.sector));
+      if (minStrength !== undefined) filtered = filtered.filter((r) => r.strength >= minStrength);
+
+      // If we also have a query, re-rank by semantic similarity
+      if (query && query.length > 3 && filtered.length > 1) {
+        try {
+          const queryVec = await embedder.embedOne(query);
+          const vecs = await embedder.embed(filtered.map((r) => r.content));
+          const scored = filtered.map((r, i) => ({
+            row: r, score: cosineSimilarity(queryVec, vecs[i]!),
+          }));
+          scored.sort((a, b) => b.score - a.score);
+          return scored.slice(0, limit).map((s) => s.row);
+        } catch {}
+      }
+      return filtered.slice(0, limit);
+    }
+
     let candidateIds: string[] = [];
 
     try {
@@ -184,12 +314,10 @@ export function createLocalMemoryProvider(config: Config, workspaceDir: string):
     } catch {}
 
     if (!candidateIds.length) {
-      // Fallback: SQLite keyword search
       const rows = dbMemories.search(userId, query, limit);
       return sectors ? rows.filter((r) => sectors.includes(r.sector)) : rows;
     }
 
-    // Fetch SQLite rows for the candidate IDs and filter
     const rows: MemoryRow[] = [];
     for (const id of candidateIds) {
       const row = dbMemories.getById(id);
@@ -199,7 +327,6 @@ export function createLocalMemoryProvider(config: Config, workspaceDir: string):
       rows.push(row);
     }
 
-    // Re-rank by combined vector similarity + strength
     try {
       const queryVec = await embedder.embedOne(query);
       const contentVecs = await embedder.embed(rows.map((r) => r.content));
@@ -256,7 +383,10 @@ export function createLocalMemoryProvider(config: Config, workspaceDir: string):
     },
 
     async recallRich(userId, query, opts = {}) {
-      const rows = await semanticSearch(userId, query, opts.limit ?? 10, opts.sectors, opts.minStrength);
+      const rows = await semanticSearch(
+        userId, query, opts.limit ?? 10, opts.sectors, opts.minStrength,
+        opts.tag, opts.timeframe,
+      );
       const enriched = graphEnrichRecall(userId, rows, opts.graphDepth ?? config.memory.graphDepth);
       for (const r of enriched) reinforceMemory(r.id, r.strength);
       return enriched;
@@ -264,14 +394,28 @@ export function createLocalMemoryProvider(config: Config, workspaceDir: string):
 
     async getProfile(userId, query, sessionKey) {
       try {
-        const [staticRows, queryRows] = await Promise.all([
+        const [staticRows, queryRows, recentRows] = await Promise.all([
           semanticSearch(userId, "who is the user, background, preferences, goals", 8),
           query ? semanticSearch(userId, query, 5) : Promise.resolve([]),
+          // Proactive surfacing: pull recent high-strength memories from last 24h
+          (async () => {
+            const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+            return dbMemories.searchByTimeRange(userId, cutoff, new Date().toISOString(), 5)
+              .filter((r) => r.strength >= 0.7 && r.sector !== "episodic");
+          })(),
         ]);
         const staticFacts = staticRows.map((r) => r.summary ?? r.content);
         const queryMemories = queryRows.map((r) => r.summary ?? r.content);
-        log("memory", "profile: static=%d memories=%d", staticFacts.length, queryMemories.length);
-        return { static: staticFacts, dynamic: [], memories: queryMemories };
+
+        // Dynamic context: recent important memories the user might want to continue discussing
+        const seenContent = new Set([...staticFacts, ...queryMemories]);
+        const dynamic = recentRows
+          .map((r) => r.summary ?? r.content)
+          .filter((c) => !seenContent.has(c))
+          .slice(0, 3);
+
+        log("memory", "profile: static=%d dynamic=%d memories=%d", staticFacts.length, dynamic.length, queryMemories.length);
+        return { static: staticFacts, dynamic, memories: queryMemories };
       } catch (err) {
         log("memory", "profile error: %s", (err as Error).message);
         if (sessionKey) {

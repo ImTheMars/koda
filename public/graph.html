@@ -356,16 +356,21 @@
         };
       }));
 
-      const visEdges = new vis.DataSet(data.edges.map(e => ({
-        from: e.from,
-        to: e.to,
-        label: e.label,
-        color: { color: '#333', highlight: '#7c6dfa', opacity: 0.7 },
-        font: { color: '#666', size: 10, align: 'middle' },
-        arrows: { to: { enabled: true, scaleFactor: 0.5 } },
-        smooth: { type: 'curvedCW', roundness: 0.1 },
-        width: 1.5,
-      })));
+      const visEdges = new vis.DataSet(data.edges.map(e => {
+        const isCoOccur = e.label === 'co_occurs';
+        return {
+          from: e.from,
+          to: e.to,
+          label: isCoOccur ? '' : e.label,
+          title: e.label,
+          color: { color: isCoOccur ? '#2a2a38' : '#4a4a6a', highlight: '#7c6dfa', opacity: isCoOccur ? 0.5 : 0.85 },
+          font: { color: '#888', size: 10, align: 'middle' },
+          arrows: { to: { enabled: !isCoOccur, scaleFactor: 0.5 } },
+          dashes: isCoOccur,
+          smooth: { type: 'curvedCW', roundness: 0.15 },
+          width: isCoOccur ? 1 : 2,
+        };
+      }));
 
       const container = document.getElementById('graph');
       const graphData = { nodes: visNodes, edges: visEdges };
