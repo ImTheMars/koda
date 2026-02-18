@@ -20,7 +20,7 @@ const ConfigSchema = z.object({
   owner: withEmptyDefault(z.object({ id: z.string().default("owner") })),
   openrouter: z.object({
     apiKey: z.string().min(1, "OpenRouter API key is required"),
-    fastModel: z.string().default("x-ai/grok-4.1-fast"),
+    fastModel: z.string().default("google/gemini-3-flash-preview"),
     deepModel: z.string().default("anthropic/claude-sonnet-4.6"),
   }),
   supermemory: z.object({

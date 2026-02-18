@@ -8,7 +8,7 @@
     "id": "your-user-id"
   },
   "openrouter": {
-    "fastModel": "x-ai/grok-4.1-fast",
+    "fastModel": "google/gemini-3-flash-preview",
     "deepModel": "anthropic/claude-sonnet-4.6"
   },
   "telegram": {

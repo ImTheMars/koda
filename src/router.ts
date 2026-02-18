@@ -98,14 +98,14 @@ export function getModelId(tier: Tier, config: Config): string {
 
 /** Failover chains per tier — OpenRouter tries these in order */
 export const FAILOVER: Record<Tier, string[]> = {
-  fast: ["x-ai/grok-4.1-fast"],
+  fast: ["google/gemini-3-flash-preview"],
   deep: ["anthropic/claude-sonnet-4.6"],
 };
 
 // --- Pricing (per 1M tokens) ---
 
 export const PRICING: Record<string, { input: number; output: number }> = {
-  "x-ai/grok-4.1-fast": { input: 0.20, output: 0.50 },
+  "google/gemini-3-flash-preview": { input: 0.50, output: 3 },
   "anthropic/claude-sonnet-4.6": { input: 3, output: 15 },
 };
 
