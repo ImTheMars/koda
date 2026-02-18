@@ -66,7 +66,7 @@ export function classifyTier(text: string): Tier {
     return "fast";
   }
 
-  return "standard";
+  return "fast";
 }
 
 export function needsTools(text: string): boolean {
@@ -92,30 +92,21 @@ export function classifyIntent(text: string): RequestIntent {
 export function getModelId(tier: Tier, config: Config): string {
   switch (tier) {
     case "fast": return config.openrouter.fastModel;
-    case "standard": return config.openrouter.standardModel;
     case "deep": return config.openrouter.deepModel;
   }
 }
 
 /** Failover chains per tier — OpenRouter tries these in order */
 export const FAILOVER: Record<Tier, string[]> = {
-  fast: ["google/gemini-2.5-flash-lite:nitro", "google/gemini-2.5-flash-lite"],
-  standard: ["google/gemini-3-flash-preview:nitro", "google/gemini-3-flash-preview"],
-  deep: ["anthropic/claude-opus-4.6:nitro", "anthropic/claude-opus-4.6"],
+  fast: ["x-ai/grok-4.1-fast"],
+  deep: ["anthropic/claude-sonnet-4.6"],
 };
 
 // --- Pricing (per 1M tokens) ---
 
 export const PRICING: Record<string, { input: number; output: number }> = {
-  "google/gemini-2.5-flash-lite:nitro": { input: 0.075, output: 0.3 },
-  "google/gemini-2.5-flash-lite": { input: 0.075, output: 0.3 },
-  "google/gemini-3-flash-preview:nitro": { input: 0.5, output: 3 },
-  "google/gemini-3-flash-preview": { input: 0.5, output: 3 },
-  "moonshotai/kimi-k2.5:nitro": { input: 0.45, output: 2.25 },
-  "moonshotai/kimi-k2.5": { input: 0.45, output: 2.25 },
-  "anthropic/claude-opus-4.6:nitro": { input: 5, output: 25 },
-  "anthropic/claude-opus-4.6": { input: 5, output: 25 },
-  "anthropic/claude-sonnet-4": { input: 3, output: 15 },
+  "x-ai/grok-4.1-fast": { input: 0.20, output: 0.50 },
+  "anthropic/claude-sonnet-4.6": { input: 3, output: 15 },
 };
 
 export function calculateCost(model: string, inputTokens: number, outputTokens: number): number {
@@ -132,7 +123,6 @@ export function shouldAck(input: { content: string; tier: Tier; intent: RequestI
 
   let score = 0;
   if (input.tier === "deep") score += 3;
-  else if (input.tier === "standard") score += 1;
   if (input.intent === "task" || input.intent === "research" || input.intent === "code") score += 2;
   if (input.content.length >= 180) score += 1;
 

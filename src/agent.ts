@@ -165,7 +165,7 @@ your training data is outdated. for anything time-sensitive — search first, an
 export function createAgent(deps: AgentDeps) {
   const { config, tools } = deps;
   const provider = getProvider(config.openrouter.apiKey);
-  const tierOrder: Tier[] = ["fast", "standard", "deep"];
+  const tierOrder: Tier[] = ["fast", "deep"];
 
   async function buildContext(input: AgentInput, skipQuery: boolean) {
     const [profile, skillsSummary] = await Promise.all([
@@ -373,7 +373,7 @@ export interface StreamAgentResult {
 export function createStreamAgent(deps: AgentDeps) {
   const { config, tools } = deps;
   const provider = getProvider(config.openrouter.apiKey);
-  const tierOrder: Tier[] = ["fast", "standard", "deep"];
+  const tierOrder: Tier[] = ["fast", "deep"];
 
   return async function streamAgent(input: AgentInput): Promise<StreamAgentResult> {
     const tier = classifyTier(input.content);

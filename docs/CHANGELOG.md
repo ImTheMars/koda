@@ -5,6 +5,24 @@ all notable changes to koda.
 ---
 
 ## 2026-02-18
+### v1.3.3 — 2-tier router: Grok 4.1 Fast + Claude Sonnet 4.6
+
+collapses the 3-tier model router (fast/standard/deep) into 2 tiers. Grok 4.1 Fast handles all default traffic; Claude Sonnet 4.6 handles explicit thinking/deep requests.
+
+#### changed
+
+- **3-tier → 2-tier** — `standard` tier removed entirely. `Tier` type is now `"fast" | "deep"`.
+- **fast tier** — `x-ai/grok-4.1-fast` (was `google/gemini-2.5-flash-lite:nitro`). $0.20/$0.50 per 1M tokens, 2M context window, built-in reasoning.
+- **deep tier** — `anthropic/claude-sonnet-4.6` (was `anthropic/claude-opus-4.6:nitro`). triggered by `/think`, `/deep` prefix, or 2+ reasoning keywords. ~6x cheaper than Opus at same quality tier.
+- **`standardModel` config field removed** — only `fastModel` and `deepModel` remain in `openrouter` config block.
+- **`PRICING` table** — trimmed to the two active models. stale Gemini, Kimi, and Opus entries removed.
+- **`FAILOVER` table** — trimmed to match active tiers.
+- **`tierOrder`** — `["fast", "standard", "deep"]` → `["fast", "deep"]` in both `createAgent` and `createStreamAgent`. escalation now goes directly fast → deep after 5 tool steps.
+- **`shouldAck()`** — removed `standard` branch (no longer a tier). ack threshold unchanged for fast/deep.
+
+---
+
+## 2026-02-18
 ### v1.3.2 — Exa search + voice pipeline removal
 
 replaces Tavily web search with Exa Instant, removes the entire voice/TTS pipeline from Telegram, and cleans up the config schema.

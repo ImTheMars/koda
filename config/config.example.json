@@ -8,9 +8,8 @@
     "id": "your-user-id"
   },
   "openrouter": {
-    "fastModel": "google/gemini-2.5-flash-lite:nitro",
-    "standardModel": "google/gemini-3-flash-preview:nitro",
-    "deepModel": "anthropic/claude-opus-4.6:nitro"
+    "fastModel": "x-ai/grok-4.1-fast",
+    "deepModel": "anthropic/claude-sonnet-4.6"
   },
   "telegram": {
     "allowFrom": ["your-telegram-user-id"],

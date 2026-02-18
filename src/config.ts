@@ -20,9 +20,8 @@ const ConfigSchema = z.object({
   owner: withEmptyDefault(z.object({ id: z.string().default("owner") })),
   openrouter: z.object({
     apiKey: z.string().min(1, "OpenRouter API key is required"),
-    fastModel: z.string().default("google/gemini-2.5-flash-lite:nitro"),
-    standardModel: z.string().default("google/gemini-3-flash-preview:nitro"),
-    deepModel: z.string().default("anthropic/claude-opus-4.6:nitro"),
+    fastModel: z.string().default("x-ai/grok-4.1-fast"),
+    deepModel: z.string().default("anthropic/claude-sonnet-4.6"),
   }),
   supermemory: z.object({
     apiKey: z.string().min(1, "Supermemory API key is required"),
@@ -94,7 +93,7 @@ const ConfigSchema = z.object({
 });
 
 export type Config = z.infer<typeof ConfigSchema>;
-export type Tier = "fast" | "standard" | "deep";
+export type Tier = "fast" | "deep";
 
 function checkEnvPermissions(): void {
   const envPaths = [
