@@ -154,9 +154,13 @@ function addAttribution(content: string, source: string): string {
 
 // --- Tool registration ---
 
-export function registerSkillShopTools(deps: { exaApiKey: string; workspace: string }): ToolSet {
+export function registerSkillShopTools(deps: { exaApiKey: string; workspace: string; githubToken?: string }): ToolSet {
   const exa = new Exa(deps.exaApiKey);
   const skillsDir = join(deps.workspace, "skills");
+
+  // Build GitHub fetch headers — token bumps rate limit from 60 to 5000 req/hr.
+  const ghHeaders: Record<string, string> = { "User-Agent": "koda-skillshop/1.0" };
+  if (deps.githubToken) ghHeaders["Authorization"] = `Bearer ${deps.githubToken}`;
 
   const skillShop = tool({
     description:
@@ -231,7 +235,7 @@ export function registerSkillShopTools(deps: { exaApiKey: string; workspace: str
         log("skillshop", "preview: %s", input.rawUrl);
         const rawUrl = toRawUrl(input.rawUrl) ?? input.rawUrl;
         try {
-          const res = await fetch(rawUrl, { headers: { "User-Agent": "koda-skillshop/1.0" } });
+          const res = await fetch(rawUrl, { headers: ghHeaders });
           if (!res.ok) return { success: false, error: `HTTP ${res.status} fetching ${rawUrl}` };
           const content = await res.text();
 
@@ -260,7 +264,7 @@ export function registerSkillShopTools(deps: { exaApiKey: string; workspace: str
         log("skillshop", "install: %s", input.rawUrl);
         const rawUrl = toRawUrl(input.rawUrl) ?? input.rawUrl;
         try {
-          const res = await fetch(rawUrl, { headers: { "User-Agent": "koda-skillshop/1.0" } });
+          const res = await fetch(rawUrl, { headers: ghHeaders });
           if (!res.ok) return { success: false, error: `HTTP ${res.status} fetching ${rawUrl}` };
           const content = await res.text();
 

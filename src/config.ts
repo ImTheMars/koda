@@ -89,6 +89,13 @@ const ConfigSchema = z.object({
     scheduler: z.boolean().default(true),
     debug: z.boolean().default(false),
   })),
+  subagent: withEmptyDefault(z.object({
+    timeoutMs: z.number().min(10_000).default(90_000),
+    maxSteps: z.number().min(1).max(20).default(10),
+  })),
+  github: withEmptyDefault(z.object({
+    token: z.string().optional(),
+  })),
   workspace: z.string().default("~/.koda"),
 });
 
@@ -128,6 +135,7 @@ function applyEnvOverrides(raw: Record<string, unknown>): Record<string, unknown
     ["KODA_SUPERMEMORY_API_KEY", ["supermemory", "apiKey"]],
     ["KODA_EXA_API_KEY", ["exa", "apiKey"]],
     ["KODA_TELEGRAM_TOKEN", ["telegram", "token"]],
+    ["KODA_GITHUB_TOKEN", ["github", "token"]],
   ];
 
   function setNested(obj: Record<string, unknown>, path: string[], value: unknown): void {

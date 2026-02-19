@@ -6,8 +6,9 @@
 
 import { mkdir } from "fs/promises";
 import { resolve } from "path";
-import { loadConfig } from "./config.js";
-import { initDb, closeDb, messages as dbMessages, state as dbState } from "./db.js";
+import { loadConfig, type Config } from "./config.js";
+import { initDb, closeDb, messages as dbMessages, state as dbState, tasks as dbTasks } from "./db.js";
+import { parseCronNext } from "./time.js";
 import { createAgent, createStreamAgent, type AgentDeps } from "./agent.js";
 import { SoulLoader } from "./tools/soul.js";
 import { SkillLoader } from "./tools/skills.js";
@@ -19,6 +20,7 @@ import { buildTools } from "./tools/index.js";
 import { enableDebug } from "./log.js";
 import { createMCPClient } from "@ai-sdk/mcp";
 import { handleDashboardRequest } from "./dashboard.js";
+import { registerSubAgentTools } from "./tools/subagent.js";
 
 // --- CLI routing ---
 const command = process.argv[2];
@@ -152,6 +154,46 @@ memoryProvider.setupEntityContext(config.owner.id).catch(() => {});
 const runAgent = createAgent(agentDeps);
 const streamAgentFn = createStreamAgent(agentDeps);
 
+// Register spawnAgent after runAgent exists (post-boot to avoid circular dep).
+// tools is the same object reference captured by agentDeps — agents see the update live.
+Object.assign(tools, registerSubAgentTools({
+  agentDeps,
+  masterTools: tools,
+  timeoutMs: config.subagent.timeoutMs,
+  maxStepsCap: config.subagent.maxSteps,
+}));
+
+// --- Seed built-in recurring tasks (once per install) ---
+(function seedBuiltinTasks() {
+  const SEED_KEY = "builtin-skill-discovery-v1";
+  if (dbState.get(SEED_KEY)) return;
+  try {
+    const ownerId = config.telegram.adminIds[0] ?? config.owner.id;
+    const channel = config.telegram.token ? "telegram" : "cli";
+    const chatId = ownerId;
+    const cron = "sun 09:00";
+    const nextRun = parseCronNext(cron, new Date(), config.scheduler.timezone);
+    dbTasks.create({
+      id: "builtin-skill-discovery",
+      userId: ownerId,
+      chatId,
+      channel,
+      type: "recurring",
+      description: "Weekly skill discovery",
+      prompt: "Search the skill shop for 3–5 interesting new skills relevant to my recent activity. " +
+              "Briefly list what you found with their rawUrl — don't install anything, just surface the options.",
+      cron,
+      nextRunAt: nextRun.toISOString(),
+      enabled: true,
+      oneShot: false,
+    });
+    dbState.set(SEED_KEY, true);
+    console.log(`[boot] Seeded weekly skill discovery (next: ${nextRun.toISOString()})`);
+  } catch {
+    // Already exists or DB not ready — safe to skip
+  }
+})();
+
 // --- Channels ---
 let telegram: { stop: () => Promise<void>; sendDirect: (chatId: string, text: string) => Promise<void> } | null = null;
 let repl: { stop: () => void } | null = null;
@@ -199,7 +241,7 @@ if (config.features.scheduler) {
 }
 
 // --- Health + Dashboard server ---
-const VERSION = "1.4.0";
+const VERSION = "1.5.0";
 const dashOwner = config.telegram.adminIds[0] ?? config.owner.id;
 
 const server = Bun.serve({

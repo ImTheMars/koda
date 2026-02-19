@@ -5,6 +5,31 @@ all notable changes to koda.
 ---
 
 ## 2026-02-19
+### v1.5.0 — Sub-agent hardening + config-driven tuning + spawn dashboard
+
+#### added
+
+- **`config.subagent` block** (`src/config.ts`) — new config section with `timeoutMs` (default 90 000 ms) and `maxSteps` (default 10, cap 20). `registerSubAgentTools` now reads these instead of hardcoded constants, so operators can tune sub-agent behaviour via `config.json` without touching source.
+- **`config.github.token` + `KODA_GITHUB_TOKEN` env var** — optional GitHub personal access token. when set, all `skillShop` fetch calls to `raw.githubusercontent.com` include an `Authorization: Bearer` header, raising the anonymous rate limit from 60 to 5 000 req/hr. zero-config when absent.
+- **Sub-agent memory isolation** — `spawnAgent` now sets `ingestConversation: async () => {}` in the child `AgentDeps`, preventing sub-agent turns from writing to the user's long-term memory store.
+- **Spawn log ring buffer** (`src/tools/subagent.ts`) — module-level `spawnLog` keeps the last 50 `{ name, status, toolsUsed, cost, durationMs, timestamp }` entries. exported via `getSpawnLog()` for dashboard consumption. status tracks `done`, `error`, and `timeout` distinctly.
+- **Dashboard spawn panel** (`src/dashboard.ts`) — new "Sub-Agent Activity" section at the bottom of the dashboard, fetching `GET /api/spawns`. shows name, status icon (✓/✗/⏱), tools used, cost, and relative age. auto-refreshes with the rest of the page every 30 s.
+- **`GET /api/spawns` route** — returns `{ spawns[] }` from the in-memory ring buffer (most recent first, capped at 50).
+- **Weekly skill discovery task** (`src/index.ts`) — on first boot, seeds a built-in `recurring` task ("Weekly skill discovery", cron `sun 09:00`) to `dbTasks`. the agent runs a skill shop search each Sunday morning and surfaces results without auto-installing. seeded once per workspace using `dbState` guard `builtin-skill-discovery-v1`.
+
+#### changed
+
+- **`registerSubAgentTools` signature** — now accepts `timeoutMs?: number` and `maxStepsCap?: number` in its deps object. `src/index.ts` passes `config.subagent.*`. sub-agent `maxSteps` schema max is now `maxStepsCap` (configurable) instead of hardcoded 10.
+- **Bench classify cases** — all `"expectedTier": "standard"` entries updated to `"fast"` now that the router is 2-tier. corresponding ack test cases with `"tier": "standard"` updated to `"fast"` (non-acking) or `"deep"` (acking) to match actual `shouldAck` scoring.
+- **10 new bench cases** — added deterministic classify cases covering `skillShop` search prompts (map to `research` intent, `fast` tier), `spawnAgent` delegation phrases (map to `task`/`research`, `fast` tier), and two additional `deep` tier cases including `/think` prefix.
+
+#### fixed
+
+- **Timeout message clarity** — sub-agent timeout error message changed from `Sub-agent "${name}" timed out after Xs` to the shorter `timeout after Xs` so it clearly distinguishes from other error types in the spawn log.
+
+---
+
+## 2026-02-19
 ### v1.4.0 — Skill Shop + Dashboard + Exa improvements
 
 #### added

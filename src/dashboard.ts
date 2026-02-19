@@ -2,14 +2,16 @@
  * Koda Dashboard — lightweight read-only web UI served by the Bun health server.
  *
  * Routes:
- *   GET /           → full HTML dashboard page
- *   GET /api/usage  → { today, month, allTime }
- *   GET /api/skills → { skills[] }
- *   GET /api/tasks  → { tasks[] }
+ *   GET /            → full HTML dashboard page
+ *   GET /api/usage   → { today, month, allTime }
+ *   GET /api/skills  → { skills[] }
+ *   GET /api/tasks   → { tasks[] }
+ *   GET /api/spawns  → { spawns[] }  (in-memory ring buffer from subagent.ts)
  */
 
 import type { SkillLoader } from "./tools/skills.js";
 import { usage as dbUsage, tasks as dbTasks } from "./db.js";
+import { getSpawnLog } from "./tools/subagent.js";
 
 export interface DashboardDeps {
   skillLoader: SkillLoader;
@@ -40,6 +42,10 @@ function tasksResponse(userId: string): Response {
   return Response.json({ tasks });
 }
 
+function spawnsResponse(): Response {
+  return Response.json({ spawns: getSpawnLog().reverse() });
+}
+
 // --- Route handler ---
 
 export async function handleDashboardRequest(req: Request, deps: DashboardDeps): Promise<Response | null> {
@@ -48,6 +54,7 @@ export async function handleDashboardRequest(req: Request, deps: DashboardDeps):
   if (url.pathname === "/api/usage") return usageResponse(deps.defaultUserId);
   if (url.pathname === "/api/skills") return skillsResponse(deps.skillLoader);
   if (url.pathname === "/api/tasks") return tasksResponse(deps.defaultUserId);
+  if (url.pathname === "/api/spawns") return spawnsResponse();
   if (url.pathname === "/") return new Response(buildDashboardHtml(deps.version), {
     headers: { "Content-Type": "text/html; charset=utf-8" },
   });
@@ -332,6 +339,52 @@ export function buildDashboardHtml(version: string): string {
       white-space: nowrap;
     }
 
+    /* --- Spawn rows --- */
+    .spawns-list { list-style: none; }
+
+    .spawn-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 11px 20px;
+      border-bottom: 1px solid var(--border);
+      font-size: 12px;
+    }
+
+    .spawn-row:last-child { border-bottom: none; }
+
+    .spawn-status {
+      font-size: 13px;
+      flex-shrink: 0;
+      width: 16px;
+      text-align: center;
+    }
+
+    .spawn-name {
+      font-family: var(--mono);
+      font-size: 12px;
+      color: var(--text);
+      flex-shrink: 0;
+      min-width: 130px;
+    }
+
+    .spawn-tools {
+      flex: 1;
+      color: var(--muted);
+      font-family: var(--mono);
+      font-size: 11px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .spawn-meta {
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--muted);
+      white-space: nowrap;
+    }
+
     /* --- Empty state --- */
     .empty {
       padding: 36px 20px;
@@ -394,6 +447,17 @@ export function buildDashboardHtml(version: string): string {
         <li class="empty">Loading...</li>
       </ul>
     </div>
+
+    <!-- Sub-agent activity -->
+    <div class="section">
+      <div class="section-header">
+        <span class="section-title">Sub-Agent Activity</span>
+        <span class="badge" id="spawnsBadge">—</span>
+      </div>
+      <ul class="spawns-list" id="spawnsList">
+        <li class="empty">Loading...</li>
+      </ul>
+    </div>
   </div>
 
   <script>
@@ -452,6 +516,36 @@ export function buildDashboardHtml(version: string): string {
       \`).join('');
     }
 
+    function ago(isoStr) {
+      if (!isoStr) return '—';
+      const diff = Date.now() - new Date(isoStr).getTime();
+      const mins = Math.floor(diff / 60000);
+      const hrs = Math.floor(diff / 3600000);
+      if (mins < 1) return 'just now';
+      if (hrs < 1) return \`\${mins}m ago\`;
+      return \`\${hrs}h ago\`;
+    }
+
+    const SPAWN_STATUS = { done: '✓', error: '✗', timeout: '⏱' };
+    const SPAWN_COLOR = { done: 'var(--green)', error: 'var(--red)', timeout: 'var(--yellow)' };
+
+    function renderSpawns(data) {
+      const list = document.getElementById('spawnsList');
+      document.getElementById('spawnsBadge').textContent = data.spawns.length;
+      if (!data.spawns.length) {
+        list.innerHTML = '<li class="empty">No sub-agents spawned yet</li>';
+        return;
+      }
+      list.innerHTML = data.spawns.slice(0, 20).map(s => \`
+        <li class="spawn-row">
+          <span class="spawn-status" style="color:\${SPAWN_COLOR[s.status] ?? 'var(--muted)'}">\${SPAWN_STATUS[s.status] ?? '?'}</span>
+          <span class="spawn-name">\${s.name}</span>
+          <span class="spawn-tools">\${s.toolsUsed.join(', ') || '—'}</span>
+          <span class="spawn-meta">\${s.cost > 0 ? '$' + s.cost.toFixed(4) : ''} \${ago(s.timestamp)}</span>
+        </li>
+      \`).join('');
+    }
+
     function renderTasks(data) {
       const list = document.getElementById('tasksList');
       document.getElementById('tasksBadge').textContent = data.tasks.length;
@@ -470,14 +564,16 @@ export function buildDashboardHtml(version: string): string {
 
     async function refresh() {
       try {
-        const [usage, skills, tasks] = await Promise.all([
+        const [usage, skills, tasks, spawns] = await Promise.all([
           fetch('/api/usage').then(r => r.json()),
           fetch('/api/skills').then(r => r.json()),
           fetch('/api/tasks').then(r => r.json()),
+          fetch('/api/spawns').then(r => r.json()),
         ]);
         renderUsage(usage);
         renderSkills(skills);
         renderTasks(tasks);
+        renderSpawns(spawns);
         const now = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
         document.getElementById('refreshInfo').textContent = 'updated ' + now;
         document.getElementById('statusDot').style.background = '#34d399';

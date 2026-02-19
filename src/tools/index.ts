@@ -64,7 +64,7 @@ export function buildTools(deps: {
   // Search + Skill Shop (optional — needs Exa key)
   if (config.exa.apiKey) {
     Object.assign(tools, registerSearchTools({ apiKey: config.exa.apiKey, numResults: config.exa.numResults }));
-    Object.assign(tools, registerSkillShopTools({ exaApiKey: config.exa.apiKey, workspace }));
+    Object.assign(tools, registerSkillShopTools({ exaApiKey: config.exa.apiKey, workspace, githubToken: config.github?.token }));
   }
 
   // Schedule
