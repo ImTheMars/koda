@@ -1,7 +1,7 @@
 /**
  * AssistantBench scorers — deterministic + LLM-judged evaluation.
  *
- * Adapted for v1 rebuild: 3-tier classify, simplified ack, removed outcome/budget.
+ * Adapted for v2: 2-tier classify (fast/deep), simplified ack, removed outcome/budget.
  */
 
 import { classifyTier, classifyIntent, shouldAck } from "../src/router.js";

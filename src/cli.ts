@@ -82,19 +82,9 @@ async function runSetup(): Promise<void> {
   });
   if (clack.isCancel(supermemoryKey)) { clack.outro("cancelled"); return; }
 
-  // Tavily key
-  const tavilyKey = await clack.text({ message: "Tavily API key (for web search):", placeholder: "optional" });
-  if (clack.isCancel(tavilyKey)) { clack.outro("cancelled"); return; }
-
-  // Cartesia key (voice TTS)
-  const cartesiaKey = await clack.text({ message: "Cartesia API key (for voice TTS):", placeholder: "optional" });
-  if (clack.isCancel(cartesiaKey)) { clack.outro("cancelled"); return; }
-
-  const cartesiaVoiceId = await clack.text({
-    message: "Cartesia voice ID:",
-    placeholder: "694f9389-aac1-45b6-b726-9d9369183238",
-  });
-  if (clack.isCancel(cartesiaVoiceId)) { clack.outro("cancelled"); return; }
+  // Exa key
+  const exaKey = await clack.text({ message: "Exa API key (for web search):", placeholder: "optional — get one free at dashboard.exa.ai" });
+  if (clack.isCancel(exaKey)) { clack.outro("cancelled"); return; }
 
   // Telegram (conditional)
   let telegramToken = "";
@@ -132,9 +122,7 @@ async function runSetup(): Promise<void> {
   const envLines: string[] = [];
   envLines.push(`KODA_OPENROUTER_API_KEY=${openrouterKey}`);
   envLines.push(`KODA_SUPERMEMORY_API_KEY=${supermemoryKey}`);
-  if (tavilyKey) envLines.push(`KODA_TAVILY_API_KEY=${tavilyKey}`);
-  if (cartesiaKey) envLines.push(`KODA_CARTESIA_API_KEY=${cartesiaKey}`);
-  if (cartesiaVoiceId) envLines.push(`KODA_CARTESIA_VOICE_ID=${cartesiaVoiceId}`);
+  if (exaKey) envLines.push(`KODA_EXA_API_KEY=${exaKey}`);
   if (telegramToken) envLines.push(`KODA_TELEGRAM_TOKEN=${telegramToken}`);
   await writeFile(envPath, envLines.join("\n") + "\n", "utf-8");
   try { await chmod(envPath, 0o600); } catch {}

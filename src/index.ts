@@ -18,6 +18,7 @@ import { startProactive } from "./proactive.js";
 import { buildTools } from "./tools/index.js";
 import { enableDebug } from "./log.js";
 import { createMCPClient } from "@ai-sdk/mcp";
+import { handleDashboardRequest } from "./dashboard.js";
 
 // --- CLI routing ---
 const command = process.argv[2];
@@ -197,18 +198,24 @@ if (config.features.scheduler) {
   console.log("[boot] Proactive: started");
 }
 
-// --- Health server ---
+// --- Health + Dashboard server ---
+const VERSION = "1.4.0";
+const dashOwner = config.telegram.adminIds[0] ?? config.owner.id;
+
 const server = Bun.serve({
   port: Number(process.env.PORT ?? 3000),
-  fetch(req) {
+  async fetch(req) {
     const url = new URL(req.url);
     if (url.pathname === "/health") {
-      return Response.json({ status: "ok", version: "1.3.3", uptime: process.uptime() });
+      return Response.json({ status: "ok", version: VERSION, uptime: process.uptime() });
     }
+    const dash = await handleDashboardRequest(req, { skillLoader, defaultUserId: dashOwner, version: VERSION });
+    if (dash) return dash;
     return new Response("Not found", { status: 404 });
   },
 });
 console.log(`[boot] Health server on :${server.port}/health`);
+console.log(`[boot] Dashboard on :${server.port}/`);
 
 // --- Graceful shutdown ---
 const shutdown = async (signal: string) => {

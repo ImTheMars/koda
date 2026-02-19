@@ -1,7 +1,7 @@
 /**
- * Router — 3-tier rule-based classification + intent detection.
+ * Router — 2-tier rule-based classification + intent detection.
  *
- * Tiers: fast (< 20 words, no tool hints), deep (reasoning keywords, /think /deep prefix), standard (everything else).
+ * Tiers: fast (default), deep (reasoning keywords, long tasks, /think /deep prefix).
  */
 
 import type { Tier, Config } from "./config.js";

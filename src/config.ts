@@ -1,7 +1,7 @@
 /**
  * Koda configuration — Zod-validated with env override for secrets.
  *
- * 3-tier LLM: fast/standard/deep. Voice via Gemini STT (OpenRouter) + Cartesia TTS.
+ * 2-tier LLM: fast (Gemini Flash) / deep (Claude Sonnet).
  */
 
 import { z } from "zod";

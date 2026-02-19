@@ -1,7 +1,7 @@
 /**
  * AssistantBench — shared types for all benchmark suites.
  *
- * v1 rebuild: 3-tier classify (fast/standard/deep), simplified ack, removed outcome/budget.
+ * v2: 2-tier classify (fast/deep), simplified ack, removed outcome/budget.
  */
 
 import type { Tier } from "../src/config.js";

@@ -1,5 +1,8 @@
 /**
  * Search tools — web search + URL extraction via Exa.
+ *
+ * webSearch: uses type=auto + highlights for token-efficient agentic results.
+ * extractUrl: fetches full compact text for deep reading.
  */
 
 import Exa from "exa-js";
@@ -13,7 +16,7 @@ export function registerSearchTools(deps: { apiKey: string; numResults?: number 
   const webSearch = tool({
     description: "Search the web for current information. Always cite sources in your response.",
     inputSchema: z.object({
-      query: z.string().describe("Search query"),
+      query: z.string().describe("Search query — can be a natural language description, not just keywords."),
       numResults: z.number().min(1).max(10).optional(),
     }),
     execute: async ({ query, numResults }) => {
@@ -21,17 +24,15 @@ export function registerSearchTools(deps: { apiKey: string; numResults?: number 
         const result = await exa.searchAndContents(query, {
           type: "auto",
           numResults: numResults ?? defaultNum,
-          summary: true,
-          useAutoprompt: true,
+          highlights: { maxCharacters: 2000 },
         });
         return {
           success: result.results.length > 0,
-          answer: result.results[0]?.summary ?? "No summary available.",
           results: result.results.map((r, i) => ({
             index: i + 1,
             title: r.title,
             url: r.url,
-            snippet: (r as any).summary ?? ((r as any).text?.slice(0, 280) ?? ""),
+            highlights: (r as any).highlights ?? [],
             citation: `[${r.title}](${r.url})`,
           })),
           resultCount: result.results.length,
@@ -43,13 +44,15 @@ export function registerSearchTools(deps: { apiKey: string; numResults?: number 
   });
 
   const extractUrl = tool({
-    description: "Extract full content from URLs. Returns page content as text.",
+    description: "Extract full content from a URL for deep reading. Use after webSearch to get complete page text.",
     inputSchema: z.object({
       urls: z.array(z.string().url()).min(1).max(5),
     }),
     execute: async ({ urls }) => {
       try {
-        const result = await exa.getContents(urls.slice(0, 5) as [string, ...string[]], { text: true });
+        const result = await exa.getContents(urls.slice(0, 5) as [string, ...string[]], {
+          text: { maxCharacters: 15000 },
+        });
         return {
           success: result.results.length > 0,
           results: result.results.map((r) => ({

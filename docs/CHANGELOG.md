@@ -4,6 +4,27 @@ all notable changes to koda.
 
 ---
 
+## 2026-02-19
+### v1.4.0 — Skill Shop + Dashboard + Exa improvements
+
+#### added
+
+- **Skill Shop** (`src/tools/skillshop.ts`) — new `skillShop` tool with three actions: `search` (Exa targets skills.sh + GitHub for SKILL.md files), `preview` (fetches raw content from `raw.githubusercontent.com`, no auth required), and `install` (safety scan → write to `~/.koda/skills/<name>/SKILL.md`). the existing `SkillLoader` `fs.watch` picks up installed skills immediately with no restart. registered in `buildTools()` alongside webSearch, gated on `config.exa.apiKey`.
+- **Safety scanner** — `install` and `preview` both run a regex scan blocking exfiltration patterns (`fetch(`, `curl |`, `wget |`), destructive commands (`rm -rf`, `sudo rm`), prompt injection phrases (`ignore all previous instructions`), and files over 100KB. blocked installs include a detailed reason list.
+- **Source attribution** — installed SKILL.md files get `source:` and `installed_at:` fields injected into frontmatter for traceability.
+- **Dashboard** (`src/dashboard.ts`) — lightweight read-only web UI served by the existing Bun health server at `GET /`. dark-mode single-page app with no build step, no React. auto-refreshes every 30 seconds. shows: usage cost cards (today / month / all-time) from the `usage` SQLite table, skills list with `builtin`/`workspace` badges from `SkillLoader`, and upcoming scheduled tasks with relative time from the `tasks` table.
+- **Dashboard API routes** — `GET /api/usage`, `GET /api/skills`, `GET /api/tasks` return JSON consumed by the dashboard frontend.
+
+#### changed
+
+- **Exa `webSearch`** — switched from `summary: true` + `useAutoprompt: true` (deprecated fields) to `highlights: { maxCharacters: 2000 }`. highlights are 10x more token-efficient for multi-step agentic workflows. `type: "auto"` unchanged.
+- **Exa `extractUrl`** — now passes `text: { maxCharacters: 15000 }` for full-page deep reads (was bare `text: true`).
+- **CLI setup wizard** — Cartesia prompts (API key + voice ID) removed. Exa key prompt renamed from "Tavily" and now correctly writes `KODA_EXA_API_KEY` (was mistakenly writing `KODA_TAVILY_API_KEY`).
+- **Health server** — `VERSION` extracted to a single constant. `Bun.serve` fetch handler made `async` to support dashboard route awaiting `skillLoader.listSkills()`.
+- **Boot log** — now prints dashboard URL alongside health URL on startup.
+
+---
+
 ## 2026-02-18
 ### v1.3.3 — 2-tier router: Grok 4.1 Fast + Claude Sonnet 4.6
 

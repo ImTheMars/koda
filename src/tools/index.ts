@@ -18,6 +18,7 @@ import { registerScheduleTools } from "./schedule.js";
 import { registerSkillTools } from "./skills.js";
 import { registerSoulTools, SoulLoader } from "./soul.js";
 import { registerStatusTools } from "./status.js";
+import { registerSkillShopTools } from "./skillshop.js";
 
 interface ToolRuntimeContext {
   userId: string;
@@ -60,9 +61,10 @@ export function buildTools(deps: {
     ...registerSkillTools({ skillLoader, workspace }),
   };
 
-  // Search (optional — needs Exa key)
+  // Search + Skill Shop (optional — needs Exa key)
   if (config.exa.apiKey) {
     Object.assign(tools, registerSearchTools({ apiKey: config.exa.apiKey, numResults: config.exa.numResults }));
+    Object.assign(tools, registerSkillShopTools({ exaApiKey: config.exa.apiKey, workspace }));
   }
 
   // Schedule
