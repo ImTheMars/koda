@@ -105,6 +105,67 @@ export function parseCronNext(schedule: string, from: Date, tz: string): Date {
   return finalDate;
 }
 
+/**
+ * Parse natural-language schedule strings into cron format understood by parseCronNext.
+ * Examples:
+ *   "every day at 8 AM"           → "08:00"
+ *   "every Monday at 9:30"        → "mon 09:30"
+ *   "every weekday at 6pm"        → "mon,tue,wed,thu,fri 18:00"
+ *   "every weekend at 10 am"      → "sat,sun 10:00"
+ *   "every Monday and Wednesday"  → "mon,wed 08:00"  (defaults to 08:00 if no time)
+ * Returns null if the text doesn't look like a schedule.
+ */
+export function parseNaturalSchedule(text: string): string | null {
+  const lower = text.toLowerCase().trim();
+
+  // Extract time: "8 am", "9:30 pm", "14:00", "9", "9 o'clock"
+  const timeRe = /(\d{1,2})(?::(\d{2}))?\s*(am|pm)?(?:\s*o'?clock)?/;
+  const timeMatch = lower.match(timeRe);
+  let hour = 8;
+  let minute = 0;
+  let hasTime = false;
+  if (timeMatch) {
+    hasTime = true;
+    hour = parseInt(timeMatch[1]!);
+    minute = parseInt(timeMatch[2] ?? "0");
+    const mer = timeMatch[3];
+    if (mer === "pm" && hour < 12) hour += 12;
+    if (mer === "am" && hour === 12) hour = 0;
+    // Ambiguous single-digit w/ no am/pm: treat noon+ as pm if < 8 (e.g. "at 7" = 07:00, "at 3" = 15:00)
+    if (!mer && hour < 8 && hour !== 0) hour += 12;
+  }
+  const timeStr = `${String(hour).padStart(2, "0")}:${String(minute).padStart(2, "0")}`;
+
+  // Named shorthand patterns
+  if (/every\s+day|daily|each\s+day/.test(lower)) return timeStr;
+  if (/every\s+weekday|weekdays|monday.+through.+friday|mon.+fri/.test(lower)) return `mon,tue,wed,thu,fri ${timeStr}`;
+  if (/every\s+weekend|weekends/.test(lower)) return `sat,sun ${timeStr}`;
+  if (/every\s+morning/.test(lower)) return hasTime ? timeStr : "08:00";
+  if (/every\s+evening/.test(lower)) return hasTime ? timeStr : "18:00";
+  if (/every\s+night/.test(lower)) return hasTime ? timeStr : "21:00";
+
+  // Specific weekday(s)
+  const DAY_PATTERNS: Array<[RegExp, string]> = [
+    [/monday|mondays|\bmon\b/, "mon"],
+    [/tuesday|tuesdays|\btue\b/, "tue"],
+    [/wednesday|wednesdays|\bwed\b/, "wed"],
+    [/thursday|thursdays|\bthu\b/, "thu"],
+    [/friday|fridays|\bfri\b/, "fri"],
+    [/saturday|saturdays|\bsat\b/, "sat"],
+    [/sunday|sundays|\bsun\b/, "sun"],
+  ];
+  const days: string[] = [];
+  for (const [re, abbr] of DAY_PATTERNS) {
+    if (re.test(lower)) days.push(abbr);
+  }
+  if (days.length > 0) return `${days.join(",")} ${timeStr}`;
+
+  // If we found a time but no day context, assume daily
+  if (hasTime && /every|each|repeat|recurring|remind/.test(lower)) return timeStr;
+
+  return null;
+}
+
 export function validateTimezone(tz: string): boolean {
   try { Intl.DateTimeFormat(undefined, { timeZone: tz }); return true; } catch { return false; }
 }

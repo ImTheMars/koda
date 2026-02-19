@@ -19,6 +19,7 @@ import { registerSkillTools } from "./skills.js";
 import { registerSoulTools, SoulLoader } from "./soul.js";
 import { registerStatusTools } from "./status.js";
 import { registerSkillShopTools } from "./skillshop.js";
+import { registerSandboxTools } from "./sandbox.js";
 
 interface ToolRuntimeContext {
   userId: string;
@@ -42,13 +43,13 @@ function getToolContext(): ToolRuntimeContext {
   return toolContextStore.getStore() ?? DEFAULT_CONTEXT;
 }
 
-export function buildTools(deps: {
+export async function buildTools(deps: {
   config: Config;
   memoryProvider: MemoryProvider;
   skillLoader: SkillLoader;
   workspace: string;
   soulLoader?: SoulLoader;
-}): ToolSet {
+}): Promise<ToolSet> {
   const { config, memoryProvider, skillLoader, workspace } = deps;
 
   const tools: ToolSet = {
@@ -82,6 +83,9 @@ export function buildTools(deps: {
 
   // Status
   Object.assign(tools, registerStatusTools({ memory: memoryProvider }));
+
+  // Safe sandbox (async — checks Docker availability at boot)
+  Object.assign(tools, await registerSandboxTools({ workspace }));
 
   return tools;
 }

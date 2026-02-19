@@ -7,9 +7,9 @@
 import { mkdir } from "fs/promises";
 import { resolve } from "path";
 import { loadConfig, type Config } from "./config.js";
-import { initDb, closeDb, messages as dbMessages, state as dbState, tasks as dbTasks } from "./db.js";
+import { initDb, closeDb, messages as dbMessages, state as dbState, tasks as dbTasks, vacuumDb } from "./db.js";
 import { parseCronNext } from "./time.js";
-import { createAgent, createStreamAgent, type AgentDeps } from "./agent.js";
+import { createAgent, createStreamAgent, initOllama, type AgentDeps } from "./agent.js";
 import { SoulLoader } from "./tools/soul.js";
 import { SkillLoader } from "./tools/skills.js";
 import { createMemoryProvider } from "./tools/memory.js";
@@ -20,7 +20,8 @@ import { buildTools } from "./tools/index.js";
 import { enableDebug } from "./log.js";
 import { createMCPClient } from "@ai-sdk/mcp";
 import { handleDashboardRequest } from "./dashboard.js";
-import { registerSubAgentTools } from "./tools/subagent.js";
+import { registerSubAgentTools, getNamedSession } from "./tools/subagent.js";
+import { recordMemSample } from "./metrics.js";
 
 // --- CLI routing ---
 const command = process.argv[2];
@@ -83,8 +84,23 @@ Skip:
   }
 })();
 
+// --- Ollama detection ---
+if (config.ollama?.enabled) {
+  try {
+    const res = await fetch(`${config.ollama.baseUrl}/api/tags`, { signal: AbortSignal.timeout(1500) });
+    if (res.ok) {
+      initOllama(config.ollama.baseUrl);
+      console.log(`[boot] Ollama: enabled (${config.ollama.model}) at ${config.ollama.baseUrl}`);
+    } else {
+      console.log("[boot] Ollama: configured but not reachable — using OpenRouter only");
+    }
+  } catch {
+    console.log("[boot] Ollama: not reachable — using OpenRouter only");
+  }
+}
+
 // --- Tools ---
-const tools = buildTools({ config, memoryProvider, skillLoader, workspace: config.workspace, soulLoader });
+const tools = await buildTools({ config, memoryProvider, skillLoader, workspace: config.workspace, soulLoader });
 
 // --- MCP Clients ---
 type McpServerConfig = Config["mcp"]["servers"][number];
@@ -96,7 +112,7 @@ function buildMcpTransport(server: McpServerConfig) {
   return { type: server.transport, url: server.url, ...(server.headers ? { headers: server.headers } : {}) };
 }
 
-async function connectMcpServer(server: McpServerConfig, toolSet: ReturnType<typeof buildTools>) {
+async function connectMcpServer(server: McpServerConfig, toolSet: Awaited<ReturnType<typeof buildTools>>) {
   const client = await createMCPClient({ transport: buildMcpTransport(server) as any });
   const mcpTools = await client.tools();
   Object.assign(toolSet, mcpTools);
@@ -194,12 +210,39 @@ Object.assign(tools, registerSubAgentTools({
   }
 })();
 
+// --- Named agent routing wrapper ---
+// Parses "@AgentName: message" prefix and routes to that sub-agent's session.
+const NAMED_AGENT_RE = /^@([A-Za-z][A-Za-z0-9_-]*):\s*/;
+
+function resolveNamedInput(content: string): { content: string; sessionKey?: string } | null {
+  const match = content.match(NAMED_AGENT_RE);
+  if (!match) return null;
+  const name = match[1]!;
+  const session = getNamedSession(name);
+  if (!session) return null;
+  return { content: content.slice(match[0].length), sessionKey: session.sessionKey };
+}
+
+function makeNamedStreamAgent(baseStreamAgent: typeof streamAgentFn): typeof streamAgentFn {
+  return async (input) => {
+    const resolved = resolveNamedInput(input.content);
+    if (!resolved) return baseStreamAgent(input);
+    return baseStreamAgent({
+      ...input,
+      content: resolved.content,
+      sessionKey: resolved.sessionKey ?? input.sessionKey,
+    });
+  };
+}
+
 // --- Channels ---
 let telegram: { stop: () => Promise<void>; sendDirect: (chatId: string, text: string) => Promise<void> } | null = null;
 let repl: { stop: () => void } | null = null;
 
+const routedStreamAgent = makeNamedStreamAgent(streamAgentFn);
+
 if (config.mode !== "cli-only" && config.telegram.token) {
-  telegram = startTelegram({ streamAgent: streamAgentFn, config });
+  telegram = startTelegram({ streamAgent: routedStreamAgent, config });
   console.log("[boot] Channel: telegram enabled");
 }
 
@@ -240,8 +283,23 @@ if (config.features.scheduler) {
   console.log("[boot] Proactive: started");
 }
 
+// --- Metrics: memory sampling every 5 s ---
+recordMemSample(); // baseline at boot
+const memSampleTimer = setInterval(recordMemSample, 5_000);
+
+// --- Hourly RAM auto-clean ---
+const hourlyCleanTimer = setInterval(() => {
+  try {
+    const cleaned = dbMessages.cleanup(90);
+    vacuumDb();
+    if (cleaned > 0) console.log(`[gc] Cleaned ${cleaned} messages + vacuumed SQLite`);
+  } catch (err) {
+    console.warn("[gc] Hourly clean failed:", (err as Error).message);
+  }
+}, 60 * 60 * 1000);
+
 // --- Health + Dashboard server ---
-const VERSION = "1.5.0";
+const VERSION = "1.6.0"; // v1.6.0
 const dashOwner = config.telegram.adminIds[0] ?? config.owner.id;
 
 const server = Bun.serve({
@@ -263,6 +321,8 @@ console.log(`[boot] Dashboard on :${server.port}/`);
 const shutdown = async (signal: string) => {
   console.log(`\n[${signal}] Shutting down...`);
   clearInterval(mcpRestartTimer);
+  clearInterval(memSampleTimer);
+  clearInterval(hourlyCleanTimer);
   proactive?.stop();
   repl?.stop();
   if (telegram) await telegram.stop();

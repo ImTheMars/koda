@@ -5,7 +5,7 @@
 import { tool, type ToolSet } from "ai";
 import { z } from "zod";
 import { tasks as dbTasks } from "../db.js";
-import { parseCronNext } from "../time.js";
+import { parseCronNext, parseNaturalSchedule } from "../time.js";
 import { scheduleNudge } from "../proactive.js";
 
 export function registerScheduleTools(deps: {
@@ -41,25 +41,27 @@ export function registerScheduleTools(deps: {
   });
 
   const createRecurringTask = tool({
-    description: "Create a recurring task that triggers the agent at a schedule.",
+    description: "Create a recurring task that triggers the agent at a schedule. Accepts natural language like 'every day at 8 AM', 'every Monday at 9', 'every weekday at 6 PM', or cron format '08:00' / 'mon,wed,fri 09:00'.",
     inputSchema: z.object({
       description: z.string().describe("Human-readable label"),
       prompt: z.string().describe("What the agent should do when this fires"),
-      schedule: z.string().describe('Cron schedule: "08:00" for daily, "mon,wed,fri 09:00" for specific days'),
+      schedule: z.string().describe('Schedule: natural language ("every day at 8 AM") or cron format ("mon,wed,fri 09:00")'),
     }),
     execute: async ({ description, prompt, schedule }) => {
+      // Try natural language parsing first, fall back to raw cron string
+      const normalizedSchedule = parseNaturalSchedule(schedule) ?? schedule;
       let nextRunAt: Date;
-      try { nextRunAt = parseCronNext(schedule, new Date(), timezone); }
-      catch { return { success: false, error: "Invalid schedule format" }; }
+      try { nextRunAt = parseCronNext(normalizedSchedule, new Date(), timezone); }
+      catch { return { success: false, error: `Invalid schedule format: "${schedule}"` }; }
 
       const id = crypto.randomUUID();
       dbTasks.create({
         id, type: "recurring", channel: getChannel(), chatId: getChatId(),
-        userId: getUserId(), cron: schedule, nextRunAt: nextRunAt.toISOString(),
+        userId: getUserId(), cron: normalizedSchedule, nextRunAt: nextRunAt.toISOString(),
         prompt, description, enabled: true, oneShot: false,
       });
 
-      return { success: true, id, schedule, nextRunAt: nextRunAt.toISOString() };
+      return { success: true, id, schedule: normalizedSchedule, parsedFrom: schedule !== normalizedSchedule ? schedule : undefined, nextRunAt: nextRunAt.toISOString() };
     },
   });
 

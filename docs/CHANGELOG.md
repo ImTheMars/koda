@@ -5,6 +5,35 @@ all notable changes to koda.
 ---
 
 ## 2026-02-19
+### v1.6.0 — RAM auto-clean · live spawns · safe score · smarter router · natural cron · RAM graph · Docker sandbox · Ollama · named agent chat
+
+#### added
+
+- **`src/metrics.ts`** — new module: `recordMemSample()` collects `process.memoryUsage()` every 5 s into a 120-entry ring buffer (10 min history). `getMemSamples()` exported for dashboard. Recording starts at boot in `index.ts`.
+- **Hourly RAM auto-clean** (`src/index.ts`) — `setInterval` runs `dbMessages.cleanup(90)` + `vacuumDb()` every hour. Reclaims 40–100 MB on long-running instances by freeing WAL pages and compacting the database file.
+- **`vacuumDb()`** (`src/db.ts`) — runs `PRAGMA wal_checkpoint(TRUNCATE)` + `VACUUM` to return unused pages to the OS.
+- **Kill sub-agent** (`src/tools/subagent.ts`, `src/dashboard.ts`) — each in-flight sub-agent is tracked with an `AbortController`. `killSpawn(sessionKey)` sets the abort signal and marks the entry "killed". Dashboard exposes `DELETE /api/spawns?session=<key>`. Spawn rows show a "kill" button when `status === 'running'`.
+- **Live "running" status** — `SpawnEntry` now has `status: "running" | "done" | "error" | "timeout" | "killed"`. Running spawns appear at the top of the log immediately when they start, before completion.
+- **Named session registry** (`src/tools/subagent.ts`) — `spawnAgent` registers `name → sessionKey` in `namedSessions` Map. Returns a `note` field in the result suggesting the `@AgentName:` syntax. `getNamedSession(name)` exported.
+- **Direct sub-agent chat** (`src/index.ts`) — `makeNamedStreamAgent` wraps `streamAgentFn` to parse `@AgentName: message` prefix. Matching sessions resume the sub-agent's conversation history from SQLite, so follow-up questions are contextual.
+- **Skill Shop safe score** (`src/tools/skillshop.ts`) — `calculateSafeScore(content)` returns 0–100 based on weighted pattern severity (e.g. credential theft = −30, `fetch(` = −5). Replaced the flat `DANGEROUS_PATTERNS` array with `PATTERN_WEIGHTS` used by both the scanner and the scorer. Score returned in `preview` and `install` results.
+- **Weighted tier classification** (`src/router.ts`) — `classifyTier` now uses an additive score: strong keywords (+3/match), soft keywords (+1/match), message length >120 words (+1), >300 words (+1), 3+ connective conjunctions (+1). Threshold ≥ 3 → deep. Replaces the brittle binary `countMatches ≥ 2` check.
+- **`parseNaturalSchedule()`** (`src/time.ts`) — converts natural language like "every day at 8 AM", "every Monday at 9:30", "every weekday at 6 PM", "every weekend at 10", "every morning" into cron format. `createRecurringTask` tries this before raw cron string.
+- **Dashboard RAM graph** (`src/dashboard.ts`) — `GET /api/memory` returns the sample ring buffer. Dashboard renders an SVG polyline sparkline (last 10 min) with heap, RSS, and external stats. Auto-refreshes every 30 s.
+- **Docker safe sandbox** (`src/tools/sandbox.ts`) — `runSandboxed` tool wraps `docker run` with: `--memory 512m`, `--cpus 0.5`, `--network none`, `--pids-limit 64`, `--cap-drop ALL`, workspace mounted read-only. Docker availability checked at boot; tool is silently absent if Docker is not installed.
+- **Ollama local model support** (`src/agent.ts`, `src/config.ts`) — `config.ollama.enabled` + `baseUrl` + `model` + `fastOnly`. `initOllama()` initializes `ollama-ai-provider` at boot if Ollama is reachable. Fast-tier calls use the local model when configured; deep-tier always uses OpenRouter. Adds `ollama-ai-provider@1.2.0` dependency.
+- **AbortSignal threading** — `AgentInput.abortSignal?` flows from channel → `createAgent` → `generateText`/`streamText`. Used by kill and timeout logic.
+
+#### changed
+
+- `buildTools()` in `src/tools/index.ts` is now `async` (for Docker check). All callers updated.
+- `streamAgentFn` in channels is now wrapped by `routedStreamAgent` for named agent routing.
+- Spawn rows in dashboard now include `startedAt` field (was `timestamp`) for accurate age display.
+- Spawn log is no longer reversed on the API — `running` entries appear first naturally.
+
+---
+
+## 2026-02-19
 ### v1.5.0 — Sub-agent hardening + config-driven tuning + spawn dashboard
 
 #### added

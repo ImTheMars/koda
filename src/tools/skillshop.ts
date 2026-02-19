@@ -15,44 +15,48 @@ import { log } from "../log.js";
 
 // --- Safety scanner ---
 
-const DANGEROUS_PATTERNS = [
-  // Exfiltration
-  /fetch\s*\(/i,
-  /axios\s*\./i,
-  /http\.get\s*\(/i,
-  /curl\s+/i,
-  /wget\s+/i,
-  // Credential theft instructions
-  /steal\s+(api\s*key|password|token|secret|credential)/i,
-  /exfiltrat/i,
-  /send\s+.*(api.?key|password|token|secret|credential).*to/i,
-  /transmit\s+.*(key|secret|password)/i,
-  /upload\s+.*(env|credential|password|secret)/i,
-  // Destructive file ops
-  /rm\s+-rf/i,
-  /sudo\s+rm/i,
-  /format\s+c:/i,
-  /del\s+\/f\s+\/s/i,
-  /rd\s+\/s\s+\/q/i,
-  // Shell injection
-  /curl\s+.*\|\s*(bash|sh|zsh|fish)/i,
-  /wget\s+.*\|\s*(bash|sh|zsh|fish)/i,
-  // Sensitive file access + transmit
-  /read\s+\.env\s+.*send/i,
-  /access\s+\.env\s+.*transmit/i,
-  // Prompt injection hallmarks
-  /ignore\s+all\s+previous\s+instructions/i,
-  /disregard\s+(your|all)\s+(previous\s+)?instructions/i,
-  /you\s+are\s+now\s+.*\bDAN\b/i,
-  /override\s+(safety|security)\s+(rules?|guidelines?)/i,
-];
-
 const MAX_SKILL_SIZE_BYTES = 100_000;
 const SKILL_NAME_PATTERN = /^[a-z][a-z0-9-]*$/;
 
 interface ScanResult {
   safe: boolean;
   reasons: string[];
+}
+
+/** Weighted per-pattern severity for safe score calculation */
+const PATTERN_WEIGHTS: Array<{ pattern: RegExp; weight: number }> = [
+  { pattern: /steal\s+(api\s*key|password|token|secret|credential)/i, weight: 30 },
+  { pattern: /exfiltrat/i, weight: 30 },
+  { pattern: /send\s+.*(api.?key|password|token|secret|credential).*to/i, weight: 30 },
+  { pattern: /transmit\s+.*(key|secret|password)/i, weight: 25 },
+  { pattern: /ignore\s+all\s+previous\s+instructions/i, weight: 25 },
+  { pattern: /disregard\s+(your|all)\s+(previous\s+)?instructions/i, weight: 25 },
+  { pattern: /override\s+(safety|security)\s+(rules?|guidelines?)/i, weight: 25 },
+  { pattern: /you\s+are\s+now\s+.*\bDAN\b/i, weight: 25 },
+  { pattern: /rm\s+-rf/i, weight: 20 },
+  { pattern: /sudo\s+rm/i, weight: 20 },
+  { pattern: /format\s+c:/i, weight: 20 },
+  { pattern: /curl\s+.*\|\s*(bash|sh|zsh|fish)/i, weight: 20 },
+  { pattern: /wget\s+.*\|\s*(bash|sh|zsh|fish)/i, weight: 20 },
+  { pattern: /upload\s+.*(env|credential|password|secret)/i, weight: 20 },
+  { pattern: /read\s+\.env\s+.*send/i, weight: 15 },
+  { pattern: /access\s+\.env\s+.*transmit/i, weight: 15 },
+  { pattern: /fetch\s*\(/i, weight: 5 },
+  { pattern: /axios\s*\./i, weight: 5 },
+  { pattern: /http\.get\s*\(/i, weight: 5 },
+  { pattern: /curl\s+/i, weight: 3 },
+  { pattern: /wget\s+/i, weight: 3 },
+];
+
+function calculateSafeScore(content: string): number {
+  let score = 100;
+  const bytes = Buffer.byteLength(content, "utf-8");
+  if (bytes > MAX_SKILL_SIZE_BYTES) score -= 40;
+  else if (bytes > 50_000) score -= 10;
+  for (const { pattern, weight } of PATTERN_WEIGHTS) {
+    if (pattern.test(content)) score -= weight;
+  }
+  return Math.max(0, score);
 }
 
 function scanContent(content: string): ScanResult {
@@ -62,7 +66,7 @@ function scanContent(content: string): ScanResult {
     reasons.push(`File too large (>${MAX_SKILL_SIZE_BYTES / 1000}KB) — suspicious for a SKILL.md`);
   }
 
-  for (const pattern of DANGEROUS_PATTERNS) {
+  for (const { pattern } of PATTERN_WEIGHTS) {
     if (pattern.test(content)) {
       reasons.push(`Matched unsafe pattern: ${pattern.source}`);
     }
@@ -248,6 +252,7 @@ export function registerSkillShopTools(deps: { exaApiKey: string; workspace: str
             name: fmName ?? nameFromUrl(rawUrl),
             content,
             safe: scan.safe,
+            safeScore: calculateSafeScore(content),
             safetyWarnings: scan.reasons,
             sizeBytes: Buffer.byteLength(content, "utf-8"),
             note: scan.safe
@@ -303,6 +308,7 @@ export function registerSkillShopTools(deps: { exaApiKey: string; workspace: str
             name: localName,
             path: skillPath,
             source: sourceTag,
+            safeScore: calculateSafeScore(content),
             message: `Skill "${localName}" installed! It's live immediately — no restart needed.`,
           };
         } catch (err) {

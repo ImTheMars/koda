@@ -258,6 +258,14 @@ export const learnings = {
   },
 };
 
+// --- Maintenance ---
+
+export function vacuumDb(): void {
+  const d = getDb();
+  d.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+  d.exec("VACUUM");
+}
+
 // --- State (key-value) ---
 
 export const state = {

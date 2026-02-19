@@ -93,6 +93,12 @@ const ConfigSchema = z.object({
     timeoutMs: z.number().min(10_000).default(90_000),
     maxSteps: z.number().min(1).max(20).default(10),
   })),
+  ollama: withEmptyDefault(z.object({
+    enabled: z.boolean().default(false),
+    baseUrl: z.string().default("http://localhost:11434"),
+    model: z.string().default("llama3.2"),
+    fastOnly: z.boolean().default(true),
+  })),
   github: withEmptyDefault(z.object({
     token: z.string().optional(),
   })),

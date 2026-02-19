@@ -1,23 +1,32 @@
 /**
- * Router — 2-tier rule-based classification + intent detection.
+ * Router — weighted 2-tier classification + intent detection.
  *
- * Tiers: fast (default), deep (reasoning keywords, long tasks, /think /deep prefix).
+ * Tiers: fast (default), deep (score ≥ 3 from keyword weights + message length).
+ * Ollama local tier: used for fast-tier when Ollama is detected and enabled in config.
  */
 
 import type { Tier, Config } from "./config.js";
 
-// --- Keyword lists ---
+// --- Keyword weights for tier classification ---
 
-const DEEP_WORDS = [
-  "prove", "theorem", "derive", "step by step", "chain of thought",
-  "formally", "mathematical", "proof", "analyze", "compare and contrast",
-  "evaluate", "critically", "explain why", "reasoning", "deduce", "infer",
+/** Single match of any of these → +3 (instant deep) */
+const DEEP_STRONG = [
+  "/think", "/deep",
+  "step by step", "chain of thought", "formally prove", "formally derive",
+  "derive the", "prove that", "proof that", "theorem",
+];
+
+/** Each match adds +1; need accumulation to reach deep */
+const DEEP_SOFT = [
+  "prove", "analyze", "compare and contrast", "evaluate", "critically",
+  "explain why", "reasoning", "deduce", "infer", "mathematical",
+  "architecture", "tradeoffs", "trade-offs", "first principles",
+  "thoroughly", "in depth", "comprehensive", "detailed analysis",
 ];
 
 const TOOL_HINTS = [
   "search", "look up", "find out", "remind", "schedule", "remember",
   "browse", "open url", "run ", "execute", "download",
-  // current-events signals — should not answer from stale training data
   "who is the", "who's the", "current president", "current ceo", "current price",
   "latest news", "what happened", "recent", "right now", "today's", "this week",
   "breaking", "live", "stock price", "weather",
@@ -50,23 +59,29 @@ function countMatches(text: string, keywords: string[]): number {
 export function classifyTier(text: string): Tier {
   const lower = text.toLowerCase().trim();
 
-  // Prefix overrides
+  // Hard prefix overrides
   if (lower.startsWith("/think") || lower.startsWith("/deep")) return "deep";
 
-  // Deep: 2+ reasoning markers
-  if (countMatches(lower, DEEP_WORDS) >= 2) return "deep";
+  let score = 0;
 
-  // Fast: short, no tool hints, no complexity signals
-  const wordCount = lower.split(/\s+/).length;
-  if (
-    wordCount < 20 &&
-    countMatches(lower, CODE_WORDS) === 0 &&
-    countMatches(lower, DEEP_WORDS) === 0
-  ) {
-    return "fast";
+  // Strong deep signals: single hit = +3 (immediately deep)
+  for (const kw of DEEP_STRONG) {
+    if (lower.includes(kw)) { score += 3; break; }
   }
 
-  return "fast";
+  // Soft signals: accumulate
+  score += countMatches(lower, DEEP_SOFT);
+
+  // Message length signals
+  const words = lower.split(/\s+/).length;
+  if (words > 120) score += 1;
+  if (words > 300) score += 1;
+
+  // Multi-constraint structure ("first... then... also... finally...")
+  const connectors = (lower.match(/\b(then|also|finally|afterwards|next|additionally)\b/g) ?? []).length;
+  if (connectors >= 3) score += 1;
+
+  return score >= 3 ? "deep" : "fast";
 }
 
 export function needsTools(text: string): boolean {

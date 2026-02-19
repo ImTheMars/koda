@@ -6,12 +6,15 @@
  *   GET /api/usage   → { today, month, allTime }
  *   GET /api/skills  → { skills[] }
  *   GET /api/tasks   → { tasks[] }
- *   GET /api/spawns  → { spawns[] }  (in-memory ring buffer from subagent.ts)
+ *   GET /api/spawns   → { spawns[] }  (in-memory ring buffer from subagent.ts)
+ *   GET /api/memory   → { samples[] } (process.memoryUsage() ring buffer)
+ *   DELETE /api/spawns?session=key → kill a running sub-agent
  */
 
 import type { SkillLoader } from "./tools/skills.js";
 import { usage as dbUsage, tasks as dbTasks } from "./db.js";
-import { getSpawnLog } from "./tools/subagent.js";
+import { getSpawnLog, killSpawn } from "./tools/subagent.js";
+import { getMemSamples } from "./metrics.js";
 
 export interface DashboardDeps {
   skillLoader: SkillLoader;
@@ -43,7 +46,11 @@ function tasksResponse(userId: string): Response {
 }
 
 function spawnsResponse(): Response {
-  return Response.json({ spawns: getSpawnLog().reverse() });
+  return Response.json({ spawns: getSpawnLog() });
+}
+
+function memoryResponse(): Response {
+  return Response.json({ samples: getMemSamples() });
 }
 
 // --- Route handler ---
@@ -55,6 +62,12 @@ export async function handleDashboardRequest(req: Request, deps: DashboardDeps):
   if (url.pathname === "/api/skills") return skillsResponse(deps.skillLoader);
   if (url.pathname === "/api/tasks") return tasksResponse(deps.defaultUserId);
   if (url.pathname === "/api/spawns") return spawnsResponse();
+  if (url.pathname === "/api/memory") return memoryResponse();
+  if (req.method === "DELETE" && url.pathname === "/api/spawns") {
+    const sessionKey = url.searchParams.get("session") ?? "";
+    const ok = killSpawn(sessionKey);
+    return Response.json({ killed: ok, sessionKey });
+  }
   if (url.pathname === "/") return new Response(buildDashboardHtml(deps.version), {
     headers: { "Content-Type": "text/html; charset=utf-8" },
   });
@@ -385,6 +398,48 @@ export function buildDashboardHtml(version: string): string {
       white-space: nowrap;
     }
 
+    .kill-btn {
+      background: none;
+      border: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 10px;
+      padding: 2px 6px;
+      border-radius: 4px;
+      cursor: pointer;
+      flex-shrink: 0;
+      transition: color 0.15s, border-color 0.15s;
+    }
+    .kill-btn:hover { color: var(--red); border-color: var(--red); }
+
+    /* --- RAM graph --- */
+    .ram-section {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      overflow: hidden;
+    }
+
+    .ram-body {
+      padding: 16px 20px 12px;
+    }
+
+    .ram-stats {
+      display: flex;
+      gap: 24px;
+      margin-bottom: 12px;
+      font-size: 12px;
+      font-family: var(--mono);
+    }
+
+    .ram-stat-label { color: var(--muted); margin-right: 4px; }
+    .ram-stat-value { color: var(--text); font-weight: 600; }
+
+    .ram-chart {
+      width: 100%;
+      height: 60px;
+      display: block;
+    }
+
     /* --- Empty state --- */
     .empty {
       padding: 36px 20px;
@@ -458,6 +513,22 @@ export function buildDashboardHtml(version: string): string {
         <li class="empty">Loading...</li>
       </ul>
     </div>
+
+    <!-- RAM graph -->
+    <div class="ram-section">
+      <div class="section-header">
+        <span class="section-title">Memory</span>
+        <span class="badge" id="ramBadge">—</span>
+      </div>
+      <div class="ram-body">
+        <div class="ram-stats">
+          <span><span class="ram-stat-label">heap</span><span class="ram-stat-value" id="ramHeap">—</span></span>
+          <span><span class="ram-stat-label">rss</span><span class="ram-stat-value" id="ramRss">—</span></span>
+          <span><span class="ram-stat-label">external</span><span class="ram-stat-value" id="ramExt">—</span></span>
+        </div>
+        <svg class="ram-chart" id="ramChart" viewBox="0 0 600 60" preserveAspectRatio="none"></svg>
+      </div>
+    </div>
   </div>
 
   <script>
@@ -529,6 +600,11 @@ export function buildDashboardHtml(version: string): string {
     const SPAWN_STATUS = { done: '✓', error: '✗', timeout: '⏱' };
     const SPAWN_COLOR = { done: 'var(--green)', error: 'var(--red)', timeout: 'var(--yellow)' };
 
+    async function killAgent(sessionKey) {
+      await fetch('/api/spawns?session=' + encodeURIComponent(sessionKey), { method: 'DELETE' });
+      refresh();
+    }
+
     function renderSpawns(data) {
       const list = document.getElementById('spawnsList');
       document.getElementById('spawnsBadge').textContent = data.spawns.length;
@@ -538,12 +614,38 @@ export function buildDashboardHtml(version: string): string {
       }
       list.innerHTML = data.spawns.slice(0, 20).map(s => \`
         <li class="spawn-row">
-          <span class="spawn-status" style="color:\${SPAWN_COLOR[s.status] ?? 'var(--muted)'}">\${SPAWN_STATUS[s.status] ?? '?'}</span>
+          <span class="spawn-status" style="color:\${SPAWN_COLOR[s.status] ?? 'var(--muted)'}">\${SPAWN_STATUS[s.status] ?? '·'}</span>
           <span class="spawn-name">\${s.name}</span>
           <span class="spawn-tools">\${s.toolsUsed.join(', ') || '—'}</span>
-          <span class="spawn-meta">\${s.cost > 0 ? '$' + s.cost.toFixed(4) : ''} \${ago(s.timestamp)}</span>
+          <span class="spawn-meta">\${s.cost > 0 ? '$' + s.cost.toFixed(4) : ''} \${ago(s.startedAt)}</span>
+          \${s.status === 'running' ? \`<button class="kill-btn" onclick="killAgent('\${s.sessionKey}')">kill</button>\` : ''}
         </li>
       \`).join('');
+    }
+
+    function renderMemory(data) {
+      const samples = data.samples ?? [];
+      if (!samples.length) return;
+      const latest = samples[samples.length - 1];
+      document.getElementById('ramHeap').textContent = latest.heapMB + ' MB';
+      document.getElementById('ramRss').textContent = latest.rssMB + ' MB';
+      document.getElementById('ramExt').textContent = latest.externalMB + ' MB';
+      document.getElementById('ramBadge').textContent = latest.rssMB + ' MB RSS';
+
+      // SVG sparkline for heap
+      const W = 600; const H = 60; const PAD = 4;
+      const vals = samples.map(s => s.heapMB);
+      const min = Math.min(...vals); const max = Math.max(...vals) || 1;
+      const pts = vals.map((v, i) => {
+        const x = PAD + (i / Math.max(vals.length - 1, 1)) * (W - PAD * 2);
+        const y = H - PAD - ((v - min) / (max - min || 1)) * (H - PAD * 2);
+        return \`\${x.toFixed(1)},\${y.toFixed(1)}\`;
+      }).join(' ');
+      document.getElementById('ramChart').innerHTML = \`
+        <polyline points="\${pts}" fill="none" stroke="var(--accent)" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>
+        <text x="\${PAD + 2}" y="\${H - PAD - 2}" fill="var(--muted)" font-size="9" font-family="monospace">\${min.toFixed(0)} MB</text>
+        <text x="\${W - PAD - 30}" y="12" fill="var(--muted)" font-size="9" font-family="monospace">\${max.toFixed(0)} MB</text>
+      \`;
     }
 
     function renderTasks(data) {
@@ -564,16 +666,18 @@ export function buildDashboardHtml(version: string): string {
 
     async function refresh() {
       try {
-        const [usage, skills, tasks, spawns] = await Promise.all([
+        const [usage, skills, tasks, spawns, memory] = await Promise.all([
           fetch('/api/usage').then(r => r.json()),
           fetch('/api/skills').then(r => r.json()),
           fetch('/api/tasks').then(r => r.json()),
           fetch('/api/spawns').then(r => r.json()),
+          fetch('/api/memory').then(r => r.json()),
         ]);
         renderUsage(usage);
         renderSkills(skills);
         renderTasks(tasks);
         renderSpawns(spawns);
+        renderMemory(memory);
         const now = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
         document.getElementById('refreshInfo').textContent = 'updated ' + now;
         document.getElementById('statusDot').style.background = '#34d399';

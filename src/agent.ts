@@ -7,6 +7,7 @@
 
 import { generateText, streamText, stepCountIs, type ToolSet, type ModelMessage } from "ai";
 import { createOpenRouter } from "@openrouter/ai-sdk-provider";
+import { createOllama } from "ollama-ai-provider";
 import type { Config, Tier } from "./config.js";
 import { classifyTier, classifyIntent, getModelId, calculateCost, shouldAck, FAILOVER } from "./router.js";
 import { messages as dbMessages, usage as dbUsage } from "./db.js";
@@ -23,6 +24,7 @@ export interface AgentInput {
   channel: string;
   sessionKey: string;
   source?: string;
+  abortSignal?: AbortSignal;
   onAck?: (text: string) => void;
   onTypingStart?: () => void;
   onTypingStop?: () => void;
@@ -57,6 +59,15 @@ const LLM_FAILURE_THRESHOLD = 3;
 const LLM_RESET_MS = 120_000;
 
 let openrouter: ReturnType<typeof createOpenRouter> | null = null;
+let ollamaProvider: ReturnType<typeof createOllama> | null = null;
+
+export function initOllama(baseUrl: string): void {
+  ollamaProvider = createOllama({ baseURL: `${baseUrl}/api` });
+}
+
+export function getOllamaProvider(): ReturnType<typeof createOllama> | null {
+  return ollamaProvider;
+}
 
 function getProvider(apiKey: string) {
   if (!openrouter) openrouter = createOpenRouter({ apiKey });
@@ -272,8 +283,13 @@ export function createAgent(deps: AgentDeps) {
         const fallbackIds = FAILOVER[currentTier] ?? [];
         const model = provider(modelId, { models: fallbackIds });
 
+        // Use Ollama for fast tier if configured and available
+        const useOllama = tier === "fast" && config.ollama?.enabled && ollamaProvider && config.ollama.fastOnly;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const activeModel: any = useOllama ? ollamaProvider!(config.ollama.model) : model;
+
         const result = await generateText({
-          model,
+          model: activeModel,
           system: systemPrompt,
           messages: messageList,
           tools,
@@ -281,6 +297,7 @@ export function createAgent(deps: AgentDeps) {
           stopWhen: stepCountIs(config.agent.maxSteps),
           maxOutputTokens: config.agent.maxTokens,
           temperature: config.agent.temperature,
+          abortSignal: input.abortSignal,
           prepareStep: ({ stepNumber }) => {
             stepCount = stepNumber;
             if (stepNumber > 10 && messageList.length > 8) {
