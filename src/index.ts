@@ -47,7 +47,7 @@ if (cleanedMessages > 0) {
 console.log("[boot] Database initialized");
 
 // --- Providers ---
-const memoryProvider = createMemoryProvider(config.supermemory.apiKey);
+const memoryProvider = createMemoryProvider(config);
 const soulLoader = new SoulLoader(config.soul.path, config.soul.dir);
 await soulLoader.initialize();
 console.log(`[boot] Soul: ${soulLoader.getSoul().identity.name}`);
@@ -56,33 +56,10 @@ const skillLoader = new SkillLoader(config.workspace);
 const skills = await skillLoader.listSkills();
 console.log(`[boot] Skills: ${skills.length} loaded`);
 
-// --- One-time Supermemory filter prompt setup ---
-(async () => {
-  const FILTER_KEY = "supermemory_filter_set_v1";
-  if (!dbState.get(FILTER_KEY)) {
-    try {
-      await (memoryProvider.client as any).settings.update({
-        shouldLLMFilter: true,
-        filterPrompt: `Personal AI assistant called Koda. Prioritize:
-- User preferences and habits (response style, tools, languages, workflows)
-- Corrections and clarifications the user makes to Koda's responses
-- Important personal facts (name, timezone, projects, roles, goals)
-- Action items and outcomes (what worked, what didn't)
-- Recurring topics and interests
-
-Skip:
-- Casual greetings and small talk with no informational content
-- Tool call noise and intermediate processing steps
-- System messages and error outputs
-- Duplicate information already captured`,
-      });
-      dbState.set(FILTER_KEY, true);
-      console.log("[boot] Supermemory filter prompt configured");
-    } catch (err) {
-      console.warn("[boot] Supermemory filter setup skipped:", (err as Error).message);
-    }
-  }
-})();
+// --- One-time cloud memory filter setup (Supermemory only) ---
+memoryProvider.setupCloudFilter?.().catch((err: Error) =>
+  console.warn("[boot] Cloud filter setup skipped:", err.message),
+);
 
 // --- Ollama detection ---
 if (config.ollama?.enabled) {
@@ -299,7 +276,7 @@ const hourlyCleanTimer = setInterval(() => {
 }, 60 * 60 * 1000);
 
 // --- Health + Dashboard server ---
-const VERSION = "1.6.0"; // v1.6.0
+const VERSION = "1.7.0"; // v1.7.0
 const dashOwner = config.telegram.adminIds[0] ?? config.owner.id;
 
 const server = Bun.serve({

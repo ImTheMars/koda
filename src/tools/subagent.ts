@@ -7,16 +7,18 @@
  *   - config-driven maxSteps cap and timeout (default 90 s)
  *   - AbortController-based kill support
  *
+ * State is persisted to SQLite (subagents table) for crash-resilience and dashboard queries.
+ * Named sessions are resolved from SQLite so @AgentName routing survives restarts.
+ *
  * Parallelism is free: the AI SDK runs multiple tool calls in a single step concurrently.
  * Registration happens post-boot in index.ts (after runAgent exists) to avoid circular deps.
- *
- * Named sessions: spawnAgent registers the name → sessionKey so users can resume conversation
- * with a specific sub-agent via "@AgentName: ..." syntax in any channel.
  */
 
 import { tool, type ToolSet } from "ai";
 import { z } from "zod";
 import { createAgent, type AgentDeps } from "../agent.js";
+import { subagents as dbSubagents, type SpawnRow } from "../db.js";
+import { emit } from "../events.js";
 
 // Tools that sub-agents are never allowed to use, regardless of allowlist.
 const ALWAYS_BLOCKED = new Set([
@@ -25,6 +27,7 @@ const ALWAYS_BLOCKED = new Set([
   "listReminders",     // no scheduling side effects
   "deleteReminder",    // no scheduling side effects
   "runCode",           // no arbitrary code execution inside a sub-agent
+  "runSandboxed",      // sandbox access only from main agent
   "skillShop",         // no installs inside a sub-agent
   "soul",              // soul is a main-agent concern
 ]);
@@ -41,70 +44,38 @@ const DEFAULT_ALLOWED = new Set([
   "systemStatus",
 ]);
 
-// --- Spawn log ring buffer ---
+// Re-export SpawnEntry shape from db for backward compat with dashboard
+export type SpawnEntry = SpawnRow;
 
-export interface SpawnEntry {
-  sessionKey: string;
-  name: string;
-  status: "running" | "done" | "error" | "timeout" | "killed";
-  toolsUsed: string[];
-  cost: number;
-  durationMs: number;
-  startedAt: string;
-  timestamp: string;
-}
-
-const SPAWN_LOG_MAX = 50;
-const spawnLog: SpawnEntry[] = [];
-
-/** running spawns indexed by sessionKey for live status */
-const runningMap = new Map<string, SpawnEntry>();
-
-/** AbortControllers for in-flight sub-agents */
+/** AbortControllers for in-flight sub-agents (in-memory only — not persisted). */
 const abortMap = new Map<string, AbortController>();
 
 export function getSpawnLog(): SpawnEntry[] {
-  const running = [...runningMap.values()];
-  return [...running, ...spawnLog].slice(0, SPAWN_LOG_MAX);
+  return dbSubagents.listRecent(50);
 }
 
 export function killSpawn(sessionKey: string): boolean {
   const ac = abortMap.get(sessionKey);
   if (!ac) return false;
   ac.abort();
-  const entry = runningMap.get(sessionKey);
-  if (entry) entry.status = "killed";
+  dbSubagents.markCompleted(sessionKey, { status: "killed", toolsUsed: [], cost: 0, durationMs: 0 });
+  const entry = dbSubagents.getByName(""); // Emit updated state
+  const updated = dbSubagents.listRecent(1).find((r) => r.sessionKey === sessionKey);
+  if (updated) emit("spawn", updated);
   return true;
 }
 
 export function getRunningSessionKeys(): string[] {
-  return [...runningMap.keys()];
+  return [...abortMap.keys()];
 }
 
-function appendCompleted(entry: SpawnEntry): void {
-  runningMap.delete(entry.sessionKey);
-  abortMap.delete(entry.sessionKey);
-  spawnLog.unshift(entry);
-  if (spawnLog.length > SPAWN_LOG_MAX) spawnLog.pop();
+export function getNamedSession(name: string): { sessionKey: string } | undefined {
+  const row = dbSubagents.getByName(name);
+  return row ?? undefined;
 }
 
-// --- Named session registry ---
-
-export interface NamedSession {
-  name: string;
-  sessionKey: string;
-  tools: string[];
-  createdAt: string;
-}
-
-const namedSessions = new Map<string, NamedSession>();
-
-export function getNamedSession(name: string): NamedSession | undefined {
-  return namedSessions.get(name.toLowerCase());
-}
-
-export function listNamedSessions(): NamedSession[] {
-  return [...namedSessions.values()];
+export function listNamedSessions(): Array<{ name: string; sessionKey: string }> {
+  return dbSubagents.getRunning().map((r) => ({ name: r.name, sessionKey: r.sessionKey }));
 }
 
 // ---
@@ -155,24 +126,11 @@ export function registerSubAgentTools(deps: {
 
       console.log(`[spawn] → ${name}  ×${maxSteps} steps  [${Object.keys(subTools).join(", ")}]`);
 
-      const entry: SpawnEntry = {
-        sessionKey,
-        name,
-        status: "running",
-        toolsUsed: [],
-        cost: 0,
-        durationMs: 0,
-        startedAt,
-        timestamp: startedAt,
-      };
-      runningMap.set(sessionKey, entry);
-
-      // Register named session immediately so user can reference it
-      namedSessions.set(name.toLowerCase(), {
-        name,
-        sessionKey,
-        tools: Object.keys(subTools),
-        createdAt: startedAt,
+      // Persist spawn record immediately
+      dbSubagents.upsert({ sessionKey, name, startedAt });
+      emit("spawn", {
+        sessionKey, name, status: "running",
+        toolsUsed: [], cost: 0, durationMs: 0, startedAt, timestamp: startedAt,
       });
 
       const ac = new AbortController();
@@ -212,14 +170,20 @@ export function registerSubAgentTools(deps: {
 
         const durationMs = Date.now() - startMs;
         const uniqueTools = [...new Set(result.toolsUsed)];
+        const wasKilled = !abortMap.has(sessionKey); // killed externally clears the map entry
+        const status = wasKilled ? "killed" : "done";
+
         console.log(`[spawn] ✓ ${name}  ${uniqueTools.join(", ")}  $${result.usage.cost.toFixed(4)}`);
 
-        entry.status = entry.status === "killed" ? "killed" : "done";
-        entry.toolsUsed = uniqueTools;
-        entry.cost = result.usage.cost;
-        entry.durationMs = durationMs;
-        entry.timestamp = new Date().toISOString();
-        appendCompleted(entry);
+        dbSubagents.markCompleted(sessionKey, { status, toolsUsed: uniqueTools, cost: result.usage.cost, durationMs });
+        abortMap.delete(sessionKey);
+
+        const finalEntry: SpawnEntry = {
+          sessionKey, name, status,
+          toolsUsed: uniqueTools, cost: result.usage.cost, durationMs,
+          startedAt, timestamp: new Date().toISOString(),
+        };
+        emit("spawn", finalEntry);
 
         return {
           success: true,
@@ -234,12 +198,20 @@ export function registerSubAgentTools(deps: {
         const msg = err instanceof Error ? err.message : "Sub-agent failed";
         const durationMs = Date.now() - startMs;
         const isTimeout = msg.startsWith("timeout");
+        const wasKilled = !abortMap.has(sessionKey);
+        const status = isTimeout ? "timeout" : wasKilled ? "killed" : "error";
+
         console.log(`[spawn] ✗ ${name}  ${msg}`);
 
-        entry.status = isTimeout ? "timeout" : entry.status === "killed" ? "killed" : "error";
-        entry.durationMs = durationMs;
-        entry.timestamp = new Date().toISOString();
-        appendCompleted(entry);
+        dbSubagents.markCompleted(sessionKey, { status, toolsUsed: [], cost: 0, durationMs });
+        abortMap.delete(sessionKey);
+
+        const finalEntry: SpawnEntry = {
+          sessionKey, name, status,
+          toolsUsed: [], cost: 0, durationMs,
+          startedAt, timestamp: new Date().toISOString(),
+        };
+        emit("spawn", finalEntry);
 
         return { success: false, name, sessionKey, error: msg, result: "", toolsUsed: [], cost: 0 };
       }

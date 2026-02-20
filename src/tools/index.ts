@@ -13,7 +13,6 @@ import type { SkillLoader } from "./skills.js";
 import { registerMemoryTools } from "./memory.js";
 import { registerSearchTools } from "./search.js";
 import { registerFilesystemTools } from "./filesystem.js";
-import { registerExecTools } from "./exec.js";
 import { registerScheduleTools } from "./schedule.js";
 import { registerSkillTools } from "./skills.js";
 import { registerSoulTools, SoulLoader } from "./soul.js";
@@ -58,7 +57,6 @@ export async function buildTools(deps: {
       getUserId: () => getToolContext().userId,
     }),
     ...registerFilesystemTools({ workspace }),
-    ...registerExecTools({ workspace }),
     ...registerSkillTools({ skillLoader, workspace }),
   };
 

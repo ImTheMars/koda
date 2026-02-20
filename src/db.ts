@@ -1,7 +1,7 @@
 /**
  * SQLite persistence layer via bun:sqlite.
  *
- * Tables: messages, tasks, usage, learnings, state
+ * Tables: messages, tasks, usage, learnings, state, subagents, vector_memories
  * WAL mode for concurrent reads.
  */
 
@@ -12,7 +12,7 @@ let stmtAppendMessage: ReturnType<Database["prepare"]> | null = null;
 let stmtGetHistory: ReturnType<Database["prepare"]> | null = null;
 let stmtTrackUsage: ReturnType<Database["prepare"]> | null = null;
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 export function initDb(dbPath: string): Database {
   db = new Database(dbPath, { create: true });
@@ -75,6 +75,28 @@ export function initDb(dbPath: string): Database {
       value TEXT NOT NULL,
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
+
+    CREATE TABLE IF NOT EXISTS subagents (
+      session_key TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'running',
+      tools_used TEXT,
+      cost REAL NOT NULL DEFAULT 0,
+      duration_ms INTEGER NOT NULL DEFAULT 0,
+      started_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_subagents_name ON subagents(name, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_subagents_updated ON subagents(updated_at DESC);
+
+    CREATE TABLE IF NOT EXISTS vector_memories (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id TEXT NOT NULL,
+      content TEXT NOT NULL,
+      embedding BLOB NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_vector_user ON vector_memories(user_id, id DESC);
   `);
 
   stmtAppendMessage = db.prepare("INSERT INTO messages (session_key, role, content, tools_used) VALUES (?, ?, ?, ?)");
@@ -92,12 +114,41 @@ function runMigrations(database: Database): void {
 
   if (currentVersion >= SCHEMA_VERSION) return;
 
-  // v1 → (current schema — no ALTER TABLE needed, just record version)
   if (currentVersion < 1) {
     database.run(
       "INSERT OR REPLACE INTO state (key, value, updated_at) VALUES ('schema_version', '1', datetime('now'))",
     );
     console.log("[db] Migrated to schema version 1");
+  }
+
+  if (currentVersion < 2) {
+    database.exec(`
+      CREATE TABLE IF NOT EXISTS subagents (
+        session_key TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'running',
+        tools_used TEXT,
+        cost REAL NOT NULL DEFAULT 0,
+        duration_ms INTEGER NOT NULL DEFAULT 0,
+        started_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_subagents_name ON subagents(name, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_subagents_updated ON subagents(updated_at DESC);
+
+      CREATE TABLE IF NOT EXISTS vector_memories (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        content TEXT NOT NULL,
+        embedding BLOB NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_vector_user ON vector_memories(user_id, id DESC);
+    `);
+    database.run(
+      "INSERT OR REPLACE INTO state (key, value, updated_at) VALUES ('schema_version', '2', datetime('now'))",
+    );
+    console.log("[db] Migrated to schema version 2");
   }
 }
 
@@ -255,6 +306,107 @@ export const learnings = {
     return getDb()
       .query("SELECT type, content FROM learnings WHERE user_id = ? ORDER BY id DESC LIMIT ?")
       .all(userId, limit) as any[];
+  },
+};
+
+// --- Sub-agents ---
+
+export interface SpawnRow {
+  sessionKey: string;
+  name: string;
+  status: "running" | "done" | "error" | "timeout" | "killed";
+  toolsUsed: string[];
+  cost: number;
+  durationMs: number;
+  startedAt: string;
+  timestamp: string;
+}
+
+export const subagents = {
+  upsert(row: { sessionKey: string; name: string; startedAt: string }): void {
+    getDb().run(
+      `INSERT INTO subagents (session_key, name, status, started_at, updated_at)
+       VALUES (?, ?, 'running', ?, datetime('now'))
+       ON CONFLICT(session_key) DO NOTHING`,
+      [row.sessionKey, row.name, row.startedAt],
+    );
+  },
+
+  markCompleted(sessionKey: string, update: {
+    status: "done" | "error" | "timeout" | "killed";
+    toolsUsed: string[];
+    cost: number;
+    durationMs: number;
+  }): void {
+    getDb().run(
+      "UPDATE subagents SET status = ?, tools_used = ?, cost = ?, duration_ms = ?, updated_at = datetime('now') WHERE session_key = ?",
+      [update.status, JSON.stringify(update.toolsUsed), update.cost, update.durationMs, sessionKey],
+    );
+  },
+
+  listRecent(limit = 50): SpawnRow[] {
+    const rows = getDb()
+      .query("SELECT session_key, name, status, tools_used, cost, duration_ms, started_at, updated_at FROM subagents ORDER BY updated_at DESC LIMIT ?")
+      .all(limit) as Array<{
+        session_key: string; name: string; status: string;
+        tools_used: string | null; cost: number; duration_ms: number;
+        started_at: string; updated_at: string;
+      }>;
+    return rows.map((r) => ({
+      sessionKey: r.session_key,
+      name: r.name,
+      status: r.status as SpawnRow["status"],
+      toolsUsed: r.tools_used ? (JSON.parse(r.tools_used) as string[]) : [],
+      cost: r.cost,
+      durationMs: r.duration_ms,
+      startedAt: r.started_at,
+      timestamp: r.updated_at,
+    }));
+  },
+
+  getByName(name: string): { sessionKey: string; name: string } | null {
+    const row = getDb()
+      .query("SELECT session_key, name FROM subagents WHERE lower(name) = lower(?) ORDER BY updated_at DESC LIMIT 1")
+      .get(name) as { session_key: string; name: string } | null;
+    if (!row) return null;
+    return { sessionKey: row.session_key, name: row.name };
+  },
+
+  getRunning(): SpawnRow[] {
+    return subagents.listRecent(200).filter((r) => r.status === "running");
+  },
+};
+
+// --- Vector memories ---
+
+export const vectorMemories = {
+  insert(userId: string, content: string, embedding: Float32Array): void {
+    const blob = Buffer.from(embedding.buffer, embedding.byteOffset, embedding.byteLength);
+    getDb().run(
+      "INSERT INTO vector_memories (user_id, content, embedding) VALUES (?, ?, ?)",
+      [userId, content, blob],
+    );
+  },
+
+  listByUser(userId: string): Array<{ id: number; content: string; embedding: Buffer }> {
+    return getDb()
+      .query("SELECT id, content, embedding FROM vector_memories WHERE user_id = ? ORDER BY id DESC")
+      .all(userId) as any[];
+  },
+
+  count(userId: string): number {
+    const row = getDb()
+      .query("SELECT COUNT(*) as cnt FROM vector_memories WHERE user_id = ?")
+      .get(userId) as { cnt: number } | null;
+    return row?.cnt ?? 0;
+  },
+
+  deleteOldest(userId: string, keepCount: number): void {
+    getDb().run(
+      `DELETE FROM vector_memories WHERE user_id = ? AND id NOT IN
+       (SELECT id FROM vector_memories WHERE user_id = ? ORDER BY id DESC LIMIT ?)`,
+      [userId, userId, keepCount],
+    );
   },
 };
 

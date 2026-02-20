@@ -23,9 +23,9 @@ const ConfigSchema = z.object({
     fastModel: z.string().default("google/gemini-3-flash-preview"),
     deepModel: z.string().default("anthropic/claude-sonnet-4.6"),
   }),
-  supermemory: z.object({
-    apiKey: z.string().min(1, "Supermemory API key is required"),
-  }),
+  supermemory: withEmptyDefault(z.object({
+    apiKey: z.string().optional(),
+  })),
   exa: withEmptyDefault(z.object({ apiKey: z.string().optional(), numResults: z.number().min(1).max(20).default(5) })),
   telegram: withEmptyDefault(z.object({
     token: z.string().optional(),
@@ -101,6 +101,12 @@ const ConfigSchema = z.object({
   })),
   github: withEmptyDefault(z.object({
     token: z.string().optional(),
+  })),
+  embeddings: withEmptyDefault(z.object({
+    enabled: z.boolean().default(false),
+    ollamaUrl: z.string().default("http://localhost:11434"),
+    model: z.string().default("nomic-embed-text"),
+    maxMemories: z.number().min(10).max(10_000).default(1_000),
   })),
   workspace: z.string().default("~/.koda"),
 });

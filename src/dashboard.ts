@@ -6,8 +6,9 @@
  *   GET /api/usage   → { today, month, allTime }
  *   GET /api/skills  → { skills[] }
  *   GET /api/tasks   → { tasks[] }
- *   GET /api/spawns   → { spawns[] }  (in-memory ring buffer from subagent.ts)
- *   GET /api/memory   → { samples[] } (process.memoryUsage() ring buffer)
+ *   GET /api/spawns  → { spawns[] }  (SQLite-backed, latest 50)
+ *   GET /api/memory  → { samples[] } (process.memoryUsage() ring buffer)
+ *   GET /api/events  → SSE stream (memory every 5s, spawn on state change, heartbeat every 30s)
  *   DELETE /api/spawns?session=key → kill a running sub-agent
  */
 
@@ -15,6 +16,7 @@ import type { SkillLoader } from "./tools/skills.js";
 import { usage as dbUsage, tasks as dbTasks } from "./db.js";
 import { getSpawnLog, killSpawn } from "./tools/subagent.js";
 import { getMemSamples } from "./metrics.js";
+import { subscribe } from "./events.js";
 
 export interface DashboardDeps {
   skillLoader: SkillLoader;
@@ -53,6 +55,44 @@ function memoryResponse(): Response {
   return Response.json({ samples: getMemSamples() });
 }
 
+function sseResponse(): Response {
+  const encoder = new TextEncoder();
+  let unsub: (() => void) | undefined;
+  let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+
+  const stream = new ReadableStream({
+    start(ctrl) {
+      function send(name: string, data: unknown) {
+        try {
+          ctrl.enqueue(encoder.encode(`event: ${name}\ndata: ${JSON.stringify(data)}\n\n`));
+        } catch {}
+      }
+
+      // Immediately send init event so client triggers a full data refresh
+      send("init", { ok: true });
+
+      // Subscribe to future events from any module
+      unsub = subscribe((name, data) => send(name, data));
+
+      // Heartbeat keeps connection alive and triggers slow-data refresh (usage, skills, tasks)
+      heartbeatTimer = setInterval(() => send("heartbeat", {}), 30_000);
+    },
+    cancel() {
+      unsub?.();
+      clearInterval(heartbeatTimer);
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      "Connection": "keep-alive",
+      "X-Accel-Buffering": "no",
+    },
+  });
+}
+
 // --- Route handler ---
 
 export async function handleDashboardRequest(req: Request, deps: DashboardDeps): Promise<Response | null> {
@@ -61,13 +101,18 @@ export async function handleDashboardRequest(req: Request, deps: DashboardDeps):
   if (url.pathname === "/api/usage") return usageResponse(deps.defaultUserId);
   if (url.pathname === "/api/skills") return skillsResponse(deps.skillLoader);
   if (url.pathname === "/api/tasks") return tasksResponse(deps.defaultUserId);
-  if (url.pathname === "/api/spawns") return spawnsResponse();
   if (url.pathname === "/api/memory") return memoryResponse();
-  if (req.method === "DELETE" && url.pathname === "/api/spawns") {
-    const sessionKey = url.searchParams.get("session") ?? "";
-    const ok = killSpawn(sessionKey);
-    return Response.json({ killed: ok, sessionKey });
+  if (url.pathname === "/api/events") return sseResponse();
+
+  if (url.pathname === "/api/spawns") {
+    if (req.method === "DELETE") {
+      const sessionKey = url.searchParams.get("session") ?? "";
+      const ok = killSpawn(sessionKey);
+      return Response.json({ killed: ok, sessionKey });
+    }
+    return spawnsResponse();
   }
+
   if (url.pathname === "/") return new Response(buildDashboardHtml(deps.version), {
     headers: { "Content-Type": "text/html; charset=utf-8" },
   });
@@ -141,6 +186,7 @@ export function buildDashboardHtml(version: string): string {
       background: var(--green);
       box-shadow: 0 0 8px var(--green);
       flex-shrink: 0;
+      transition: background 0.3s, box-shadow 0.3s;
     }
 
     .version {
@@ -149,9 +195,28 @@ export function buildDashboardHtml(version: string): string {
       font-family: var(--mono);
     }
 
-    .refresh-info {
+    .status-info {
       font-size: 12px;
       color: var(--muted);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .sse-badge {
+      font-size: 10px;
+      font-family: var(--mono);
+      padding: 2px 7px;
+      border-radius: 10px;
+      background: rgba(52, 211, 153, 0.1);
+      color: var(--green);
+      border: 1px solid rgba(52, 211, 153, 0.2);
+    }
+
+    .sse-badge.offline {
+      background: rgba(248, 113, 113, 0.1);
+      color: var(--red);
+      border-color: rgba(248, 113, 113, 0.2);
     }
 
     .main {
@@ -235,9 +300,7 @@ export function buildDashboardHtml(version: string): string {
     }
 
     /* --- Skills table --- */
-    .skills-list {
-      list-style: none;
-    }
+    .skills-list { list-style: none; }
 
     .skill-row {
       display: flex;
@@ -419,9 +482,7 @@ export function buildDashboardHtml(version: string): string {
       overflow: hidden;
     }
 
-    .ram-body {
-      padding: 16px 20px 12px;
-    }
+    .ram-body { padding: 16px 20px 12px; }
 
     .ram-stats {
       display: flex;
@@ -434,11 +495,7 @@ export function buildDashboardHtml(version: string): string {
     .ram-stat-label { color: var(--muted); margin-right: 4px; }
     .ram-stat-value { color: var(--text); font-weight: 600; }
 
-    .ram-chart {
-      width: 100%;
-      height: 60px;
-      display: block;
-    }
+    .ram-chart { width: 100%; height: 60px; display: block; }
 
     /* --- Empty state --- */
     .empty {
@@ -470,7 +527,10 @@ export function buildDashboardHtml(version: string): string {
       Koda
       <span class="version">v${version}</span>
     </div>
-    <div class="refresh-info" id="refreshInfo">loading...</div>
+    <div class="status-info">
+      <span class="sse-badge" id="sseBadge">live</span>
+      <span id="refreshInfo">connecting...</span>
+    </div>
   </div>
 
   <div class="main">
@@ -533,6 +593,13 @@ export function buildDashboardHtml(version: string): string {
 
   <script>
     const SKILL_ICONS = { builtin: '⚡', workspace: '✦' };
+    const SPAWN_STATUS = { done: '✓', error: '✗', timeout: '⏱', running: '·', killed: '✕' };
+    const SPAWN_COLOR = { done: 'var(--green)', error: 'var(--red)', timeout: 'var(--yellow)', running: 'var(--accent)', killed: 'var(--muted)' };
+
+    // Client-side state for incremental SSE updates
+    const memSamples = [];
+    const MEM_MAX = 120;
+    let spawnList = [];
 
     function fmt(cost) {
       return cost < 0.01 ? '<$0.01' : '$' + cost.toFixed(3);
@@ -551,6 +618,32 @@ export function buildDashboardHtml(version: string): string {
       if (hrs < 1) return \`\${prefix} \${mins}m\`;
       if (days < 1) return \`\${prefix} \${hrs}h\`;
       return \`\${prefix} \${days}d\`;
+    }
+
+    function ago(isoStr) {
+      if (!isoStr) return '—';
+      const diff = Date.now() - new Date(isoStr).getTime();
+      const mins = Math.floor(diff / 60000);
+      const hrs = Math.floor(diff / 3600000);
+      if (mins < 1) return 'just now';
+      if (hrs < 1) return \`\${mins}m ago\`;
+      return \`\${hrs}h ago\`;
+    }
+
+    function setStatus(online) {
+      const dot = document.getElementById('statusDot');
+      const badge = document.getElementById('sseBadge');
+      if (online) {
+        dot.style.background = '#34d399';
+        dot.style.boxShadow = '0 0 8px #34d399';
+        badge.textContent = 'live';
+        badge.className = 'sse-badge';
+      } else {
+        dot.style.background = '#f87171';
+        dot.style.boxShadow = '0 0 8px #f87171';
+        badge.textContent = 'offline';
+        badge.className = 'sse-badge offline';
+      }
     }
 
     function renderUsage(data) {
@@ -587,67 +680,6 @@ export function buildDashboardHtml(version: string): string {
       \`).join('');
     }
 
-    function ago(isoStr) {
-      if (!isoStr) return '—';
-      const diff = Date.now() - new Date(isoStr).getTime();
-      const mins = Math.floor(diff / 60000);
-      const hrs = Math.floor(diff / 3600000);
-      if (mins < 1) return 'just now';
-      if (hrs < 1) return \`\${mins}m ago\`;
-      return \`\${hrs}h ago\`;
-    }
-
-    const SPAWN_STATUS = { done: '✓', error: '✗', timeout: '⏱' };
-    const SPAWN_COLOR = { done: 'var(--green)', error: 'var(--red)', timeout: 'var(--yellow)' };
-
-    async function killAgent(sessionKey) {
-      await fetch('/api/spawns?session=' + encodeURIComponent(sessionKey), { method: 'DELETE' });
-      refresh();
-    }
-
-    function renderSpawns(data) {
-      const list = document.getElementById('spawnsList');
-      document.getElementById('spawnsBadge').textContent = data.spawns.length;
-      if (!data.spawns.length) {
-        list.innerHTML = '<li class="empty">No sub-agents spawned yet</li>';
-        return;
-      }
-      list.innerHTML = data.spawns.slice(0, 20).map(s => \`
-        <li class="spawn-row">
-          <span class="spawn-status" style="color:\${SPAWN_COLOR[s.status] ?? 'var(--muted)'}">\${SPAWN_STATUS[s.status] ?? '·'}</span>
-          <span class="spawn-name">\${s.name}</span>
-          <span class="spawn-tools">\${s.toolsUsed.join(', ') || '—'}</span>
-          <span class="spawn-meta">\${s.cost > 0 ? '$' + s.cost.toFixed(4) : ''} \${ago(s.startedAt)}</span>
-          \${s.status === 'running' ? \`<button class="kill-btn" onclick="killAgent('\${s.sessionKey}')">kill</button>\` : ''}
-        </li>
-      \`).join('');
-    }
-
-    function renderMemory(data) {
-      const samples = data.samples ?? [];
-      if (!samples.length) return;
-      const latest = samples[samples.length - 1];
-      document.getElementById('ramHeap').textContent = latest.heapMB + ' MB';
-      document.getElementById('ramRss').textContent = latest.rssMB + ' MB';
-      document.getElementById('ramExt').textContent = latest.externalMB + ' MB';
-      document.getElementById('ramBadge').textContent = latest.rssMB + ' MB RSS';
-
-      // SVG sparkline for heap
-      const W = 600; const H = 60; const PAD = 4;
-      const vals = samples.map(s => s.heapMB);
-      const min = Math.min(...vals); const max = Math.max(...vals) || 1;
-      const pts = vals.map((v, i) => {
-        const x = PAD + (i / Math.max(vals.length - 1, 1)) * (W - PAD * 2);
-        const y = H - PAD - ((v - min) / (max - min || 1)) * (H - PAD * 2);
-        return \`\${x.toFixed(1)},\${y.toFixed(1)}\`;
-      }).join(' ');
-      document.getElementById('ramChart').innerHTML = \`
-        <polyline points="\${pts}" fill="none" stroke="var(--accent)" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>
-        <text x="\${PAD + 2}" y="\${H - PAD - 2}" fill="var(--muted)" font-size="9" font-family="monospace">\${min.toFixed(0)} MB</text>
-        <text x="\${W - PAD - 30}" y="12" fill="var(--muted)" font-size="9" font-family="monospace">\${max.toFixed(0)} MB</text>
-      \`;
-    }
-
     function renderTasks(data) {
       const list = document.getElementById('tasksList');
       document.getElementById('tasksBadge').textContent = data.tasks.length;
@@ -664,6 +696,64 @@ export function buildDashboardHtml(version: string): string {
       \`).join('');
     }
 
+    async function killAgent(sessionKey) {
+      await fetch('/api/spawns?session=' + encodeURIComponent(sessionKey), { method: 'DELETE' });
+    }
+
+    function renderSpawns(spawns) {
+      const list = document.getElementById('spawnsList');
+      document.getElementById('spawnsBadge').textContent = spawns.length;
+      if (!spawns.length) {
+        list.innerHTML = '<li class="empty">No sub-agents spawned yet</li>';
+        return;
+      }
+      list.innerHTML = spawns.slice(0, 20).map(s => \`
+        <li class="spawn-row">
+          <span class="spawn-status" style="color:\${SPAWN_COLOR[s.status] ?? 'var(--muted)'}">\${SPAWN_STATUS[s.status] ?? '·'}</span>
+          <span class="spawn-name">\${s.name}</span>
+          <span class="spawn-tools">\${s.toolsUsed.join(', ') || '—'}</span>
+          <span class="spawn-meta">\${s.cost > 0 ? '$' + s.cost.toFixed(4) : ''} \${ago(s.startedAt)}</span>
+          \${s.status === 'running' ? \`<button class="kill-btn" onclick="killAgent('\${s.sessionKey}')">kill</button>\` : ''}
+        </li>
+      \`).join('');
+    }
+
+    function updateSpawnEntry(entry) {
+      const idx = spawnList.findIndex(s => s.sessionKey === entry.sessionKey);
+      if (idx >= 0) {
+        spawnList[idx] = entry;
+      } else {
+        spawnList.unshift(entry);
+        if (spawnList.length > 50) spawnList.pop();
+      }
+      renderSpawns(spawnList);
+    }
+
+    function renderMemory(samples) {
+      if (!samples.length) return;
+      const latest = samples[samples.length - 1];
+      document.getElementById('ramHeap').textContent = latest.heapMB + ' MB';
+      document.getElementById('ramRss').textContent = latest.rssMB + ' MB';
+      document.getElementById('ramExt').textContent = latest.externalMB + ' MB';
+      document.getElementById('ramBadge').textContent = latest.rssMB + ' MB RSS';
+
+      const W = 600, H = 60, PAD = 4;
+      const vals = samples.map(s => s.heapMB);
+      const min = Math.min(...vals);
+      const max = Math.max(...vals) || 1;
+      const pts = vals.map((v, i) => {
+        const x = PAD + (i / Math.max(vals.length - 1, 1)) * (W - PAD * 2);
+        const y = H - PAD - ((v - min) / (max - min || 1)) * (H - PAD * 2);
+        return \`\${x.toFixed(1)},\${y.toFixed(1)}\`;
+      }).join(' ');
+      document.getElementById('ramChart').innerHTML = \`
+        <polyline points="\${pts}" fill="none" stroke="var(--accent)" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>
+        <text x="\${PAD + 2}" y="\${H - PAD - 2}" fill="var(--muted)" font-size="9" font-family="monospace">\${min.toFixed(0)} MB</text>
+        <text x="\${W - PAD - 30}" y="12" fill="var(--muted)" font-size="9" font-family="monospace">\${max.toFixed(0)} MB</text>
+      \`;
+    }
+
+    // Full refresh for slow-changing data (usage, skills, tasks, initial spawns + memory)
     async function refresh() {
       try {
         const [usage, skills, tasks, spawns, memory] = await Promise.all([
@@ -676,21 +766,64 @@ export function buildDashboardHtml(version: string): string {
         renderUsage(usage);
         renderSkills(skills);
         renderTasks(tasks);
-        renderSpawns(spawns);
-        renderMemory(memory);
+
+        // Seed client-side spawn list
+        spawnList = spawns.spawns ?? [];
+        renderSpawns(spawnList);
+
+        // Seed client-side memory ring buffer
+        const incoming = memory.samples ?? [];
+        for (const s of incoming) {
+          memSamples.push(s);
+          if (memSamples.length > MEM_MAX) memSamples.shift();
+        }
+        renderMemory(memSamples);
+
         const now = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
         document.getElementById('refreshInfo').textContent = 'updated ' + now;
-        document.getElementById('statusDot').style.background = '#34d399';
-        document.getElementById('statusDot').style.boxShadow = '0 0 8px #34d399';
       } catch (e) {
-        document.getElementById('refreshInfo').textContent = 'offline';
-        document.getElementById('statusDot').style.background = '#f87171';
-        document.getElementById('statusDot').style.boxShadow = '0 0 8px #f87171';
+        document.getElementById('refreshInfo').textContent = 'fetch error';
       }
     }
 
-    refresh();
-    setInterval(refresh, 30000);
+    // SSE connection — replaces setInterval polling
+    function connectSSE() {
+      const es = new EventSource('/api/events');
+
+      es.onopen = () => setStatus(true);
+      es.onerror = () => setStatus(false);
+
+      // init: triggered once on connect — do a full data refresh
+      es.addEventListener('init', () => {
+        refresh();
+      });
+
+      // heartbeat: every 30 s — refresh slow-changing data
+      es.addEventListener('heartbeat', () => {
+        refresh();
+      });
+
+      // memory: every 5 s — update RAM panel instantly, no full fetch needed
+      es.addEventListener('memory', (e) => {
+        try {
+          const sample = JSON.parse(e.data);
+          memSamples.push(sample);
+          if (memSamples.length > MEM_MAX) memSamples.shift();
+          renderMemory(memSamples);
+          const now = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+          document.getElementById('refreshInfo').textContent = 'live · ' + now;
+        } catch {}
+      });
+
+      // spawn: on sub-agent status change — update spawn row instantly
+      es.addEventListener('spawn', (e) => {
+        try {
+          updateSpawnEntry(JSON.parse(e.data));
+        } catch {}
+      });
+    }
+
+    connectSSE();
   </script>
 </body>
 </html>`;

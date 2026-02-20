@@ -1,34 +1,21 @@
 /**
- * Memory tools — Supermemory with circuit breaker and SQLite fallback.
+ * Memory tools — dual-provider: Supermemory cloud or local SQLite + Ollama embeddings.
  *
- * Uses the actual Supermemory SDK v4 API:
- *   client.documents.add(), client.search.memories(), client.settings.update()
+ * Provider selection (in priority order):
+ *   1. Local embeddings  — if config.embeddings.enabled (Ollama + cosine similarity)
+ *   2. Supermemory cloud — if config.supermemory.apiKey is set
+ *   3. Stub (SQLite keyword fallback) — if neither is configured
  *
- * "Profile" is approximated via two search queries (static facts + dynamic context).
- * Conversation ingestion stores an assistant-memory entry after each exchange.
+ * All providers implement the same MemoryProvider interface, so the rest of the
+ * codebase is completely unaware of which backend is active.
  */
 
 import { tool, type ToolSet } from "ai";
 import { z } from "zod";
 import Supermemory from "supermemory";
-import { messages as dbMessages, state as dbState } from "../db.js";
+import { messages as dbMessages, state as dbState, vectorMemories } from "../db.js";
 import { log } from "../log.js";
-
-// --- Circuit breaker ---
-
-let failures = 0;
-let lastFailureTime = 0;
-const FAILURE_THRESHOLD = 3;
-const RESET_TIMEOUT_MS = 60_000;
-
-function isCircuitOpen(): boolean {
-  if (failures < FAILURE_THRESHOLD) return false;
-  if (Date.now() - lastFailureTime >= RESET_TIMEOUT_MS) { failures = 0; return false; }
-  return true;
-}
-
-function recordFailure(): void { failures++; lastFailureTime = Date.now(); }
-function recordSuccess(): void { failures = 0; }
+import type { Config } from "../config.js";
 
 // --- Types ---
 
@@ -46,15 +33,33 @@ export interface MemoryProvider {
   setupEntityContext(userId: string): Promise<void>;
   healthCheck(): Promise<boolean>;
   readonly isDegraded: boolean;
-  readonly client: Supermemory;
+  /** Optional Supermemory-specific one-time filter prompt setup. */
+  setupCloudFilter?(): Promise<void>;
 }
 
-export function createMemoryProvider(apiKey: string): MemoryProvider {
+// ============================================================
+// Provider 1: Supermemory (cloud, circuit-breaker guarded)
+// ============================================================
+
+let failures = 0;
+let lastFailureTime = 0;
+const FAILURE_THRESHOLD = 3;
+const RESET_TIMEOUT_MS = 60_000;
+
+function isCircuitOpen(): boolean {
+  if (failures < FAILURE_THRESHOLD) return false;
+  if (Date.now() - lastFailureTime >= RESET_TIMEOUT_MS) { failures = 0; return false; }
+  return true;
+}
+
+function recordFailure(): void { failures++; lastFailureTime = Date.now(); }
+function recordSuccess(): void { failures = 0; }
+
+function createSupermemoryProvider(apiKey: string): MemoryProvider {
   const client = new Supermemory({ apiKey });
 
   return {
     get isDegraded() { return isCircuitOpen(); },
-    get client() { return client; },
 
     async store(userId, content, tags) {
       if (isCircuitOpen()) { log("memory", "circuit breaker tripped"); return { id: "unavailable" }; }
@@ -108,8 +113,6 @@ export function createMemoryProvider(apiKey: string): MemoryProvider {
         return { static: [], dynamic: [], memories: fallbackMemories };
       }
       try {
-        // Static profile = general facts about the user
-        // Dynamic context = recent/current situation, if there's a query
         const [staticRes, dynamicRes] = await Promise.all([
           client.search.memories({ q: `who is this user, their background, preferences, and facts`, containerTag: `user-${userId}`, limit: 8 }),
           query ? client.search.memories({ q: query, containerTag: `user-${userId}`, limit: 5 }) : Promise.resolve(null),
@@ -123,11 +126,7 @@ export function createMemoryProvider(apiKey: string): MemoryProvider {
         const queryMemories = dynamicRes ? toStrings(dynamicRes) : [];
 
         log("memory", "profile: static=%d memories=%d", staticFacts.length, queryMemories.length);
-        return {
-          static: staticFacts,
-          dynamic: [],
-          memories: queryMemories,
-        };
+        return { static: staticFacts, dynamic: [], memories: queryMemories };
       } catch (err) {
         recordFailure();
         console.error("[memory] Profile fetch failed:", err);
@@ -135,11 +134,10 @@ export function createMemoryProvider(apiKey: string): MemoryProvider {
       }
     },
 
-    async ingestConversation(sessionKey, userId, messages) {
+    async ingestConversation(sessionKey, userId, msgs) {
       if (isCircuitOpen()) { log("memory", "ingest: circuit open, skipping"); return; }
-      // Only ingest the last user+assistant pair to avoid excessive API calls
-      const lastUser = [...messages].reverse().find((m) => m.role === "user");
-      const lastAssistant = [...messages].reverse().find((m) => m.role === "assistant");
+      const lastUser = [...msgs].reverse().find((m) => m.role === "user");
+      const lastAssistant = [...msgs].reverse().find((m) => m.role === "assistant");
       if (!lastUser || !lastAssistant) return;
 
       const summary = `Conversation excerpt:\nUser: ${lastUser.content.slice(0, 300)}\nKoda: ${lastAssistant.content.slice(0, 300)}`;
@@ -161,10 +159,8 @@ export function createMemoryProvider(apiKey: string): MemoryProvider {
       const stateKey = `sm_entity_ctx_${userId}`;
       if (dbState.get(stateKey)) return;
       if (isCircuitOpen()) return;
-      // Supermemory SDK v4 doesn't expose containerTags.update() — skip this step
-      // Entity context is applied implicitly via the filter prompt set at boot
       dbState.set(stateKey, true);
-      log("memory", "entity context skipped (not in SDK v4), marked as done for user %s", userId);
+      log("memory", "entity context marked done for user %s", userId);
     },
 
     async healthCheck() {
@@ -175,10 +171,205 @@ export function createMemoryProvider(apiKey: string): MemoryProvider {
         return false;
       }
     },
+
+    async setupCloudFilter() {
+      const FILTER_KEY = "supermemory_filter_set_v1";
+      if (dbState.get(FILTER_KEY)) return;
+      try {
+        await (client as any).settings.update({
+          shouldLLMFilter: true,
+          filterPrompt: `Personal AI assistant called Koda. Prioritize:
+- User preferences and habits (response style, tools, languages, workflows)
+- Corrections and clarifications the user makes to Koda's responses
+- Important personal facts (name, timezone, projects, roles, goals)
+- Action items and outcomes (what worked, what didn't)
+- Recurring topics and interests
+
+Skip:
+- Casual greetings and small talk with no informational content
+- Tool call noise and intermediate processing steps
+- System messages and error outputs
+- Duplicate information already captured`,
+        });
+        dbState.set(FILTER_KEY, true);
+        console.log("[boot] Supermemory filter prompt configured");
+      } catch (err) {
+        console.warn("[boot] Supermemory filter setup skipped:", (err as Error).message);
+      }
+    },
   };
 }
 
-// --- Tools ---
+// ============================================================
+// Provider 2: Local (Ollama embeddings + SQLite + cosine sim)
+// ============================================================
+
+function cosineSimilarity(a: Float32Array, b: Float32Array): number {
+  let dot = 0, normA = 0, normB = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i]! * b[i]!;
+    normA += a[i]! * a[i]!;
+    normB += b[i]! * b[i]!;
+  }
+  return dot / (Math.sqrt(normA * normB) || 1);
+}
+
+async function ollamaEmbed(ollamaUrl: string, model: string, text: string): Promise<Float32Array> {
+  const res = await fetch(`${ollamaUrl}/api/embeddings`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model, prompt: text }),
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!res.ok) throw new Error(`Ollama embed HTTP ${res.status}`);
+  const data = await res.json() as { embedding: number[] };
+  if (!Array.isArray(data.embedding)) throw new Error("Ollama embed: missing embedding field");
+  return new Float32Array(data.embedding);
+}
+
+function createLocalMemoryProvider(ollamaUrl: string, embeddingModel: string, maxMemoriesPerUser: number): MemoryProvider {
+  async function storeVec(userId: string, content: string): Promise<void> {
+    const vec = await ollamaEmbed(ollamaUrl, embeddingModel, content);
+    vectorMemories.insert(userId, content, vec);
+    if (vectorMemories.count(userId) > maxMemoriesPerUser) {
+      vectorMemories.deleteOldest(userId, maxMemoriesPerUser);
+    }
+  }
+
+  async function recallVec(userId: string, query: string, limit: number): Promise<string[]> {
+    const queryVec = await ollamaEmbed(ollamaUrl, embeddingModel, query);
+    const rows = vectorMemories.listByUser(userId);
+    const scored = rows.map((row) => {
+      const emb = new Float32Array(row.embedding.buffer, row.embedding.byteOffset, row.embedding.byteLength / 4);
+      return { content: row.content, score: cosineSimilarity(queryVec, emb) };
+    });
+    scored.sort((a, b) => b.score - a.score);
+    return scored.slice(0, limit).map((r) => r.content);
+  }
+
+  return {
+    get isDegraded() { return false; },
+
+    async store(userId, content) {
+      try {
+        await storeVec(userId, content);
+        return { id: "local" };
+      } catch (err) {
+        console.error("[memory:local] store failed:", (err as Error).message);
+        return { id: "unavailable" };
+      }
+    },
+
+    async recall(userId, query, limit = 5) {
+      try {
+        return await recallVec(userId, query, limit);
+      } catch (err) {
+        console.error("[memory:local] recall failed:", (err as Error).message);
+        return [];
+      }
+    },
+
+    async getProfile(userId, query?) {
+      try {
+        const [staticResults, dynamicResults] = await Promise.all([
+          recallVec(userId, "user preferences background facts interests goals", 5),
+          query ? recallVec(userId, query, 5) : Promise.resolve([]),
+        ]);
+        return { static: staticResults, dynamic: [], memories: dynamicResults };
+      } catch {
+        return { static: [], dynamic: [], memories: [] };
+      }
+    },
+
+    async ingestConversation(sessionKey, userId, msgs) {
+      const lastUser = [...msgs].reverse().find((m) => m.role === "user");
+      const lastAssistant = [...msgs].reverse().find((m) => m.role === "assistant");
+      if (!lastUser || !lastAssistant) return;
+      const summary = `Session ${sessionKey}:\nUser: ${lastUser.content.slice(0, 300)}\nKoda: ${lastAssistant.content.slice(0, 300)}`;
+      try {
+        await storeVec(userId, summary);
+        log("memory", "local ingest: stored for session %s", sessionKey);
+      } catch (err) {
+        console.error("[memory:local] ingest failed:", (err as Error).message);
+      }
+    },
+
+    async setupEntityContext() {
+      // No-op: local provider has no external entity context concept
+    },
+
+    async healthCheck() {
+      try {
+        const res = await fetch(`${ollamaUrl}/api/tags`, { signal: AbortSignal.timeout(2_000) });
+        return res.ok;
+      } catch {
+        return false;
+      }
+    },
+  };
+}
+
+// ============================================================
+// Provider 3: Stub (SQLite keyword search, no vector ops)
+// ============================================================
+
+function createStubMemoryProvider(): MemoryProvider {
+  return {
+    get isDegraded() { return true; },
+
+    async store() {
+      return { id: "unavailable" };
+    },
+
+    async recall(userId, query, limit = 5, sessionKey) {
+      const history = dbMessages.getHistory(sessionKey ?? `sqlite_${userId}`, 50);
+      const lower = query.toLowerCase();
+      return history
+        .filter((m) => m.content.toLowerCase().includes(lower))
+        .slice(0, limit)
+        .map((m) => m.content);
+    },
+
+    async getProfile(userId, query?, sessionKey?) {
+      const memories = query
+        ? (await this.recall(userId, query, 5, sessionKey))
+        : [];
+      return { static: [], dynamic: [], memories };
+    },
+
+    async ingestConversation() {
+      // No-op: stub cannot persist semantics without a vector store
+    },
+
+    async setupEntityContext() {},
+
+    async healthCheck() { return false; },
+  };
+}
+
+// ============================================================
+// Factory — selects provider based on config
+// ============================================================
+
+export function createMemoryProvider(config: Config): MemoryProvider {
+  if (config.embeddings?.enabled) {
+    const { ollamaUrl, model, maxMemories } = config.embeddings;
+    console.log(`[memory] Using local embeddings (Ollama: ${model} @ ${ollamaUrl})`);
+    return createLocalMemoryProvider(ollamaUrl, model, maxMemories);
+  }
+
+  if (config.supermemory?.apiKey) {
+    console.log("[memory] Using Supermemory cloud provider");
+    return createSupermemoryProvider(config.supermemory.apiKey);
+  }
+
+  console.log("[memory] No vector store configured — using SQLite keyword fallback");
+  return createStubMemoryProvider();
+}
+
+// ============================================================
+// Tools
+// ============================================================
 
 export function registerMemoryTools(deps: { memory: MemoryProvider; getUserId: () => string }): ToolSet {
   const { memory, getUserId } = deps;
