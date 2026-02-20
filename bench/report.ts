@@ -3,6 +3,7 @@
  */
 
 import type { BenchmarkResult, BenchmarkSummary, SuiteReport } from "./types.js";
+import { VERSION } from "../src/version.js";
 
 // ---------------------------------------------------------------------------
 // ANSI colors
@@ -110,7 +111,7 @@ export function renderReport(summary: BenchmarkSummary): string {
   lines.push("");
   lines.push(`${c.bold}${c.magenta}╔══════════════════════════════════════════════════════════════╗${c.reset}`);
   lines.push(`${c.bold}${c.magenta}║${c.reset}              ${c.bold}${c.white}A S S I S T A N T B E N C H${c.reset}              ${c.bold}${c.magenta}║${c.reset}`);
-  lines.push(`${c.bold}${c.magenta}║${c.reset}              ${c.dim}Koda v2 Evaluation Suite${c.reset}                  ${c.bold}${c.magenta}║${c.reset}`);
+  lines.push(`${c.bold}${c.magenta}║${c.reset}              ${c.dim}Koda v${VERSION} Evaluation Suite${c.reset}                ${c.bold}${c.magenta}║${c.reset}`);
   lines.push(`${c.bold}${c.magenta}╚══════════════════════════════════════════════════════════════╝${c.reset}`);
   lines.push("");
 

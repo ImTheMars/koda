@@ -22,6 +22,7 @@ import { createMCPClient } from "@ai-sdk/mcp";
 import { handleDashboardRequest } from "./dashboard.js";
 import { registerSubAgentTools, getNamedSession } from "./tools/subagent.js";
 import { recordMemSample } from "./metrics.js";
+import { VERSION } from "./version.js";
 
 // --- CLI routing ---
 const command = process.argv[2];
@@ -276,7 +277,6 @@ const hourlyCleanTimer = setInterval(() => {
 }, 60 * 60 * 1000);
 
 // --- Health + Dashboard server ---
-const VERSION = "1.7.0"; // v1.7.0
 const dashOwner = config.telegram.adminIds[0] ?? config.owner.id;
 
 const server = Bun.serve({

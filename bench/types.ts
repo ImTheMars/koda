@@ -72,11 +72,18 @@ export interface TimezoneValidationCase {
   expectedValid: boolean;
 }
 
+export interface NaturalScheduleCase {
+  name: string;
+  input: string;
+  expected: string | null;
+}
+
 export interface DeterministicCases {
   classify: ClassifyCase[];
   ack: AckCase[];
   time: TimeCase[];
   timezoneValidation: TimezoneValidationCase[];
+  naturalSchedule: NaturalScheduleCase[];
 }
 
 // --- LLM-judge case shapes ---

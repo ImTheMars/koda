@@ -169,8 +169,3 @@ export function parseNaturalSchedule(text: string): string | null {
 export function validateTimezone(tz: string): boolean {
   try { Intl.DateTimeFormat(undefined, { timeZone: tz }); return true; } catch { return false; }
 }
-
-export function isActiveHours(tz: string, startHour = 8, endHour = 23): boolean {
-  const { hour } = nowInTz(new Date(), tz);
-  return hour >= startHour && hour < endHour;
-}

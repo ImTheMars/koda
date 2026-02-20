@@ -596,6 +596,12 @@ export function buildDashboardHtml(version: string): string {
     const SPAWN_STATUS = { done: '✓', error: '✗', timeout: '⏱', running: '·', killed: '✕' };
     const SPAWN_COLOR = { done: 'var(--green)', error: 'var(--red)', timeout: 'var(--yellow)', running: 'var(--accent)', killed: 'var(--muted)' };
 
+    function esc(str) {
+      const d = document.createElement('div');
+      d.textContent = str;
+      return d.innerHTML;
+    }
+
     // Client-side state for incremental SSE updates
     const memSamples = [];
     const MEM_MAX = 120;
@@ -672,10 +678,10 @@ export function buildDashboardHtml(version: string): string {
         <li class="skill-row">
           <div class="skill-icon">\${SKILL_ICONS[s.source] ?? '◆'}</div>
           <div class="skill-body">
-            <div class="skill-name">\${s.name}</div>
-            <div class="skill-desc">\${s.description}</div>
+            <div class="skill-name">\${esc(s.name)}</div>
+            <div class="skill-desc">\${esc(s.description)}</div>
           </div>
-          <span class="skill-source source-\${s.source}">\${s.source}</span>
+          <span class="skill-source source-\${esc(s.source)}">\${esc(s.source)}</span>
         </li>
       \`).join('');
     }
@@ -689,8 +695,8 @@ export function buildDashboardHtml(version: string): string {
       }
       list.innerHTML = data.tasks.map(t => \`
         <li class="task-row">
-          <span class="task-type type-\${t.type}">\${t.type}</span>
-          <span class="task-desc">\${t.description}</span>
+          <span class="task-type type-\${esc(t.type)}">\${esc(t.type)}</span>
+          <span class="task-desc">\${esc(t.description)}</span>
           <span class="task-time">\${relTime(t.nextRunAt)}</span>
         </li>
       \`).join('');
@@ -710,10 +716,10 @@ export function buildDashboardHtml(version: string): string {
       list.innerHTML = spawns.slice(0, 20).map(s => \`
         <li class="spawn-row">
           <span class="spawn-status" style="color:\${SPAWN_COLOR[s.status] ?? 'var(--muted)'}">\${SPAWN_STATUS[s.status] ?? '·'}</span>
-          <span class="spawn-name">\${s.name}</span>
-          <span class="spawn-tools">\${s.toolsUsed.join(', ') || '—'}</span>
+          <span class="spawn-name">\${esc(s.name)}</span>
+          <span class="spawn-tools">\${esc(s.toolsUsed.join(', ') || '—')}</span>
           <span class="spawn-meta">\${s.cost > 0 ? '$' + s.cost.toFixed(4) : ''} \${ago(s.startedAt)}</span>
-          \${s.status === 'running' ? \`<button class="kill-btn" onclick="killAgent('\${s.sessionKey}')">kill</button>\` : ''}
+          \${s.status === 'running' ? \`<button class="kill-btn" onclick="killAgent('\${esc(s.sessionKey)}')">kill</button>\` : ''}
         </li>
       \`).join('');
     }

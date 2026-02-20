@@ -208,13 +208,13 @@
       "name": "subagent: delegate sub-task",
       "input": "spawn a sub-agent to research TypeScript 5.9 features and summarize them",
       "expectedTier": "fast",
-      "expectedIntent": "task"
+      "expectedIntent": "research"
     },
     {
       "name": "subagent: plan week with helpers",
       "input": "plan my whole week using parallel agents: research 3 things, write a summary, and draft a schedule",
       "expectedTier": "fast",
-      "expectedIntent": "task"
+      "expectedIntent": "research"
     },
     {
       "name": "deep: system design with explicit think",
@@ -420,6 +420,58 @@
       "name": "invalid: random string",
       "timezone": "notavalidtimezone",
       "expectedValid": false
+    }
+  ],
+  "naturalSchedule": [
+    {
+      "name": "every day at 8 AM",
+      "input": "every day at 8 AM",
+      "expected": "08:00"
+    },
+    {
+      "name": "every Monday at 9:30",
+      "input": "every Monday at 9:30",
+      "expected": "mon 09:30"
+    },
+    {
+      "name": "every weekday at 6pm",
+      "input": "every weekday at 6pm",
+      "expected": "mon,tue,wed,thu,fri 18:00"
+    },
+    {
+      "name": "every weekend at 10 am",
+      "input": "every weekend at 10 am",
+      "expected": "sat,sun 10:00"
+    },
+    {
+      "name": "every Monday and Wednesday at 3pm",
+      "input": "every Monday and Wednesday at 3pm",
+      "expected": "mon,wed 15:00"
+    },
+    {
+      "name": "daily at 14:00",
+      "input": "every day at 14:00",
+      "expected": "14:00"
+    },
+    {
+      "name": "every morning (no time)",
+      "input": "every morning",
+      "expected": "08:00"
+    },
+    {
+      "name": "every evening (no time)",
+      "input": "every evening",
+      "expected": "18:00"
+    },
+    {
+      "name": "every night (no time)",
+      "input": "every night",
+      "expected": "21:00"
+    },
+    {
+      "name": "non-schedule returns null",
+      "input": "what's the weather like?",
+      "expected": null
     }
   ]
 }

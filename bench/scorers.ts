@@ -5,7 +5,7 @@
  */
 
 import { classifyTier, classifyIntent, shouldAck } from "../src/router.js";
-import { parseCronNext, validateTimezone } from "../src/time.js";
+import { parseCronNext, validateTimezone, parseNaturalSchedule } from "../src/time.js";
 import { judge } from "./judge.js";
 import type {
   BenchmarkResult,
@@ -101,6 +101,24 @@ export function scoreDeterministic(cases: DeterministicCases): BenchmarkResult[]
       maxScore: 1,
       expected: c.expectedValid ? "valid" : "invalid",
       actual: valid ? "valid" : "invalid",
+      latencyMs: ms,
+    });
+  }
+
+  // --- Natural schedule parsing ---
+  for (const c of cases.naturalSchedule) {
+    const { result: parsed, ms } = time(() => parseNaturalSchedule(c.input));
+    const passed = parsed === c.expected;
+
+    results.push({
+      suite: "deterministic",
+      category: "schedule",
+      name: c.name,
+      passed,
+      score: passed ? 1 : 0,
+      maxScore: 1,
+      expected: c.expected === null ? "null" : c.expected,
+      actual: parsed === null ? "null" : parsed,
       latencyMs: ms,
     });
   }

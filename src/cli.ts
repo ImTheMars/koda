@@ -12,8 +12,7 @@ import { resolve } from "path";
 import { homedir } from "os";
 import { validateTimezone } from "./time.js";
 import { readEnvFile } from "./env.js";
-
-const VERSION = "1.1.1";
+import { VERSION } from "./version.js";
 const REPO = "ImTheMars/koda";
 
 function getWorkspacePath(): string {
@@ -75,10 +74,10 @@ async function runSetup(): Promise<void> {
   if (valid) keySpinner.succeed("OpenRouter key validated");
   else { keySpinner.fail("key rejected"); return; }
 
-  // Supermemory key
+  // Supermemory key (optional — local embeddings work without it)
   const supermemoryKey = await clack.text({
-    message: "Supermemory API key:",
-    validate: (v) => v ? undefined : "Required",
+    message: "Supermemory API key (optional — leave blank for local-only memory):",
+    placeholder: "optional",
   });
   if (clack.isCancel(supermemoryKey)) { clack.outro("cancelled"); return; }
 
@@ -121,7 +120,7 @@ async function runSetup(): Promise<void> {
   const envPath = resolve(workspace, ".env");
   const envLines: string[] = [];
   envLines.push(`KODA_OPENROUTER_API_KEY=${openrouterKey}`);
-  envLines.push(`KODA_SUPERMEMORY_API_KEY=${supermemoryKey}`);
+  if (supermemoryKey) envLines.push(`KODA_SUPERMEMORY_API_KEY=${supermemoryKey}`);
   if (exaKey) envLines.push(`KODA_EXA_API_KEY=${exaKey}`);
   if (telegramToken) envLines.push(`KODA_TELEGRAM_TOKEN=${telegramToken}`);
   await writeFile(envPath, envLines.join("\n") + "\n", "utf-8");
@@ -130,7 +129,7 @@ async function runSetup(): Promise<void> {
   // config.json
   const config: Record<string, unknown> = {
     mode,
-    features: { scheduler: mode === "private", heartbeat: mode === "private", browser: false },
+    features: { scheduler: mode === "private" },
     scheduler: { timezone },
   };
   if (mode === "private" && telegramUserId) {
@@ -184,7 +183,7 @@ async function runDoctor(): Promise<void> {
     }},
     { label: "Supermemory", async run() {
       const key = getEnv("KODA_SUPERMEMORY_API_KEY");
-      return key ? { status: "ok", detail: "Supermemory key present" } : { status: "fail", detail: "Supermemory key not set" };
+      return key ? { status: "ok", detail: "Supermemory key present" } : { status: "warn", detail: "Supermemory key not set (optional — using local embeddings only)" };
     }},
     { label: "SQLite", async run() {
       try { const p = resolve(workspace, "koda.db.test"); await writeFile(p, "", "utf-8"); const { unlink } = await import("fs/promises"); await unlink(p);

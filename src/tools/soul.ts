@@ -7,6 +7,7 @@ import { z } from "zod";
 import { watch, type FSWatcher } from "fs";
 import { readdir, mkdir } from "fs/promises";
 import { join, dirname } from "path";
+import { VERSION } from "../version.js";
 
 export interface SoulDocument {
   identity: { name: string; version: string };
@@ -18,7 +19,7 @@ export interface SoulDocument {
 }
 
 const DEFAULT_SOUL: SoulDocument = {
-  identity: { name: "Koda", version: "1.1.1" },
+  identity: { name: "Koda", version: VERSION },
   coreValues: ["accuracy over speed", "user privacy and safety", "transparency in actions", "keep it real"],
   personality: {
     style: "young, natural, texts like a real person",
@@ -99,7 +100,7 @@ export class SoulLoader {
 
   private parse(content: string): SoulDocument {
     const soul: SoulDocument = {
-      identity: { name: "", version: "1.1.1" },
+      identity: { name: "", version: VERSION },
       coreValues: [], personality: { style: "", tone: "", quirks: [] },
       boundaries: [], protocol: [], responseStyle: [],
     };

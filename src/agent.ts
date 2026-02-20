@@ -3,6 +3,9 @@
  *
  * runAgent(input) → selectTier → buildSystemPrompt → generateText(tools, onStepFinish) → return result
  * streamAgent(input) → selectTier → buildSystemPrompt → streamText(tools, onFinish) → yield chunks
+ *
+ * Shared logic (context building, step callbacks, result post-processing) lives in internal helpers
+ * so runAgent and streamAgent stay thin.
  */
 
 import { generateText, streamText, stepCountIs, type ToolSet, type ModelMessage } from "ai";
@@ -83,6 +86,10 @@ export function isLlmCircuitOpen(): boolean {
   return true;
 }
 
+// ---------------------------------------------------------------------------
+// Shared helpers — used by both runAgent and streamAgent
+// ---------------------------------------------------------------------------
+
 function buildSystemPrompt(deps: {
   soulPrompt: string | null;
   skillsSummary: string | null;
@@ -98,7 +105,6 @@ function buildSystemPrompt(deps: {
 
   const parts: string[] = [];
 
-  // Identity + time
   parts.push(`## current time
 <current_time>
 time: ${timeParts}
@@ -123,10 +129,8 @@ rules:
 - simple one-word or one-line answers don't need splitting
 - after using tools, still summarize what you did in a brief response`);
 
-  // Soul
   if (deps.soulPrompt) parts.push(deps.soulPrompt);
 
-  // User profile (replaces flat memories + learnings)
   if (deps.isProfileDegraded) {
     parts.push("## System Status\nMemory service is temporarily unavailable. Rely on conversation history only.");
   } else {
@@ -152,7 +156,6 @@ rules:
     }
   }
 
-  // Web search guidance
   if (deps.hasWebSearch) {
     parts.push(`## web search
 you have the webSearch tool. use it whenever asked about:
@@ -165,7 +168,6 @@ you have the webSearch tool. use it whenever asked about:
 your training data is outdated. for anything time-sensitive — search first, answer second.`);
   }
 
-  // Skills
   if (deps.skillsSummary) {
     parts.push(`# Available Skills\n\nTo use a skill, read its SKILL.md file using the readFile tool.\n\n${deps.skillsSummary}`);
   }
@@ -173,104 +175,158 @@ your training data is outdated. for anything time-sensitive — search first, an
   return parts.join("\n\n---\n\n");
 }
 
+/** Classify input, send ack if warranted, return routing info. */
+function classifyAndAck(input: AgentInput, logPrefix: string): { tier: Tier; skipQuery: boolean } {
+  const tier = classifyTier(input.content);
+  const intent = classifyIntent(input.content);
+  const willAck = shouldAck({ content: input.content, tier, intent, source: input.source });
+  log("agent", "%stier=%s intent=%s ack=%s len=%d", logPrefix, tier, intent, willAck, input.content.length);
+
+  if (input.onAck && willAck) {
+    const ackMsg = ACK_TEMPLATES[Math.abs(Number(Bun.hash(input.chatId))) % ACK_TEMPLATES.length]!;
+    input.onAck(ackMsg);
+  }
+
+  return { tier, skipQuery: tier === "fast" && intent === "chat" };
+}
+
+/** Fetch profile + skills summary, build system prompt. */
+async function buildAgentContext(deps: AgentDeps, input: AgentInput, skipQuery: boolean): Promise<string> {
+  const [profile, skillsSummary] = await Promise.all([
+    deps.getProfile(input.senderId, skipQuery ? "" : input.content, input.sessionKey),
+    deps.getSkillsSummary(),
+  ]);
+
+  return buildSystemPrompt({
+    soulPrompt: deps.getSoulPrompt(),
+    skillsSummary,
+    profile,
+    isProfileDegraded: false,
+    workspace: deps.config.workspace,
+    timezone: deps.config.scheduler.timezone,
+    hasWebSearch: "webSearch" in deps.tools,
+  });
+}
+
+/** Build the messages array from history + current input. */
+function buildMessages(input: AgentInput, history: Array<{ role: string; content: string }>): ModelMessage[] {
+  const userContent = input.attachments?.length
+    ? [
+      ...input.attachments.map((a) => ({ type: "image" as const, image: a.data, mimeType: a.mimeType })),
+      { type: "text" as const, text: input.content },
+    ]
+    : input.content;
+  return [
+    ...history.map((h) => ({ role: h.role as "user" | "assistant", content: h.content })),
+    { role: "user" as const, content: userContent },
+  ];
+}
+
+/** Shared prepareStep callback — handles compaction and tier escalation. */
+function makePrepareStep(
+  provider: ReturnType<typeof createOpenRouter>,
+  tierOrder: Tier[],
+  config: Config,
+  messageList: ModelMessage[],
+  state: { currentTier: Tier; stepCount: number },
+  logPrefix: string,
+) {
+  return ({ stepNumber }: { stepNumber: number }) => {
+    state.stepCount = stepNumber;
+    if (stepNumber > 10 && messageList.length > 8) {
+      const keep = 6;
+      const removed = messageList.length - keep;
+      log("agent", "%scompacted %d msgs", logPrefix, removed);
+      messageList.splice(0, removed, { role: "user" as const, content: `[${removed} earlier messages compacted]` });
+    }
+    if (stepNumber > 5 && state.currentTier !== "deep") {
+      const idx = tierOrder.indexOf(state.currentTier);
+      if (idx < tierOrder.length - 1) {
+        state.currentTier = tierOrder[idx + 1]!;
+        const newModelId = getModelId(state.currentTier, config);
+        log("agent", "%sescalated tier=%s model=%s", logPrefix, state.currentTier, newModelId);
+        const newFallbacks = FAILOVER[state.currentTier] ?? [];
+        return { model: provider(newModelId, { models: newFallbacks }) };
+      }
+    }
+    return {};
+  };
+}
+
+/** Shared onStepFinish callback — tracks tool usage. */
+function makeOnStepFinish(toolsUsed: string[], state: { stepCount: number }, logPrefix: string) {
+  return async (step: { toolCalls?: Array<{ toolName: string }> }) => {
+    if (step.toolCalls) {
+      for (const call of step.toolCalls) {
+        toolsUsed.push(call.toolName);
+        log("agent", "%sstep %d tool=%s", logPrefix, state.stepCount, call.toolName);
+      }
+    }
+  };
+}
+
+/** Post-processing: cost calc, usage tracking, message save, conversation ingestion. */
+function finalizeResult(
+  deps: AgentDeps,
+  input: AgentInput,
+  history: Array<{ role: string; content: string }>,
+  currentTier: Tier,
+  toolsUsed: string[],
+  text: string,
+  modelId: string,
+  promptTokens: number,
+  completionTokens: number,
+  logPrefix: string,
+): AgentResult {
+  const cost = calculateCost(modelId, promptTokens, completionTokens);
+  const uniqueTools = [...new Set(toolsUsed)];
+
+  log("agent", "%sdone tokens=%d/%d cost=$%s tools=[%s]", logPrefix, promptTokens, completionTokens, cost.toFixed(4), uniqueTools.join(","));
+
+  dbUsage.track({
+    userId: input.senderId,
+    model: modelId,
+    inputTokens: promptTokens,
+    outputTokens: completionTokens,
+    cost,
+    toolsUsed: uniqueTools,
+  });
+
+  const fallback = "aight that's handled.";
+  const responseText = text || fallback;
+  dbMessages.append(input.sessionKey, "user", input.content);
+  dbMessages.append(input.sessionKey, "assistant", responseText, uniqueTools);
+
+  const allMessages = [...history, { role: "user", content: input.content }, { role: "assistant", content: responseText }];
+  deps.ingestConversation(input.sessionKey, input.senderId, allMessages).catch(() => {});
+
+  return {
+    text: responseText,
+    tier: currentTier,
+    toolsUsed: uniqueTools,
+    usage: { promptTokens, completionTokens, cost },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Agent factories
+// ---------------------------------------------------------------------------
+
 export function createAgent(deps: AgentDeps) {
   const { config, tools } = deps;
   const provider = getProvider(config.openrouter.apiKey);
   const tierOrder: Tier[] = ["fast", "deep"];
 
-  async function buildContext(input: AgentInput, skipQuery: boolean) {
-    const [profile, skillsSummary] = await Promise.all([
-      deps.getProfile(input.senderId, skipQuery ? "" : input.content, input.sessionKey),
-      deps.getSkillsSummary(),
-    ]);
-    return { profile, skillsSummary };
-  }
-
-  function buildMessages(input: AgentInput, history: Array<{ role: string; content: string }>): ModelMessage[] {
-    const userContent = input.attachments?.length
-      ? [
-        ...input.attachments.map((a) => ({ type: "image" as const, image: a.data, mimeType: a.mimeType })),
-        { type: "text" as const, text: input.content },
-      ]
-      : input.content;
-    return [
-      ...history.map((h) => ({ role: h.role as "user" | "assistant", content: h.content })),
-      { role: "user" as const, content: userContent },
-    ];
-  }
-
-  function makeStepHandler(config: Config, provider: ReturnType<typeof createOpenRouter>, tierOrder: Tier[]) {
-    let currentTier: Tier = "fast";
-    let stepCount = 0;
-    const messageList: ModelMessage[] = [];
-    const toolsUsed: string[] = [];
-
-    const prepareStep = ({ stepNumber }: { stepNumber: number }) => {
-      stepCount = stepNumber;
-      if (stepNumber > 10 && messageList.length > 8) {
-        const keep = 6;
-        const removed = messageList.length - keep;
-        log("agent", "compacted %d msgs", removed);
-        messageList.splice(0, removed, { role: "user" as const, content: `[${removed} earlier messages compacted]` });
-      }
-      if (stepNumber > 5 && currentTier !== "deep") {
-        const idx = tierOrder.indexOf(currentTier);
-        if (idx < tierOrder.length - 1) {
-          currentTier = tierOrder[idx + 1]!;
-          const newModelId = getModelId(currentTier, config);
-          log("agent", "escalated tier=%s model=%s", currentTier, newModelId);
-          const newFallbacks = FAILOVER[currentTier] ?? [];
-          return { model: provider(newModelId, { models: newFallbacks }) };
-        }
-      }
-      return {};
-    };
-
-    const onStepFinish = async (step: { toolCalls?: Array<{ toolName: string }> }) => {
-      if (step.toolCalls) {
-        for (const call of step.toolCalls) {
-          toolsUsed.push(call.toolName);
-          log("agent", "step %d tool=%s", stepCount, call.toolName);
-        }
-      }
-    };
-
-    return { currentTierRef: () => currentTier, setTier: (t: Tier) => { currentTier = t; }, messageList, toolsUsed, prepareStep, onStepFinish };
-  }
-
   return async function runAgent(input: AgentInput): Promise<AgentResult> {
-    const tier = classifyTier(input.content);
-    const intent = classifyIntent(input.content);
-    const willAck = shouldAck({ content: input.content, tier, intent, source: input.source });
-    log("agent", "tier=%s intent=%s ack=%s len=%d", tier, intent, willAck, input.content.length);
-
-    if (input.onAck && willAck) {
-      const ackMsg = ACK_TEMPLATES[Math.abs(Number(Bun.hash(input.chatId))) % ACK_TEMPLATES.length]!;
-      input.onAck(ackMsg);
-    }
-
-    // Build context — always fetch profile (fast+chat skips query-based search)
-    const skipQuery = tier === "fast" && intent === "chat";
-    const { profile, skillsSummary } = await buildContext(input, skipQuery);
-
-    const systemPrompt = buildSystemPrompt({
-      soulPrompt: deps.getSoulPrompt(),
-      skillsSummary,
-      profile,
-      isProfileDegraded: false,
-      workspace: config.workspace,
-      timezone: config.scheduler.timezone,
-      hasWebSearch: "webSearch" in tools,
-    });
-
+    const { tier, skipQuery } = classifyAndAck(input, "");
+    const systemPrompt = await buildAgentContext(deps, input, skipQuery);
     const history = dbMessages.getHistory(input.sessionKey, 30);
     const messageList = buildMessages(input, history);
 
     input.onTypingStart?.();
 
     const toolsUsed: string[] = [];
-    let currentTier = tier;
-    let stepCount = 0;
+    const state = { currentTier: tier, stepCount: 0 };
 
     try {
       return await withToolContext({
@@ -278,14 +334,12 @@ export function createAgent(deps: AgentDeps) {
         chatId: input.chatId,
         channel: input.channel,
       }, async () => {
-        const modelId = getModelId(currentTier, config);
+        const modelId = getModelId(state.currentTier, config);
         log("agent", "model=%s session=%s", modelId, input.sessionKey);
-        const fallbackIds = FAILOVER[currentTier] ?? [];
+        const fallbackIds = FAILOVER[state.currentTier] ?? [];
         const model = provider(modelId, { models: fallbackIds });
 
-        // Use Ollama for fast tier if configured and available
         const useOllama = tier === "fast" && config.ollama?.enabled && ollamaProvider && config.ollama.fastOnly;
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
         const activeModel: any = useOllama ? ollamaProvider!(config.ollama.model) : model;
 
         const result = await generateText({
@@ -298,69 +352,16 @@ export function createAgent(deps: AgentDeps) {
           maxOutputTokens: config.agent.maxTokens,
           temperature: config.agent.temperature,
           abortSignal: input.abortSignal,
-          prepareStep: ({ stepNumber }) => {
-            stepCount = stepNumber;
-            if (stepNumber > 10 && messageList.length > 8) {
-              const keep = 6;
-              const removed = messageList.length - keep;
-              log("agent", "compacted %d msgs", removed);
-              messageList.splice(0, removed, { role: "user" as const, content: `[${removed} earlier messages compacted]` });
-            }
-            if (stepNumber > 5 && currentTier !== "deep") {
-              const idx = tierOrder.indexOf(currentTier);
-              if (idx < tierOrder.length - 1) {
-                currentTier = tierOrder[idx + 1]!;
-                const newModelId = getModelId(currentTier, config);
-                log("agent", "escalated tier=%s model=%s", currentTier, newModelId);
-                const newFallbacks = FAILOVER[currentTier] ?? [];
-                return { model: provider(newModelId, { models: newFallbacks }) };
-              }
-            }
-            return {};
-          },
-          onStepFinish: async (step) => {
-            if (step.toolCalls) {
-              for (const call of step.toolCalls) {
-                toolsUsed.push(call.toolName);
-                log("agent", "step %d tool=%s", stepCount, call.toolName);
-              }
-            }
-          },
+          prepareStep: makePrepareStep(provider, tierOrder, config, messageList, state, ""),
+          onStepFinish: makeOnStepFinish(toolsUsed, state, ""),
         });
 
         llmFailures = 0;
-        const finalModelId = result.response?.modelId ?? getModelId(currentTier, config);
-        // Use totalUsage for accurate multi-step cost (covers escalation)
+        const finalModelId = result.response?.modelId ?? getModelId(state.currentTier, config);
         const promptTokens = result.totalUsage?.inputTokens ?? result.usage?.inputTokens ?? 0;
         const completionTokens = result.totalUsage?.outputTokens ?? result.usage?.outputTokens ?? 0;
-        const cost = calculateCost(finalModelId, promptTokens, completionTokens);
 
-        log("agent", "done tokens=%d/%d cost=$%s tools=[%s]", promptTokens, completionTokens, cost.toFixed(4), [...new Set(toolsUsed)].join(","));
-
-        dbUsage.track({
-          userId: input.senderId,
-          model: finalModelId,
-          inputTokens: promptTokens,
-          outputTokens: completionTokens,
-          cost,
-          toolsUsed: [...new Set(toolsUsed)],
-        });
-
-        const fallback = "aight that's handled.";
-        const responseText = result.text || fallback;
-        dbMessages.append(input.sessionKey, "user", input.content);
-        dbMessages.append(input.sessionKey, "assistant", responseText, [...new Set(toolsUsed)]);
-
-        // Fire-and-forget conversation ingestion for auto-learning
-        const allMessages = [...history, { role: "user", content: input.content }, { role: "assistant", content: responseText }];
-        deps.ingestConversation(input.sessionKey, input.senderId, allMessages).catch(() => {});
-
-        return {
-          text: responseText,
-          tier: currentTier,
-          toolsUsed: [...new Set(toolsUsed)],
-          usage: { promptTokens, completionTokens, cost },
-        };
+        return finalizeResult(deps, input, history, state.currentTier, toolsUsed, result.text, finalModelId, promptTokens, completionTokens, "");
       });
     } catch (err) {
       console.error("[agent] LLM generate error:", err);
@@ -370,7 +371,7 @@ export function createAgent(deps: AgentDeps) {
         text: isLlmCircuitOpen()
           ? "i'm having trouble connecting right now. try again in a couple minutes."
           : "i ran into an issue processing that. could you try again?",
-        tier: currentTier,
+        tier: state.currentTier,
         toolsUsed: [],
         usage: { promptTokens: 0, completionTokens: 0, cost: 0 },
       };
@@ -393,51 +394,17 @@ export function createStreamAgent(deps: AgentDeps) {
   const tierOrder: Tier[] = ["fast", "deep"];
 
   return async function streamAgent(input: AgentInput): Promise<StreamAgentResult> {
-    const tier = classifyTier(input.content);
-    const intent = classifyIntent(input.content);
-    const willAck = shouldAck({ content: input.content, tier, intent, source: input.source });
-    log("agent", "stream tier=%s intent=%s ack=%s len=%d", tier, intent, willAck, input.content.length);
-
-    if (input.onAck && willAck) {
-      const ackMsg = ACK_TEMPLATES[Math.abs(Number(Bun.hash(input.chatId))) % ACK_TEMPLATES.length]!;
-      input.onAck(ackMsg);
-    }
-
-    const skipQuery = tier === "fast" && intent === "chat";
-    const [profile, skillsSummary] = await Promise.all([
-      deps.getProfile(input.senderId, skipQuery ? "" : input.content, input.sessionKey),
-      deps.getSkillsSummary(),
-    ]);
-
-    const systemPrompt = buildSystemPrompt({
-      soulPrompt: deps.getSoulPrompt(),
-      skillsSummary,
-      profile,
-      isProfileDegraded: false,
-      workspace: config.workspace,
-      timezone: config.scheduler.timezone,
-      hasWebSearch: "webSearch" in tools,
-    });
-
+    const { tier, skipQuery } = classifyAndAck(input, "stream ");
+    const systemPrompt = await buildAgentContext(deps, input, skipQuery);
     const history = dbMessages.getHistory(input.sessionKey, 30);
-    const userContent = input.attachments?.length
-      ? [
-        ...input.attachments.map((a) => ({ type: "image" as const, image: a.data, mimeType: a.mimeType })),
-        { type: "text" as const, text: input.content },
-      ]
-      : input.content;
-    const messageList: ModelMessage[] = [
-      ...history.map((h) => ({ role: h.role as "user" | "assistant", content: h.content })),
-      { role: "user" as const, content: userContent },
-    ];
+    const messageList = buildMessages(input, history);
 
     const toolsUsed: string[] = [];
-    let currentTier = tier;
-    let stepCount = 0;
+    const state = { currentTier: tier, stepCount: 0 };
 
-    const modelId = getModelId(currentTier, config);
+    const modelId = getModelId(state.currentTier, config);
     log("agent", "stream model=%s session=%s", modelId, input.sessionKey);
-    const fallbackIds = FAILOVER[currentTier] ?? [];
+    const fallbackIds = FAILOVER[state.currentTier] ?? [];
     const model = provider(modelId, { models: fallbackIds });
 
     const streamResult = await withToolContext({
@@ -454,78 +421,25 @@ export function createStreamAgent(deps: AgentDeps) {
         stopWhen: stepCountIs(config.agent.maxSteps),
         maxOutputTokens: config.agent.maxTokens,
         temperature: config.agent.temperature,
-        prepareStep: ({ stepNumber }) => {
-          stepCount = stepNumber;
-          if (stepNumber > 10 && messageList.length > 8) {
-            const keep = 6;
-            const removed = messageList.length - keep;
-            log("agent", "stream compacted %d msgs", removed);
-            messageList.splice(0, removed, { role: "user" as const, content: `[${removed} earlier messages compacted]` });
-          }
-          if (stepNumber > 5 && currentTier !== "deep") {
-            const idx = tierOrder.indexOf(currentTier);
-            if (idx < tierOrder.length - 1) {
-              currentTier = tierOrder[idx + 1]!;
-              const newModelId = getModelId(currentTier, config);
-              log("agent", "stream escalated tier=%s model=%s", currentTier, newModelId);
-              const newFallbacks = FAILOVER[currentTier] ?? [];
-              return { model: provider(newModelId, { models: newFallbacks }) };
-            }
-          }
-          return {};
-        },
-        onStepFinish: async (step) => {
-          if (step.toolCalls) {
-            for (const call of step.toolCalls) {
-              toolsUsed.push(call.toolName);
-              log("agent", "stream step %d tool=%s", stepCount, call.toolName);
-            }
-          }
-        },
+        prepareStep: makePrepareStep(provider, tierOrder, config, messageList, state, "stream "),
+        onStepFinish: makeOnStepFinish(toolsUsed, state, "stream "),
         onError: ({ error }) => {
           console.error("[agent] Stream error:", error);
         },
       });
     });
 
-    // StreamTextResult has .text, .usage, .response as Promises (not itself a Promise)
     const finishedPromise = Promise.all([streamResult.text, streamResult.usage, streamResult.response] as const).then(
       async ([text, usage, response]) => {
         llmFailures = 0;
-        const finalModelId = (await response)?.modelId ?? getModelId(currentTier, config);
+        const finalModelId = (await response)?.modelId ?? getModelId(state.currentTier, config);
         const promptTokens = (usage as any)?.inputTokens ?? 0;
         const completionTokens = (usage as any)?.outputTokens ?? 0;
-        const cost = calculateCost(finalModelId, promptTokens, completionTokens);
 
-        log("agent", "stream done tokens=%d/%d cost=$%s tools=[%s]", promptTokens, completionTokens, cost.toFixed(4), [...new Set(toolsUsed)].join(","));
-
-        dbUsage.track({
-          userId: input.senderId,
-          model: finalModelId,
-          inputTokens: promptTokens,
-          outputTokens: completionTokens,
-          cost,
-          toolsUsed: [...new Set(toolsUsed)],
-        });
-
-        const fallback = "aight that's handled.";
-        const responseText = text || fallback;
-        dbMessages.append(input.sessionKey, "user", input.content);
-        dbMessages.append(input.sessionKey, "assistant", responseText, [...new Set(toolsUsed)]);
-
-        const allMessages = [...history, { role: "user", content: input.content }, { role: "assistant", content: responseText }];
-        deps.ingestConversation(input.sessionKey, input.senderId, allMessages).catch(() => {});
-
-        return {
-          text: responseText,
-          tier: currentTier,
-          toolsUsed: [...new Set(toolsUsed)],
-          usage: { promptTokens, completionTokens, cost },
-        };
+        return finalizeResult(deps, input, history, state.currentTier, toolsUsed, text, finalModelId, promptTokens, completionTokens, "stream ");
       },
     );
 
-    // Yield text chunks from the stream
     async function* textChunks() {
       for await (const chunk of streamResult.textStream) {
         yield chunk;

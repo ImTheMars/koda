@@ -82,8 +82,6 @@ const ConfigSchema = z.object({
   })),
   proactive: withEmptyDefault(z.object({
     tickIntervalMs: z.number().min(10_000).default(30_000),
-    activeHoursStart: z.number().min(0).max(23).default(8),
-    activeHoursEnd: z.number().min(0).max(23).default(23),
   })),
   features: withEmptyDefault(z.object({
     scheduler: z.boolean().default(true),

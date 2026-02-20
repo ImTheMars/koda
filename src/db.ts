@@ -1,7 +1,7 @@
 /**
  * SQLite persistence layer via bun:sqlite.
  *
- * Tables: messages, tasks, usage, learnings, state, subagents, vector_memories
+ * Tables: messages, tasks, usage, state, subagents, vector_memories
  * WAL mode for concurrent reads.
  */
 
@@ -292,20 +292,6 @@ export const usage = {
       .query("SELECT COUNT(*) as cnt, COALESCE(SUM(cost), 0) as totalCost, COALESCE(SUM(input_tokens), 0) as inp, COALESCE(SUM(output_tokens), 0) as out FROM usage WHERE user_id = ? AND datetime(created_at) >= datetime(?)")
       .get(userId, sinceStr) as { cnt: number; totalCost: number; inp: number; out: number } | null;
     return { totalRequests: row?.cnt ?? 0, totalCost: row?.totalCost ?? 0, totalInputTokens: row?.inp ?? 0, totalOutputTokens: row?.out ?? 0 };
-  },
-};
-
-// --- Learnings ---
-
-export const learnings = {
-  add(userId: string, type: "correction" | "preference", content: string): void {
-    getDb().run("INSERT INTO learnings (user_id, type, content) VALUES (?, ?, ?)", [userId, type, content]);
-  },
-
-  getRecent(userId: string, limit = 10): Array<{ type: string; content: string }> {
-    return getDb()
-      .query("SELECT type, content FROM learnings WHERE user_id = ? ORDER BY id DESC LIMIT ?")
-      .all(userId, limit) as any[];
   },
 };
 

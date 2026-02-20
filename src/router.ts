@@ -84,11 +84,6 @@ export function classifyTier(text: string): Tier {
   return score >= 3 ? "deep" : "fast";
 }
 
-export function needsTools(text: string): boolean {
-  const lower = text.toLowerCase();
-  return countMatches(lower, TOOL_HINTS) > 0 || countMatches(lower, CODE_WORDS) > 0;
-}
-
 export function classifyIntent(text: string): RequestIntent {
   const lower = text.toLowerCase();
   let best: RequestIntent = "chat";

@@ -22,14 +22,15 @@ import { emit } from "../events.js";
 
 // Tools that sub-agents are never allowed to use, regardless of allowlist.
 const ALWAYS_BLOCKED = new Set([
-  "spawnAgent",        // no recursion
-  "setReminder",       // no scheduling side effects
-  "listReminders",     // no scheduling side effects
-  "deleteReminder",    // no scheduling side effects
-  "runCode",           // no arbitrary code execution inside a sub-agent
-  "runSandboxed",      // sandbox access only from main agent
-  "skillShop",         // no installs inside a sub-agent
-  "soul",              // soul is a main-agent concern
+  "spawnAgent",           // no recursion
+  "createReminder",       // no scheduling side effects
+  "createRecurringTask",  // no scheduling side effects
+  "listTasks",            // no scheduling side effects
+  "deleteTask",           // no scheduling side effects
+  "runSandboxed",         // sandbox access only from main agent
+  "skillShop",            // no installs inside a sub-agent
+  "getSoul",              // soul is a main-agent concern
+  "updateSoul",           // soul is a main-agent concern
 ]);
 
 // Default allowlist when the caller doesn't specify one.

@@ -7,8 +7,7 @@ import { z } from "zod";
 import { tasks as dbTasks, usage as dbUsage } from "../db.js";
 import type { MemoryProvider } from "./memory.js";
 import { isLlmCircuitOpen } from "../agent.js";
-
-const VERSION = "1.3.3";
+import { VERSION } from "../version.js";
 
 export function registerStatusTools(deps: { memory: MemoryProvider }): ToolSet {
   const { memory } = deps;

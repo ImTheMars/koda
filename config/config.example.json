@@ -58,9 +58,7 @@
     "timezone": "America/Los_Angeles"
   },
   "proactive": {
-    "tickIntervalMs": 30000,
-    "activeHoursStart": 8,
-    "activeHoursEnd": 23
+    "tickIntervalMs": 30000
   },
   "workspace": "~/.koda"
 }
