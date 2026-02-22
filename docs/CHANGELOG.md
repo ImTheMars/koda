@@ -4,6 +4,29 @@ all notable changes to koda.
 
 ---
 
+## 2026-02-18
+### v2.1.0 — safe context compaction · live sub-agent streaming · tool cost accounting · structured agent returns
+
+#### added
+
+- **`trimHistory()` pre-flight compaction** (`src/agent.ts`) — replaces the in-place `messageList.splice()` mutation that ran inside `prepareStep`. A new `trimHistory(messages, maxMessages = 24)` function is called *before* `generateText`/`streamText`, producing a fresh array with a single placeholder for dropped messages. The SDK never sees a mid-run mutation of the array it holds, eliminating potential dropped-tool-result and sync bugs.
+- **`streamUpdate` tool** (`src/tools/subagent.ts`) — injected into every sub-agent's toolset as a closure bound to its `sessionKey`. When the child calls `streamUpdate({ message })`, it emits a `subagent_update` SSE event and logs `[spawn:Name] message` to the console. The main dashboard immediately displays these lines under the running spawn row without any polling.
+- **`returnResult` tool** (`src/tools/subagent.ts`) — injected alongside `streamUpdate`. Sub-agents are instructed to always call `returnResult({ summary, data? })` when they finish. The parent `spawnAgent` returns `{ result: summary, structured: { summary, data } | null }` — deterministic, parseable output instead of a raw text blob.
+- **Tool cost accumulator** (`src/tools/index.ts`) — `ToolRuntimeContext` now carries `toolCost: { total: number }`. `withToolContext` accepts it from the caller; tools mutate it via `addToolCost(amount)`. After `generateText` completes, the accumulated total is passed to `dbUsage.track()`.
+- **Exa cost tracking** (`src/tools/search.ts`) — `registerSearchTools` accepts an `onCost?(amount)` callback. `webSearch` reports `$0.005` per call; `extractUrl` reports `$0.001 × urls`. The callback is wired in `tools/index.ts` to `getToolContext().toolCost.total += amount`, avoiding any circular import.
+- **`tool_cost` DB column** (`src/db.ts`, schema v3) — `ALTER TABLE usage ADD COLUMN tool_cost REAL NOT NULL DEFAULT 0` migration runs on boot. `usage.track()` now stores `toolCost`; `usage.getSummary()` now returns `totalToolCost`. Existing rows default to 0.
+- **Dashboard live sub-agent log** (`src/dashboard.ts`) — a `subagentLogs` Map stores up to 50 timestamped lines per session. `subagent_update` SSE events append to the map and re-render the spawn list in place. Running spawn rows display a scrollable mono log pane (last 8 lines) under the status row.
+- **Dashboard tool cost display** (`src/dashboard.ts`) — usage cards show `+$X.XXX tools` beneath the LLM cost when `totalToolCost > 0`.
+- **`"subagent_update"` event type** (`src/events.ts`) — added to `KodaEventName` union.
+
+#### changed
+
+- `makePrepareStep` signature drops the `messageList` parameter — it now handles tier escalation only.
+- `finalizeResult` accepts an optional `toolCost` param and passes it to `dbUsage.track()`.
+- Sub-agent system prompt updated to instruct use of `streamUpdate` and `returnResult`.
+
+---
+
 ## 2026-02-19
 ### v1.6.0 — RAM auto-clean · live spawns · safe score · smarter router · natural cron · RAM graph · Docker sandbox · Ollama · named agent chat
 

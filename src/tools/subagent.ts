@@ -20,6 +20,9 @@ import { createAgent, type AgentDeps } from "../agent.js";
 import { subagents as dbSubagents, type SpawnRow } from "../db.js";
 import { emit } from "../events.js";
 
+/** Structured results stored by sub-agents that call returnResult. */
+const structuredResults = new Map<string, { summary: string; data?: Record<string, unknown> }>();
+
 // Tools that sub-agents are never allowed to use, regardless of allowlist.
 const ALWAYS_BLOCKED = new Set([
   "spawnAgent",           // no recursion
@@ -137,19 +140,51 @@ export function registerSubAgentTools(deps: {
       const ac = new AbortController();
       abortMap.set(sessionKey, ac);
 
+      // streamUpdate: bound to this session — lets the sub-agent broadcast live progress
+      const streamUpdateTool = tool({
+        description: "Send a brief live progress update visible in the dashboard. Call this between steps to show what you're doing.",
+        inputSchema: z.object({
+          message: z.string().describe("Brief status, e.g. 'Searching for pricing data...' or 'Found 3 sources, summarising...'"),
+        }),
+        execute: async ({ message }) => {
+          emit("subagent_update", { sessionKey, name, message, ts: new Date().toISOString() });
+          console.log(`[spawn:${name}] ${message}`);
+          return { sent: true };
+        },
+      });
+
+      // returnResult: forces structured output so the main agent gets clean, parseable data
+      const returnResultTool = tool({
+        description: "Submit your final structured result. ALWAYS call this when you have finished your task instead of just returning text.",
+        inputSchema: z.object({
+          summary: z.string().describe("Concise prose summary of findings (1-3 sentences)"),
+          data: z.record(z.string(), z.unknown()).describe("Optional structured data: tables, lists, counts, URLs, etc.").optional(),
+        }),
+        execute: async ({ summary, data }) => {
+          structuredResults.set(sessionKey, { summary, data });
+          return { stored: true };
+        },
+      });
+
+      const subToolsWithExtras: ToolSet = { ...subTools, streamUpdate: streamUpdateTool, returnResult: returnResultTool };
+
       const subDeps: AgentDeps = {
         ...agentDeps,
-        tools: subTools,
+        tools: subToolsWithExtras,
         getSoulPrompt: () =>
           `You are ${name} — a focused sub-agent.\n` +
           `Your ONLY job: ${task}\n` +
-          `Complete the task thoroughly using the tools available, then stop.\n` +
-          `Return your complete findings as plain text. Do not use the <|msg|> delimiter.`,
+          `Rules:\n` +
+          `- Use streamUpdate to report progress after each major step.\n` +
+          `- When you are DONE, call returnResult({ summary, data }) with your structured findings.\n` +
+          `- Do NOT use the <|msg|> delimiter.\n` +
+          `- Complete the task thoroughly, then stop.`,
         getSkillsSummary: async () => null,
         ingestConversation: async () => {},
       };
 
       const runSubAgent = createAgent(subDeps);
+      structuredResults.delete(sessionKey); // clear any stale result from prior run
 
       const timeoutPromise = new Promise<never>((_, reject) =>
         setTimeout(() => reject(new Error(`timeout after ${timeoutMs / 1000}s`)), timeoutMs),
@@ -186,11 +221,15 @@ export function registerSubAgentTools(deps: {
         };
         emit("spawn", finalEntry);
 
+        const structured = structuredResults.get(sessionKey) ?? null;
+        structuredResults.delete(sessionKey);
+
         return {
           success: true,
           name,
           sessionKey,
-          result: result.text,
+          result: structured?.summary ?? result.text,
+          structured,
           toolsUsed: result.toolsUsed,
           cost: result.usage.cost,
           note: `The agent is now available as '@${name}' for follow-up questions.`,

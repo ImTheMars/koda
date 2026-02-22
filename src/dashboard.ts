@@ -474,6 +474,22 @@ export function buildDashboardHtml(version: string): string {
     }
     .kill-btn:hover { color: var(--red); border-color: var(--red); }
 
+    /* --- Sub-agent live log --- */
+    .spawn-log {
+      background: var(--bg);
+      border-top: 1px solid var(--border);
+      padding: 8px 20px 8px 48px;
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--muted);
+      line-height: 1.6;
+      max-height: 120px;
+      overflow-y: auto;
+    }
+    .spawn-log-line { display: flex; gap: 8px; }
+    .spawn-log-ts { color: var(--border); flex-shrink: 0; }
+    .spawn-log-msg { color: var(--accent2); }
+
     /* --- RAM graph --- */
     .ram-section {
       background: var(--surface);
@@ -606,6 +622,8 @@ export function buildDashboardHtml(version: string): string {
     const memSamples = [];
     const MEM_MAX = 120;
     let spawnList = [];
+    // Live log lines per sub-agent session: sessionKey → [{ts, message}]
+    const subagentLogs = new Map();
 
     function fmt(cost) {
       return cost < 0.01 ? '<$0.01' : '$' + cost.toFixed(3);
@@ -658,13 +676,17 @@ export function buildDashboardHtml(version: string): string {
         { label: 'This Month', d: data.month },
         { label: 'All Time', d: data.allTime },
       ];
-      document.getElementById('usageGrid').innerHTML = cards.map(({ label, d }) => \`
+      document.getElementById('usageGrid').innerHTML = cards.map(({ label, d }) => {
+        const toolLine = d.totalToolCost > 0 ? \`<div class="usage-card-meta" style="margin-top:2px">+\${fmt(d.totalToolCost)} tools</div>\` : '';
+        return \`
         <div class="usage-card">
           <div class="usage-card-label">\${label}</div>
           <div class="usage-card-cost">\${fmt(d.totalCost)}</div>
           <div class="usage-card-meta">\${d.totalRequests} requests &middot; \${(d.totalInputTokens + d.totalOutputTokens).toLocaleString()} tokens</div>
+          \${toolLine}
         </div>
-      \`).join('');
+      \`;
+      }).join('');
     }
 
     function renderSkills(data) {
@@ -706,6 +728,16 @@ export function buildDashboardHtml(version: string): string {
       await fetch('/api/spawns?session=' + encodeURIComponent(sessionKey), { method: 'DELETE' });
     }
 
+    function renderSpawnLog(sessionKey) {
+      const lines = subagentLogs.get(sessionKey) ?? [];
+      if (!lines.length) return '';
+      const html = lines.slice(-8).map(l => {
+        const t = new Date(l.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        return \`<div class="spawn-log-line"><span class="spawn-log-ts">\${t}</span><span class="spawn-log-msg">\${esc(l.message)}</span></div>\`;
+      }).join('');
+      return \`<div class="spawn-log">\${html}</div>\`;
+    }
+
     function renderSpawns(spawns) {
       const list = document.getElementById('spawnsList');
       document.getElementById('spawnsBadge').textContent = spawns.length;
@@ -714,12 +746,15 @@ export function buildDashboardHtml(version: string): string {
         return;
       }
       list.innerHTML = spawns.slice(0, 20).map(s => \`
-        <li class="spawn-row">
-          <span class="spawn-status" style="color:\${SPAWN_COLOR[s.status] ?? 'var(--muted)'}">\${SPAWN_STATUS[s.status] ?? '·'}</span>
-          <span class="spawn-name">\${esc(s.name)}</span>
-          <span class="spawn-tools">\${esc(s.toolsUsed.join(', ') || '—')}</span>
-          <span class="spawn-meta">\${s.cost > 0 ? '$' + s.cost.toFixed(4) : ''} \${ago(s.startedAt)}</span>
-          \${s.status === 'running' ? \`<button class="kill-btn" onclick="killAgent('\${esc(s.sessionKey)}')">kill</button>\` : ''}
+        <li>
+          <div class="spawn-row">
+            <span class="spawn-status" style="color:\${SPAWN_COLOR[s.status] ?? 'var(--muted)'}">\${SPAWN_STATUS[s.status] ?? '·'}</span>
+            <span class="spawn-name">\${esc(s.name)}</span>
+            <span class="spawn-tools">\${esc(s.toolsUsed.join(', ') || '—')}</span>
+            <span class="spawn-meta">\${s.cost > 0 ? '$' + s.cost.toFixed(4) : ''} \${ago(s.startedAt)}</span>
+            \${s.status === 'running' ? \`<button class="kill-btn" onclick="killAgent('\${esc(s.sessionKey)}')">kill</button>\` : ''}
+          </div>
+          \${s.status === 'running' ? renderSpawnLog(s.sessionKey) : ''}
         </li>
       \`).join('');
     }
@@ -825,6 +860,19 @@ export function buildDashboardHtml(version: string): string {
       es.addEventListener('spawn', (e) => {
         try {
           updateSpawnEntry(JSON.parse(e.data));
+        } catch {}
+      });
+
+      // subagent_update: live progress message from a running sub-agent
+      es.addEventListener('subagent_update', (e) => {
+        try {
+          const { sessionKey, message, ts } = JSON.parse(e.data);
+          if (!subagentLogs.has(sessionKey)) subagentLogs.set(sessionKey, []);
+          const lines = subagentLogs.get(sessionKey);
+          lines.push({ ts: ts ?? new Date().toISOString(), message });
+          if (lines.length > 50) lines.shift();
+          // Re-render spawns so the log panel updates in place
+          renderSpawns(spawnList);
         } catch {}
       });
     }

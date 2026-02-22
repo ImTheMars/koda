@@ -5,7 +5,7 @@
  * forwards them to connected browser clients — zero polling, zero latency.
  */
 
-export type KodaEventName = "memory" | "spawn" | "heartbeat";
+export type KodaEventName = "memory" | "spawn" | "subagent_update" | "heartbeat";
 
 type Listener = (name: KodaEventName, data: unknown) => void;
 

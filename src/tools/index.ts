@@ -24,12 +24,14 @@ interface ToolRuntimeContext {
   userId: string;
   chatId: string;
   channel: string;
+  toolCost: { total: number };
 }
 
 const DEFAULT_CONTEXT: ToolRuntimeContext = {
   userId: "owner",
   chatId: "owner",
   channel: "cli",
+  toolCost: { total: 0 },
 };
 
 const toolContextStore = new AsyncLocalStorage<ToolRuntimeContext>();
@@ -40,6 +42,12 @@ export function withToolContext<T>(ctx: ToolRuntimeContext, fn: () => Promise<T>
 
 function getToolContext(): ToolRuntimeContext {
   return toolContextStore.getStore() ?? DEFAULT_CONTEXT;
+}
+
+/** Increment the tool cost accumulator for the current request context. */
+export function addToolCost(amount: number): void {
+  const ctx = toolContextStore.getStore();
+  if (ctx) ctx.toolCost.total += amount;
 }
 
 export async function buildTools(deps: {
@@ -62,7 +70,11 @@ export async function buildTools(deps: {
 
   // Search + Skill Shop (optional — needs Exa key)
   if (config.exa.apiKey) {
-    Object.assign(tools, registerSearchTools({ apiKey: config.exa.apiKey, numResults: config.exa.numResults }));
+    Object.assign(tools, registerSearchTools({
+      apiKey: config.exa.apiKey,
+      numResults: config.exa.numResults,
+      onCost: (amount) => { getToolContext().toolCost.total += amount; },
+    }));
     Object.assign(tools, registerSkillShopTools({ exaApiKey: config.exa.apiKey, workspace, githubToken: config.github?.token }));
   }
 

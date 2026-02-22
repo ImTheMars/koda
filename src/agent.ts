@@ -90,6 +90,21 @@ export function isLlmCircuitOpen(): boolean {
 // Shared helpers — used by both runAgent and streamAgent
 // ---------------------------------------------------------------------------
 
+/**
+ * Pre-flight history compaction — called BEFORE handing messages to generateText/streamText.
+ * Keeps the most recent `maxMessages` messages and inserts a single placeholder for
+ * everything older, so the SDK never sees a mid-run mutation of the array it holds.
+ */
+function trimHistory(messages: ModelMessage[], maxMessages = 24): ModelMessage[] {
+  if (messages.length <= maxMessages) return messages;
+  const removed = messages.length - maxMessages;
+  const kept = messages.slice(removed);
+  return [
+    { role: "user" as const, content: `[${removed} earlier messages omitted — context trimmed for length]` },
+    ...kept,
+  ];
+}
+
 function buildSystemPrompt(deps: {
   soulPrompt: string | null;
   skillsSummary: string | null;
@@ -222,23 +237,16 @@ function buildMessages(input: AgentInput, history: Array<{ role: string; content
   ];
 }
 
-/** Shared prepareStep callback — handles compaction and tier escalation. */
+/** Shared prepareStep callback — handles tier escalation only. Compaction is done pre-flight via trimHistory(). */
 function makePrepareStep(
   provider: ReturnType<typeof createOpenRouter>,
   tierOrder: Tier[],
   config: Config,
-  messageList: ModelMessage[],
   state: { currentTier: Tier; stepCount: number },
   logPrefix: string,
 ) {
   return ({ stepNumber }: { stepNumber: number }) => {
     state.stepCount = stepNumber;
-    if (stepNumber > 10 && messageList.length > 8) {
-      const keep = 6;
-      const removed = messageList.length - keep;
-      log("agent", "%scompacted %d msgs", logPrefix, removed);
-      messageList.splice(0, removed, { role: "user" as const, content: `[${removed} earlier messages compacted]` });
-    }
     if (stepNumber > 5 && state.currentTier !== "deep") {
       const idx = tierOrder.indexOf(state.currentTier);
       if (idx < tierOrder.length - 1) {
@@ -277,11 +285,12 @@ function finalizeResult(
   promptTokens: number,
   completionTokens: number,
   logPrefix: string,
+  toolCost = 0,
 ): AgentResult {
   const cost = calculateCost(modelId, promptTokens, completionTokens);
   const uniqueTools = [...new Set(toolsUsed)];
 
-  log("agent", "%sdone tokens=%d/%d cost=$%s tools=[%s]", logPrefix, promptTokens, completionTokens, cost.toFixed(4), uniqueTools.join(","));
+  log("agent", "%sdone tokens=%d/%d cost=$%s toolCost=$%s tools=[%s]", logPrefix, promptTokens, completionTokens, cost.toFixed(4), toolCost.toFixed(4), uniqueTools.join(","));
 
   dbUsage.track({
     userId: input.senderId,
@@ -289,6 +298,7 @@ function finalizeResult(
     inputTokens: promptTokens,
     outputTokens: completionTokens,
     cost,
+    toolCost,
     toolsUsed: uniqueTools,
   });
 
@@ -321,18 +331,21 @@ export function createAgent(deps: AgentDeps) {
     const { tier, skipQuery } = classifyAndAck(input, "");
     const systemPrompt = await buildAgentContext(deps, input, skipQuery);
     const history = dbMessages.getHistory(input.sessionKey, 30);
-    const messageList = buildMessages(input, history);
+    const messageList = trimHistory(buildMessages(input, history));
 
     input.onTypingStart?.();
 
     const toolsUsed: string[] = [];
     const state = { currentTier: tier, stepCount: 0 };
 
+    const toolCostRef = { total: 0 };
+
     try {
       return await withToolContext({
         userId: input.senderId,
         chatId: input.chatId,
         channel: input.channel,
+        toolCost: toolCostRef,
       }, async () => {
         const modelId = getModelId(state.currentTier, config);
         log("agent", "model=%s session=%s", modelId, input.sessionKey);
@@ -352,7 +365,7 @@ export function createAgent(deps: AgentDeps) {
           maxOutputTokens: config.agent.maxTokens,
           temperature: config.agent.temperature,
           abortSignal: input.abortSignal,
-          prepareStep: makePrepareStep(provider, tierOrder, config, messageList, state, ""),
+          prepareStep: makePrepareStep(provider, tierOrder, config, state, ""),
           onStepFinish: makeOnStepFinish(toolsUsed, state, ""),
         });
 
@@ -361,7 +374,7 @@ export function createAgent(deps: AgentDeps) {
         const promptTokens = result.totalUsage?.inputTokens ?? result.usage?.inputTokens ?? 0;
         const completionTokens = result.totalUsage?.outputTokens ?? result.usage?.outputTokens ?? 0;
 
-        return finalizeResult(deps, input, history, state.currentTier, toolsUsed, result.text, finalModelId, promptTokens, completionTokens, "");
+        return finalizeResult(deps, input, history, state.currentTier, toolsUsed, result.text, finalModelId, promptTokens, completionTokens, "", toolCostRef.total);
       });
     } catch (err) {
       console.error("[agent] LLM generate error:", err);
@@ -397,7 +410,7 @@ export function createStreamAgent(deps: AgentDeps) {
     const { tier, skipQuery } = classifyAndAck(input, "stream ");
     const systemPrompt = await buildAgentContext(deps, input, skipQuery);
     const history = dbMessages.getHistory(input.sessionKey, 30);
-    const messageList = buildMessages(input, history);
+    const messageList = trimHistory(buildMessages(input, history));
 
     const toolsUsed: string[] = [];
     const state = { currentTier: tier, stepCount: 0 };
@@ -407,10 +420,13 @@ export function createStreamAgent(deps: AgentDeps) {
     const fallbackIds = FAILOVER[state.currentTier] ?? [];
     const model = provider(modelId, { models: fallbackIds });
 
+    const toolCostRef = { total: 0 };
+
     const streamResult = await withToolContext({
       userId: input.senderId,
       chatId: input.chatId,
       channel: input.channel,
+      toolCost: toolCostRef,
     }, async () => {
       return streamText({
         model,
@@ -421,7 +437,7 @@ export function createStreamAgent(deps: AgentDeps) {
         stopWhen: stepCountIs(config.agent.maxSteps),
         maxOutputTokens: config.agent.maxTokens,
         temperature: config.agent.temperature,
-        prepareStep: makePrepareStep(provider, tierOrder, config, messageList, state, "stream "),
+        prepareStep: makePrepareStep(provider, tierOrder, config, state, "stream "),
         onStepFinish: makeOnStepFinish(toolsUsed, state, "stream "),
         onError: ({ error }) => {
           console.error("[agent] Stream error:", error);
@@ -436,7 +452,7 @@ export function createStreamAgent(deps: AgentDeps) {
         const promptTokens = (usage as any)?.inputTokens ?? 0;
         const completionTokens = (usage as any)?.outputTokens ?? 0;
 
-        return finalizeResult(deps, input, history, state.currentTier, toolsUsed, text, finalModelId, promptTokens, completionTokens, "stream ");
+        return finalizeResult(deps, input, history, state.currentTier, toolsUsed, text, finalModelId, promptTokens, completionTokens, "stream ", toolCostRef.total);
       },
     );
 

@@ -12,7 +12,7 @@ let stmtAppendMessage: ReturnType<Database["prepare"]> | null = null;
 let stmtGetHistory: ReturnType<Database["prepare"]> | null = null;
 let stmtTrackUsage: ReturnType<Database["prepare"]> | null = null;
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 export function initDb(dbPath: string): Database {
   db = new Database(dbPath, { create: true });
@@ -101,7 +101,7 @@ export function initDb(dbPath: string): Database {
 
   stmtAppendMessage = db.prepare("INSERT INTO messages (session_key, role, content, tools_used) VALUES (?, ?, ?, ?)");
   stmtGetHistory = db.prepare("SELECT role, content FROM messages WHERE session_key = ? ORDER BY id DESC LIMIT ?");
-  stmtTrackUsage = db.prepare("INSERT INTO usage (user_id, model, input_tokens, output_tokens, cost, tools_used, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)");
+  stmtTrackUsage = db.prepare("INSERT INTO usage (user_id, model, input_tokens, output_tokens, cost, tool_cost, tools_used, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
 
   runMigrations(db);
 
@@ -149,6 +149,19 @@ function runMigrations(database: Database): void {
       "INSERT OR REPLACE INTO state (key, value, updated_at) VALUES ('schema_version', '2', datetime('now'))",
     );
     console.log("[db] Migrated to schema version 2");
+  }
+
+  if (currentVersion < 3) {
+    // Add tool_cost column to track external API costs (Exa, etc.) separately from LLM cost
+    try {
+      database.exec("ALTER TABLE usage ADD COLUMN tool_cost REAL NOT NULL DEFAULT 0");
+    } catch {
+      // Column already exists — safe to ignore
+    }
+    database.run(
+      "INSERT OR REPLACE INTO state (key, value, updated_at) VALUES ('schema_version', '3', datetime('now'))",
+    );
+    console.log("[db] Migrated to schema version 3");
   }
 }
 
@@ -273,7 +286,7 @@ export const tasks = {
 // --- Usage ---
 
 export const usage = {
-  track(data: { userId: string; model: string; inputTokens: number; outputTokens: number; cost: number; toolsUsed?: string[] }): void {
+  track(data: { userId: string; model: string; inputTokens: number; outputTokens: number; cost: number; toolCost?: number; toolsUsed?: string[] }): void {
     if (!stmtTrackUsage) throw new Error("Database statements not initialized");
     stmtTrackUsage.run(
       data.userId,
@@ -281,17 +294,18 @@ export const usage = {
       data.inputTokens,
       data.outputTokens,
       data.cost,
+      data.toolCost ?? 0,
       data.toolsUsed?.length ? JSON.stringify(data.toolsUsed) : null,
       new Date().toISOString(),
     );
   },
 
-  getSummary(userId: string, since?: Date): { totalRequests: number; totalCost: number; totalInputTokens: number; totalOutputTokens: number } {
+  getSummary(userId: string, since?: Date): { totalRequests: number; totalCost: number; totalToolCost: number; totalInputTokens: number; totalOutputTokens: number } {
     const sinceStr = since?.toISOString() ?? "1970-01-01";
     const row = getDb()
-      .query("SELECT COUNT(*) as cnt, COALESCE(SUM(cost), 0) as totalCost, COALESCE(SUM(input_tokens), 0) as inp, COALESCE(SUM(output_tokens), 0) as out FROM usage WHERE user_id = ? AND datetime(created_at) >= datetime(?)")
-      .get(userId, sinceStr) as { cnt: number; totalCost: number; inp: number; out: number } | null;
-    return { totalRequests: row?.cnt ?? 0, totalCost: row?.totalCost ?? 0, totalInputTokens: row?.inp ?? 0, totalOutputTokens: row?.out ?? 0 };
+      .query("SELECT COUNT(*) as cnt, COALESCE(SUM(cost), 0) as totalCost, COALESCE(SUM(tool_cost), 0) as totalToolCost, COALESCE(SUM(input_tokens), 0) as inp, COALESCE(SUM(output_tokens), 0) as out FROM usage WHERE user_id = ? AND datetime(created_at) >= datetime(?)")
+      .get(userId, sinceStr) as { cnt: number; totalCost: number; totalToolCost: number; inp: number; out: number } | null;
+    return { totalRequests: row?.cnt ?? 0, totalCost: row?.totalCost ?? 0, totalToolCost: row?.totalToolCost ?? 0, totalInputTokens: row?.inp ?? 0, totalOutputTokens: row?.out ?? 0 };
   },
 };
 

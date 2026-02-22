@@ -9,7 +9,16 @@ import Exa from "exa-js";
 import { tool, type ToolSet } from "ai";
 import { z } from "zod";
 
-export function registerSearchTools(deps: { apiKey: string; numResults?: number }): ToolSet {
+// Approximate Exa credit costs (USD per call)
+const EXA_SEARCH_COST = 0.005;   // per webSearch call
+const EXA_EXTRACT_COST = 0.001;  // per URL extracted
+
+export function registerSearchTools(deps: {
+  apiKey: string;
+  numResults?: number;
+  /** Called each time a paid Exa API call is made, with the estimated USD cost. */
+  onCost?: (amount: number) => void;
+}): ToolSet {
   const exa = new Exa(deps.apiKey);
   const defaultNum = deps.numResults ?? 5;
 
@@ -20,6 +29,7 @@ export function registerSearchTools(deps: { apiKey: string; numResults?: number 
       numResults: z.number().min(1).max(10).optional(),
     }),
     execute: async ({ query, numResults }) => {
+      deps.onCost?.(EXA_SEARCH_COST);
       try {
         const result = await exa.searchAndContents(query, {
           type: "auto",
@@ -49,6 +59,7 @@ export function registerSearchTools(deps: { apiKey: string; numResults?: number 
       urls: z.array(z.string().url()).min(1).max(5),
     }),
     execute: async ({ urls }) => {
+      deps.onCost?.(EXA_EXTRACT_COST * Math.min(urls.length, 5));
       try {
         const result = await exa.getContents(urls.slice(0, 5) as [string, ...string[]], {
           text: { maxCharacters: 15000 },
