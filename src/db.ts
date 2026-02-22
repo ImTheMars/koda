@@ -101,9 +101,11 @@ export function initDb(dbPath: string): Database {
 
   stmtAppendMessage = db.prepare("INSERT INTO messages (session_key, role, content, tools_used) VALUES (?, ?, ?, ?)");
   stmtGetHistory = db.prepare("SELECT role, content FROM messages WHERE session_key = ? ORDER BY id DESC LIMIT ?");
-  stmtTrackUsage = db.prepare("INSERT INTO usage (user_id, model, input_tokens, output_tokens, cost, tool_cost, tools_used, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
 
+  // Prepare stmtTrackUsage AFTER migrations so the tool_cost column exists
   runMigrations(db);
+
+  stmtTrackUsage = db.prepare("INSERT INTO usage (user_id, model, input_tokens, output_tokens, cost, tool_cost, tools_used, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)");
 
   return db;
 }
