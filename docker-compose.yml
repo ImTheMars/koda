@@ -6,7 +6,7 @@ services:
     ports:
       - "3000:3000"
     volumes:
-      - koda-data:/app/workspace
+      - koda-data:/root/.koda
       - ./config:/app/config:ro
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:3000/health"]

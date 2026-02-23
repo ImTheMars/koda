@@ -91,11 +91,11 @@ export function startProactive(deps: ProactiveDeps): { stop: () => void } {
         }
       }
     }
+    log("proactive", "tick");
+
   };
 
   const tick = async () => {
-    log("proactive", "tick");
-
     // Reminders ALWAYS fire — user explicitly scheduled them.
     if (config.features.scheduler) await checkTasks();
   };

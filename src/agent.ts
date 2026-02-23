@@ -15,7 +15,7 @@ import type { Config, Tier } from "./config.js";
 import { classifyTier, classifyIntent, getModelId, calculateCost, shouldAck, FAILOVER } from "./router.js";
 import { messages as dbMessages, usage as dbUsage } from "./db.js";
 import { formatUserTime } from "./time.js";
-import { withToolContext } from "./tools/index.js";
+import { withToolContext, getPendingFiles } from "./tools/index.js";
 import type { UserProfile } from "./tools/memory.js";
 import { log } from "./log.js";
 
@@ -27,6 +27,7 @@ export interface AgentInput {
   channel: string;
   sessionKey: string;
   source?: string;
+  tierOverride?: Tier;
   abortSignal?: AbortSignal;
   onAck?: (text: string) => void;
   onTypingStart?: () => void;
@@ -38,6 +39,7 @@ export interface AgentResult {
   tier: Tier;
   toolsUsed: string[];
   usage: { promptTokens: number; completionTokens: number; cost: number };
+  files?: Array<{ path: string; caption?: string }>;
 }
 
 export interface AgentDeps {
@@ -66,10 +68,6 @@ let ollamaProvider: ReturnType<typeof createOllama> | null = null;
 
 export function initOllama(baseUrl: string): void {
   ollamaProvider = createOllama({ baseURL: `${baseUrl}/api` });
-}
-
-export function getOllamaProvider(): ReturnType<typeof createOllama> | null {
-  return ollamaProvider;
 }
 
 function getProvider(apiKey: string) {
@@ -192,10 +190,10 @@ your training data is outdated. for anything time-sensitive — search first, an
 
 /** Classify input, send ack if warranted, return routing info. */
 function classifyAndAck(input: AgentInput, logPrefix: string): { tier: Tier; skipQuery: boolean } {
-  const tier = classifyTier(input.content);
+  const tier = input.tierOverride ?? classifyTier(input.content);
   const intent = classifyIntent(input.content);
   const willAck = shouldAck({ content: input.content, tier, intent, source: input.source });
-  log("agent", "%stier=%s intent=%s ack=%s len=%d", logPrefix, tier, intent, willAck, input.content.length);
+  log("agent", "%stier=%s intent=%s ack=%s len=%d%s", logPrefix, tier, intent, willAck, input.content.length, input.tierOverride ? " (override)" : "");
 
   if (input.onAck && willAck) {
     const ackMsg = ACK_TEMPLATES[Math.abs(Number(Bun.hash(input.chatId))) % ACK_TEMPLATES.length]!;
@@ -310,11 +308,14 @@ function finalizeResult(
   const allMessages = [...history, { role: "user", content: input.content }, { role: "assistant", content: responseText }];
   deps.ingestConversation(input.sessionKey, input.senderId, allMessages).catch(() => {});
 
+  const pendingFiles = getPendingFiles();
+
   return {
     text: responseText,
     tier: currentTier,
     toolsUsed: uniqueTools,
     usage: { promptTokens, completionTokens, cost },
+    ...(pendingFiles.length > 0 ? { files: pendingFiles } : {}),
   };
 }
 
@@ -346,6 +347,7 @@ export function createAgent(deps: AgentDeps) {
         chatId: input.chatId,
         channel: input.channel,
         toolCost: toolCostRef,
+        pendingFiles: [],
       }, async () => {
         const modelId = getModelId(state.currentTier, config);
         log("agent", "model=%s session=%s", modelId, input.sessionKey);
@@ -427,6 +429,7 @@ export function createStreamAgent(deps: AgentDeps) {
       chatId: input.chatId,
       channel: input.channel,
       toolCost: toolCostRef,
+      pendingFiles: [],
     }, async () => {
       return streamText({
         model,

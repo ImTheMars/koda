@@ -11,6 +11,8 @@ import { statSync } from "fs";
 import { loadEnvFromFiles } from "./env.js";
 import { validateTimezone } from "./time.js";
 
+let resolvedConfigPath: string | null = null;
+
 function withEmptyDefault<T extends z.ZodTypeAny>(schema: T) {
   return schema.optional().transform((val) => schema.parse(val ?? {}));
 }
@@ -22,6 +24,7 @@ const ConfigSchema = z.object({
     apiKey: z.string().min(1, "OpenRouter API key is required"),
     fastModel: z.string().default("google/gemini-3-flash-preview"),
     deepModel: z.string().default("anthropic/claude-sonnet-4.6"),
+    imageModel: z.string().default("google/gemini-3-pro-image-preview"),
   }),
   supermemory: withEmptyDefault(z.object({
     apiKey: z.string().optional(),
@@ -31,6 +34,9 @@ const ConfigSchema = z.object({
     token: z.string().optional(),
     allowFrom: z.array(z.string()).default([]),
     adminIds: z.array(z.string()).default([]),
+    useWebhook: z.boolean().default(false),
+    webhookUrl: z.string().optional(),
+    webhookSecret: z.string().optional(),
   })),
   cli: withEmptyDefault(z.object({
     userId: z.string().default("owner"),
@@ -86,6 +92,7 @@ const ConfigSchema = z.object({
   features: withEmptyDefault(z.object({
     scheduler: z.boolean().default(true),
     debug: z.boolean().default(false),
+    autoBackup: z.boolean().default(true),
   })),
   subagent: withEmptyDefault(z.object({
     timeoutMs: z.number().min(10_000).default(90_000),
@@ -192,6 +199,7 @@ export async function loadConfig(configPath?: string): Promise<Config> {
     if (await file.exists()) {
       try {
         raw = JSON.parse(await file.text());
+        resolvedConfigPath = p;
         break;
       } catch {
         console.warn(`\x1b[33m[config] WARNING: Malformed config file at ${p}, skipping\x1b[0m`);
@@ -219,4 +227,47 @@ export async function loadConfig(configPath?: string): Promise<Config> {
   config.soul.dir = resolvePath(config.soul.dir, projectRoot);
 
   return config;
+}
+
+export async function persistConfig(config: Config): Promise<void> {
+  const configPath = resolvedConfigPath ?? resolve(homedir(), ".koda", "config.json");
+  const serializable: Record<string, unknown> = {};
+
+  // Serialize back to the JSON-compatible shape — omit secrets (they live in .env)
+  serializable.mode = config.mode;
+  serializable.owner = { id: config.owner.id };
+  serializable.openrouter = {
+    fastModel: config.openrouter.fastModel,
+    deepModel: config.openrouter.deepModel,
+    imageModel: config.openrouter.imageModel,
+  };
+  serializable.telegram = {
+    allowFrom: config.telegram.allowFrom,
+    adminIds: config.telegram.adminIds,
+    useWebhook: config.telegram.useWebhook,
+    ...(config.telegram.webhookUrl ? { webhookUrl: config.telegram.webhookUrl } : {}),
+    ...(config.telegram.webhookSecret ? { webhookSecret: config.telegram.webhookSecret } : {}),
+  };
+  serializable.cli = config.cli;
+  serializable.agent = {
+    maxSteps: config.agent.maxSteps,
+    maxTokens: config.agent.maxTokens,
+    temperature: config.agent.temperature,
+  };
+  serializable.exa = { numResults: config.exa.numResults };
+  serializable.timeouts = config.timeouts;
+  serializable.scheduler = { timezone: config.scheduler.timezone };
+  serializable.proactive = { tickIntervalMs: config.proactive.tickIntervalMs };
+  serializable.features = {
+    scheduler: config.features.scheduler,
+    debug: config.features.debug,
+    autoBackup: config.features.autoBackup,
+  };
+  serializable.subagent = {
+    timeoutMs: config.subagent.timeoutMs,
+    maxSteps: config.subagent.maxSteps,
+  };
+  serializable.workspace = config.workspace;
+
+  await Bun.write(configPath, JSON.stringify(serializable, null, 2) + "\n");
 }

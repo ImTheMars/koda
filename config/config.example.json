@@ -2,18 +2,23 @@
   "mode": "private",
   "features": {
     "scheduler": true,
-    "debug": false
+    "debug": false,
+    "autoBackup": true
   },
   "owner": {
     "id": "your-user-id"
   },
   "openrouter": {
     "fastModel": "google/gemini-3-flash-preview",
-    "deepModel": "anthropic/claude-sonnet-4.6"
+    "deepModel": "anthropic/claude-sonnet-4.6",
+    "imageModel": "google/gemini-3-pro-image-preview"
   },
   "telegram": {
     "allowFrom": ["your-telegram-user-id"],
-    "adminIds": ["your-telegram-user-id"]
+    "adminIds": ["your-telegram-user-id"],
+    "useWebhook": false,
+    "webhookUrl": "",
+    "webhookSecret": ""
   },
   "cli": {
     "userId": "owner",

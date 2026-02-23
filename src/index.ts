@@ -7,21 +7,20 @@
 import { mkdir } from "fs/promises";
 import { resolve } from "path";
 import { loadConfig, type Config } from "./config.js";
-import { initDb, closeDb, messages as dbMessages, state as dbState, tasks as dbTasks, vacuumDb } from "./db.js";
+import { initDb, closeDb, messages as dbMessages, state as dbState, tasks as dbTasks, vacuumDb, backupDatabase } from "./db.js";
 import { parseCronNext } from "./time.js";
 import { createAgent, createStreamAgent, initOllama, type AgentDeps } from "./agent.js";
 import { SoulLoader } from "./tools/soul.js";
 import { SkillLoader } from "./tools/skills.js";
-import { createMemoryProvider } from "./tools/memory.js";
+import { createMemoryProvider, setMemoryTimeout } from "./tools/memory.js";
 import { startRepl } from "./channels/repl.js";
-import { startTelegram } from "./channels/telegram.js";
+import { startTelegram, type TelegramResult } from "./channels/telegram.js";
 import { startProactive } from "./proactive.js";
 import { buildTools } from "./tools/index.js";
 import { enableDebug } from "./log.js";
 import { createMCPClient } from "@ai-sdk/mcp";
 import { handleDashboardRequest } from "./dashboard.js";
 import { registerSubAgentTools, getNamedSession } from "./tools/subagent.js";
-import { recordMemSample } from "./metrics.js";
 import { VERSION } from "./version.js";
 
 // --- CLI routing ---
@@ -46,6 +45,9 @@ if (cleanedMessages > 0) {
   console.log(`[boot] Cleaned ${cleanedMessages} messages older than 90 days`);
 }
 console.log("[boot] Database initialized");
+
+// --- Timeouts from config ---
+setMemoryTimeout(config.timeouts.memory);
 
 // --- Providers ---
 const memoryProvider = createMemoryProvider(config);
@@ -214,14 +216,14 @@ function makeNamedStreamAgent(baseStreamAgent: typeof streamAgentFn): typeof str
 }
 
 // --- Channels ---
-let telegram: { stop: () => Promise<void>; sendDirect: (chatId: string, text: string) => Promise<void> } | null = null;
+let telegram: TelegramResult | null = null;
 let repl: { stop: () => void } | null = null;
 
 const routedStreamAgent = makeNamedStreamAgent(streamAgentFn);
 
 if (config.mode !== "cli-only" && config.telegram.token) {
   telegram = startTelegram({ streamAgent: routedStreamAgent, config });
-  console.log("[boot] Channel: telegram enabled");
+  console.log(`[boot] Channel: telegram enabled${config.telegram.useWebhook ? " (webhook)" : " (polling)"}`);
 }
 
 if (config.mode === "cli-only") {
@@ -261,9 +263,28 @@ if (config.features.scheduler) {
   console.log("[boot] Proactive: started");
 }
 
-// --- Metrics: memory sampling every 5 s ---
-recordMemSample(); // baseline at boot
-const memSampleTimer = setInterval(recordMemSample, 5_000);
+// --- Database backup ---
+let backupTimer: ReturnType<typeof setInterval> | null = null;
+if (config.features.autoBackup) {
+  const backupDir = resolve(config.workspace, "backups");
+  await mkdir(backupDir, { recursive: true });
+  // Backup at boot
+  try {
+    const path = backupDatabase(backupDir);
+    console.log(`[backup] Database backed up to ${path}`);
+  } catch (err) {
+    console.warn("[backup] Boot backup failed:", (err as Error).message);
+  }
+  // Daily backup
+  backupTimer = setInterval(() => {
+    try {
+      const path = backupDatabase(backupDir);
+      console.log(`[backup] Database backed up to ${path}`);
+    } catch (err) {
+      console.warn("[backup] Failed:", (err as Error).message);
+    }
+  }, 24 * 60 * 60 * 1000);
+}
 
 // --- Hourly RAM auto-clean ---
 const hourlyCleanTimer = setInterval(() => {
@@ -286,7 +307,11 @@ const server = Bun.serve({
     if (url.pathname === "/health") {
       return Response.json({ status: "ok", version: VERSION, uptime: process.uptime() });
     }
-    const dash = await handleDashboardRequest(req, { skillLoader, defaultUserId: dashOwner, version: VERSION });
+    // Telegram webhook endpoint
+    if (url.pathname === "/telegram" && req.method === "POST" && telegram?.handleWebhook) {
+      return telegram.handleWebhook(req);
+    }
+    const dash = await handleDashboardRequest(req, { skillLoader, defaultUserId: dashOwner, config, version: VERSION });
     if (dash) return dash;
     return new Response("Not found", { status: 404 });
   },
@@ -298,7 +323,7 @@ console.log(`[boot] Dashboard on :${server.port}/`);
 const shutdown = async (signal: string) => {
   console.log(`\n[${signal}] Shutting down...`);
   clearInterval(mcpRestartTimer);
-  clearInterval(memSampleTimer);
+  if (backupTimer) clearInterval(backupTimer);
   clearInterval(hourlyCleanTimer);
   proactive?.stop();
   repl?.stop();

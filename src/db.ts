@@ -1,13 +1,16 @@
 /**
  * SQLite persistence layer via bun:sqlite.
  *
- * Tables: messages, tasks, usage, state, subagents, vector_memories
+ * Tables: messages, tasks, usage, state, subagents, vector_memories (learnings dropped in v0.9.0)
  * WAL mode for concurrent reads.
  */
 
 import { Database } from "bun:sqlite";
+import { copyFileSync, readdirSync, unlinkSync } from "fs";
+import { resolve, basename } from "path";
 
 let db: Database | null = null;
+let currentDbPath: string | null = null;
 let stmtAppendMessage: ReturnType<Database["prepare"]> | null = null;
 let stmtGetHistory: ReturnType<Database["prepare"]> | null = null;
 let stmtTrackUsage: ReturnType<Database["prepare"]> | null = null;
@@ -15,6 +18,7 @@ let stmtTrackUsage: ReturnType<Database["prepare"]> | null = null;
 const SCHEMA_VERSION = 3;
 
 export function initDb(dbPath: string): Database {
+  currentDbPath = dbPath;
   db = new Database(dbPath, { create: true });
   db.exec("PRAGMA journal_mode = WAL");
   db.exec("PRAGMA synchronous = NORMAL");
@@ -60,15 +64,6 @@ export function initDb(dbPath: string): Database {
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
     CREATE INDEX IF NOT EXISTS idx_usage_user ON usage(user_id, created_at);
-
-    CREATE TABLE IF NOT EXISTS learnings (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id TEXT NOT NULL,
-      type TEXT NOT NULL CHECK(type IN ('correction', 'preference')),
-      content TEXT NOT NULL,
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-    CREATE INDEX IF NOT EXISTS idx_learnings_user ON learnings(user_id);
 
     CREATE TABLE IF NOT EXISTS state (
       key TEXT PRIMARY KEY,
@@ -411,6 +406,30 @@ export const vectorMemories = {
     );
   },
 };
+
+// --- Backup ---
+
+export function backupDatabase(backupDir: string, maxBackups = 7): string {
+  const d = getDb();
+  if (!currentDbPath) throw new Error("Database path not set");
+  d.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const backupPath = resolve(backupDir, `koda-${timestamp}.db`);
+  copyFileSync(currentDbPath, backupPath);
+
+  // Prune old backups beyond maxBackups
+  try {
+    const files = readdirSync(backupDir)
+      .filter((f) => f.startsWith("koda-") && f.endsWith(".db"))
+      .sort();
+    while (files.length > maxBackups) {
+      const oldest = files.shift()!;
+      unlinkSync(resolve(backupDir, oldest));
+    }
+  } catch {}
+
+  return backupPath;
+}
 
 // --- Maintenance ---
 

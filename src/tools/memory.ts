@@ -214,12 +214,19 @@ function cosineSimilarity(a: Float32Array, b: Float32Array): number {
   return dot / (Math.sqrt(normA * normB) || 1);
 }
 
+let memoryTimeoutMs = 10_000;
+
+/** Set the memory operation timeout from config. Called once at boot. */
+export function setMemoryTimeout(ms: number): void {
+  memoryTimeoutMs = ms;
+}
+
 async function ollamaEmbed(ollamaUrl: string, model: string, text: string): Promise<Float32Array> {
   const res = await fetch(`${ollamaUrl}/api/embeddings`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ model, prompt: text }),
-    signal: AbortSignal.timeout(10_000),
+    signal: AbortSignal.timeout(memoryTimeoutMs),
   });
   if (!res.ok) throw new Error(`Ollama embed HTTP ${res.status}`);
   const data = await res.json() as { embedding: number[] };

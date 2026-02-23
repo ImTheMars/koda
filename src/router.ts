@@ -24,19 +24,6 @@ const DEEP_SOFT = [
   "thoroughly", "in depth", "comprehensive", "detailed analysis",
 ];
 
-const TOOL_HINTS = [
-  "search", "look up", "find out", "remind", "schedule", "remember",
-  "browse", "open url", "run ", "execute", "download",
-  "who is the", "who's the", "current president", "current ceo", "current price",
-  "latest news", "what happened", "recent", "right now", "today's", "this week",
-  "breaking", "live", "stock price", "weather",
-];
-
-const CODE_WORDS = [
-  "function", "class", "import", "export", "const ", "async", "debug",
-  "typescript", "javascript", "python", "sql", "```", "schema",
-];
-
 export type RequestIntent = "chat" | "task" | "research" | "code" | "schedule" | "memory";
 
 const INTENT_KEYWORDS: Record<RequestIntent, string[]> = {

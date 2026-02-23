@@ -7,20 +7,20 @@
  *   GET /api/skills  → { skills[] }
  *   GET /api/tasks   → { tasks[] }
  *   GET /api/spawns  → { spawns[] }  (SQLite-backed, latest 50)
- *   GET /api/memory  → { samples[] } (process.memoryUsage() ring buffer)
- *   GET /api/events  → SSE stream (memory every 5s, spawn on state change, heartbeat every 30s)
+ *   GET /api/events  → SSE stream (spawn on state change, heartbeat every 30s)
  *   DELETE /api/spawns?session=key → kill a running sub-agent
  */
 
 import type { SkillLoader } from "./tools/skills.js";
+import type { Config } from "./config.js";
 import { usage as dbUsage, tasks as dbTasks } from "./db.js";
 import { getSpawnLog, killSpawn } from "./tools/subagent.js";
-import { getMemSamples } from "./metrics.js";
 import { subscribe } from "./events.js";
 
 export interface DashboardDeps {
   skillLoader: SkillLoader;
   defaultUserId: string;
+  config: Config;
   version: string;
 }
 
@@ -51,10 +51,6 @@ function spawnsResponse(): Response {
   return Response.json({ spawns: getSpawnLog() });
 }
 
-function memoryResponse(): Response {
-  return Response.json({ samples: getMemSamples() });
-}
-
 function sseResponse(): Response {
   const encoder = new TextEncoder();
   let unsub: (() => void) | undefined;
@@ -68,13 +64,8 @@ function sseResponse(): Response {
         } catch {}
       }
 
-      // Immediately send init event so client triggers a full data refresh
       send("init", { ok: true });
-
-      // Subscribe to future events from any module
       unsub = subscribe((name, data) => send(name, data));
-
-      // Heartbeat keeps connection alive and triggers slow-data refresh (usage, skills, tasks)
       heartbeatTimer = setInterval(() => send("heartbeat", {}), 30_000);
     },
     cancel() {
@@ -101,7 +92,6 @@ export async function handleDashboardRequest(req: Request, deps: DashboardDeps):
   if (url.pathname === "/api/usage") return usageResponse(deps.defaultUserId);
   if (url.pathname === "/api/skills") return skillsResponse(deps.skillLoader);
   if (url.pathname === "/api/tasks") return tasksResponse(deps.defaultUserId);
-  if (url.pathname === "/api/memory") return memoryResponse();
   if (url.pathname === "/api/events") return sseResponse();
 
   if (url.pathname === "/api/spawns") {
@@ -113,7 +103,7 @@ export async function handleDashboardRequest(req: Request, deps: DashboardDeps):
     return spawnsResponse();
   }
 
-  if (url.pathname === "/") return new Response(buildDashboardHtml(deps.version), {
+  if (url.pathname === "/") return new Response(buildDashboardHtml(deps), {
     headers: { "Content-Type": "text/html; charset=utf-8" },
   });
 
@@ -122,7 +112,8 @@ export async function handleDashboardRequest(req: Request, deps: DashboardDeps):
 
 // --- HTML ---
 
-export function buildDashboardHtml(version: string): string {
+function buildDashboardHtml(deps: DashboardDeps): string {
+  const { version, config } = deps;
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -189,11 +180,7 @@ export function buildDashboardHtml(version: string): string {
       transition: background 0.3s, box-shadow 0.3s;
     }
 
-    .version {
-      font-size: 11px;
-      color: var(--muted);
-      font-family: var(--mono);
-    }
+    .version { font-size: 11px; color: var(--muted); font-family: var(--mono); }
 
     .status-info {
       font-size: 12px;
@@ -227,6 +214,24 @@ export function buildDashboardHtml(version: string): string {
       flex-direction: column;
       gap: 28px;
     }
+
+    /* --- Info bar --- */
+    .info-bar {
+      display: flex;
+      gap: 24px;
+      font-size: 12px;
+      font-family: var(--mono);
+      color: var(--muted);
+      padding: 12px 18px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      flex-wrap: wrap;
+    }
+
+    .info-bar span { white-space: nowrap; }
+    .info-label { color: var(--muted); margin-right: 4px; }
+    .info-value { color: var(--text); font-weight: 600; }
 
     /* --- Usage cards --- */
     .usage-grid {
@@ -474,65 +479,12 @@ export function buildDashboardHtml(version: string): string {
     }
     .kill-btn:hover { color: var(--red); border-color: var(--red); }
 
-    /* --- Sub-agent live log --- */
-    .spawn-log {
-      background: var(--bg);
-      border-top: 1px solid var(--border);
-      padding: 8px 20px 8px 48px;
-      font-family: var(--mono);
-      font-size: 11px;
-      color: var(--muted);
-      line-height: 1.6;
-      max-height: 120px;
-      overflow-y: auto;
-    }
-    .spawn-log-line { display: flex; gap: 8px; }
-    .spawn-log-ts { color: var(--border); flex-shrink: 0; }
-    .spawn-log-msg { color: var(--accent2); }
-
-    /* --- RAM graph --- */
-    .ram-section {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      overflow: hidden;
-    }
-
-    .ram-body { padding: 16px 20px 12px; }
-
-    .ram-stats {
-      display: flex;
-      gap: 24px;
-      margin-bottom: 12px;
-      font-size: 12px;
-      font-family: var(--mono);
-    }
-
-    .ram-stat-label { color: var(--muted); margin-right: 4px; }
-    .ram-stat-value { color: var(--text); font-weight: 600; }
-
-    .ram-chart { width: 100%; height: 60px; display: block; }
-
     /* --- Empty state --- */
     .empty {
       padding: 36px 20px;
       text-align: center;
       color: var(--muted);
       font-size: 13px;
-    }
-
-    /* --- Skeleton --- */
-    .skeleton {
-      height: 18px;
-      border-radius: 5px;
-      background: linear-gradient(90deg, var(--surface2) 25%, var(--border) 50%, var(--surface2) 75%);
-      background-size: 200% 100%;
-      animation: shimmer 1.4s infinite;
-    }
-
-    @keyframes shimmer {
-      0% { background-position: 200% 0; }
-      100% { background-position: -200% 0; }
     }
   </style>
 </head>
@@ -550,11 +502,18 @@ export function buildDashboardHtml(version: string): string {
   </div>
 
   <div class="main">
+    <!-- Info bar -->
+    <div class="info-bar" id="infoBar">
+      <span><span class="info-label">fast</span><span class="info-value">${escapeHtml(config.openrouter.fastModel)}</span></span>
+      <span><span class="info-label">deep</span><span class="info-value">${escapeHtml(config.openrouter.deepModel)}</span></span>
+      <span><span class="info-label">uptime</span><span class="info-value" id="uptimeVal">—</span></span>
+    </div>
+
     <!-- Usage -->
     <div class="usage-grid" id="usageGrid">
-      <div class="usage-card"><div class="usage-card-label">Today</div><div class="skeleton" style="width:80px;height:26px;margin-bottom:8px"></div><div class="skeleton" style="width:120px;height:12px"></div></div>
-      <div class="usage-card"><div class="usage-card-label">This Month</div><div class="skeleton" style="width:80px;height:26px;margin-bottom:8px"></div><div class="skeleton" style="width:120px;height:12px"></div></div>
-      <div class="usage-card"><div class="usage-card-label">All Time</div><div class="skeleton" style="width:80px;height:26px;margin-bottom:8px"></div><div class="skeleton" style="width:120px;height:12px"></div></div>
+      <div class="usage-card"><div class="usage-card-label">Today</div><div class="usage-card-cost">—</div></div>
+      <div class="usage-card"><div class="usage-card-label">This Month</div><div class="usage-card-cost">—</div></div>
+      <div class="usage-card"><div class="usage-card-label">All Time</div><div class="usage-card-cost">—</div></div>
     </div>
 
     <!-- Skills -->
@@ -589,22 +548,6 @@ export function buildDashboardHtml(version: string): string {
         <li class="empty">Loading...</li>
       </ul>
     </div>
-
-    <!-- RAM graph -->
-    <div class="ram-section">
-      <div class="section-header">
-        <span class="section-title">Memory</span>
-        <span class="badge" id="ramBadge">—</span>
-      </div>
-      <div class="ram-body">
-        <div class="ram-stats">
-          <span><span class="ram-stat-label">heap</span><span class="ram-stat-value" id="ramHeap">—</span></span>
-          <span><span class="ram-stat-label">rss</span><span class="ram-stat-value" id="ramRss">—</span></span>
-          <span><span class="ram-stat-label">external</span><span class="ram-stat-value" id="ramExt">—</span></span>
-        </div>
-        <svg class="ram-chart" id="ramChart" viewBox="0 0 600 60" preserveAspectRatio="none"></svg>
-      </div>
-    </div>
   </div>
 
   <script>
@@ -618,12 +561,7 @@ export function buildDashboardHtml(version: string): string {
       return d.innerHTML;
     }
 
-    // Client-side state for incremental SSE updates
-    const memSamples = [];
-    const MEM_MAX = 120;
     let spawnList = [];
-    // Live log lines per sub-agent session: sessionKey → [{ts, message}]
-    const subagentLogs = new Map();
 
     function fmt(cost) {
       return cost < 0.01 ? '<$0.01' : '$' + cost.toFixed(3);
@@ -639,9 +577,9 @@ export function buildDashboardHtml(version: string): string {
       const days = Math.floor(abs / 86400000);
       const prefix = diff < 0 ? 'overdue' : 'in';
       if (mins < 1) return diff < 0 ? 'overdue' : 'now';
-      if (hrs < 1) return \`\${prefix} \${mins}m\`;
-      if (days < 1) return \`\${prefix} \${hrs}h\`;
-      return \`\${prefix} \${days}d\`;
+      if (hrs < 1) return prefix + ' ' + mins + 'm';
+      if (days < 1) return prefix + ' ' + hrs + 'h';
+      return prefix + ' ' + days + 'd';
     }
 
     function ago(isoStr) {
@@ -650,8 +588,20 @@ export function buildDashboardHtml(version: string): string {
       const mins = Math.floor(diff / 60000);
       const hrs = Math.floor(diff / 3600000);
       if (mins < 1) return 'just now';
-      if (hrs < 1) return \`\${mins}m ago\`;
-      return \`\${hrs}h ago\`;
+      if (hrs < 1) return mins + 'm ago';
+      return hrs + 'h ago';
+    }
+
+    function fmtUptime() {
+      // We don't have server uptime directly in SSE — compute from page load as estimate
+      const el = document.getElementById('uptimeVal');
+      if (!el) return;
+      fetch('/health').then(r => r.json()).then(d => {
+        const s = Math.floor(d.uptime);
+        if (s < 60) el.textContent = s + 's';
+        else if (s < 3600) el.textContent = Math.floor(s/60) + 'm';
+        else el.textContent = Math.floor(s/3600) + 'h ' + Math.floor((s%3600)/60) + 'm';
+      }).catch(() => {});
     }
 
     function setStatus(online) {
@@ -676,91 +626,78 @@ export function buildDashboardHtml(version: string): string {
         { label: 'This Month', d: data.month },
         { label: 'All Time', d: data.allTime },
       ];
-      document.getElementById('usageGrid').innerHTML = cards.map(({ label, d }) => {
-        const toolLine = d.totalToolCost > 0 ? \`<div class="usage-card-meta" style="margin-top:2px">+\${fmt(d.totalToolCost)} tools</div>\` : '';
-        return \`
-        <div class="usage-card">
-          <div class="usage-card-label">\${label}</div>
-          <div class="usage-card-cost">\${fmt(d.totalCost)}</div>
-          <div class="usage-card-meta">\${d.totalRequests} requests &middot; \${(d.totalInputTokens + d.totalOutputTokens).toLocaleString()} tokens</div>
-          \${toolLine}
-        </div>
-      \`;
+      document.getElementById('usageGrid').innerHTML = cards.map(function(c) {
+        var d = c.d;
+        var toolLine = d.totalToolCost > 0 ? '<div class="usage-card-meta" style="margin-top:2px">+' + fmt(d.totalToolCost) + ' tools</div>' : '';
+        return '<div class="usage-card">' +
+          '<div class="usage-card-label">' + c.label + '</div>' +
+          '<div class="usage-card-cost">' + fmt(d.totalCost) + '</div>' +
+          '<div class="usage-card-meta">' + d.totalRequests + ' requests &middot; ' + (d.totalInputTokens + d.totalOutputTokens).toLocaleString() + ' tokens</div>' +
+          toolLine +
+          '</div>';
       }).join('');
     }
 
     function renderSkills(data) {
-      const list = document.getElementById('skillsList');
+      var list = document.getElementById('skillsList');
       document.getElementById('skillsBadge').textContent = data.skills.length;
       if (!data.skills.length) {
         list.innerHTML = '<li class="empty">No skills installed</li>';
         return;
       }
-      list.innerHTML = data.skills.map(s => \`
-        <li class="skill-row">
-          <div class="skill-icon">\${SKILL_ICONS[s.source] ?? '◆'}</div>
-          <div class="skill-body">
-            <div class="skill-name">\${esc(s.name)}</div>
-            <div class="skill-desc">\${esc(s.description)}</div>
-          </div>
-          <span class="skill-source source-\${esc(s.source)}">\${esc(s.source)}</span>
-        </li>
-      \`).join('');
+      list.innerHTML = data.skills.map(function(s) {
+        return '<li class="skill-row">' +
+          '<div class="skill-icon">' + (SKILL_ICONS[s.source] || '◆') + '</div>' +
+          '<div class="skill-body">' +
+          '<div class="skill-name">' + esc(s.name) + '</div>' +
+          '<div class="skill-desc">' + esc(s.description) + '</div>' +
+          '</div>' +
+          '<span class="skill-source source-' + esc(s.source) + '">' + esc(s.source) + '</span>' +
+          '</li>';
+      }).join('');
     }
 
     function renderTasks(data) {
-      const list = document.getElementById('tasksList');
+      var list = document.getElementById('tasksList');
       document.getElementById('tasksBadge').textContent = data.tasks.length;
       if (!data.tasks.length) {
         list.innerHTML = '<li class="empty">No scheduled tasks</li>';
         return;
       }
-      list.innerHTML = data.tasks.map(t => \`
-        <li class="task-row">
-          <span class="task-type type-\${esc(t.type)}">\${esc(t.type)}</span>
-          <span class="task-desc">\${esc(t.description)}</span>
-          <span class="task-time">\${relTime(t.nextRunAt)}</span>
-        </li>
-      \`).join('');
+      list.innerHTML = data.tasks.map(function(t) {
+        return '<li class="task-row">' +
+          '<span class="task-type type-' + esc(t.type) + '">' + esc(t.type) + '</span>' +
+          '<span class="task-desc">' + esc(t.description) + '</span>' +
+          '<span class="task-time">' + relTime(t.nextRunAt) + '</span>' +
+          '</li>';
+      }).join('');
     }
 
     async function killAgent(sessionKey) {
       await fetch('/api/spawns?session=' + encodeURIComponent(sessionKey), { method: 'DELETE' });
     }
 
-    function renderSpawnLog(sessionKey) {
-      const lines = subagentLogs.get(sessionKey) ?? [];
-      if (!lines.length) return '';
-      const html = lines.slice(-8).map(l => {
-        const t = new Date(l.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-        return \`<div class="spawn-log-line"><span class="spawn-log-ts">\${t}</span><span class="spawn-log-msg">\${esc(l.message)}</span></div>\`;
-      }).join('');
-      return \`<div class="spawn-log">\${html}</div>\`;
-    }
-
     function renderSpawns(spawns) {
-      const list = document.getElementById('spawnsList');
+      var list = document.getElementById('spawnsList');
       document.getElementById('spawnsBadge').textContent = spawns.length;
       if (!spawns.length) {
         list.innerHTML = '<li class="empty">No sub-agents spawned yet</li>';
         return;
       }
-      list.innerHTML = spawns.slice(0, 20).map(s => \`
-        <li>
-          <div class="spawn-row">
-            <span class="spawn-status" style="color:\${SPAWN_COLOR[s.status] ?? 'var(--muted)'}">\${SPAWN_STATUS[s.status] ?? '·'}</span>
-            <span class="spawn-name">\${esc(s.name)}</span>
-            <span class="spawn-tools">\${esc(s.toolsUsed.join(', ') || '—')}</span>
-            <span class="spawn-meta">\${s.cost > 0 ? '$' + s.cost.toFixed(4) : ''} \${ago(s.startedAt)}</span>
-            \${s.status === 'running' ? \`<button class="kill-btn" onclick="killAgent('\${esc(s.sessionKey)}')">kill</button>\` : ''}
-          </div>
-          \${s.status === 'running' ? renderSpawnLog(s.sessionKey) : ''}
-        </li>
-      \`).join('');
+      list.innerHTML = spawns.slice(0, 20).map(function(s) {
+        var durationStr = s.durationMs > 0 ? (s.durationMs / 1000).toFixed(1) + 's' : '';
+        return '<li class="spawn-row">' +
+          '<span class="spawn-status" style="color:' + (SPAWN_COLOR[s.status] || 'var(--muted)') + '">' + (SPAWN_STATUS[s.status] || '·') + '</span>' +
+          '<span class="spawn-name">' + esc(s.name) + '</span>' +
+          '<span class="spawn-tools">' + esc(s.toolsUsed.join(', ') || '—') + '</span>' +
+          '<span class="spawn-meta">' + (s.cost > 0 ? '$' + s.cost.toFixed(4) + ' ' : '') + (durationStr ? durationStr + ' ' : '') + ago(s.startedAt) + '</span>' +
+          (s.status === 'running' ? '<button class="kill-btn" onclick="killAgent(\\'' + esc(s.sessionKey) + '\\')">kill</button>' : '') +
+          '</li>';
+      }).join('');
     }
 
     function updateSpawnEntry(entry) {
-      const idx = spawnList.findIndex(s => s.sessionKey === entry.sessionKey);
+      var idx = spawnList.findIndex(function(s) { return s.sessionKey === entry.sessionKey; });
       if (idx >= 0) {
         spawnList[idx] = entry;
       } else {
@@ -770,110 +707,35 @@ export function buildDashboardHtml(version: string): string {
       renderSpawns(spawnList);
     }
 
-    function renderMemory(samples) {
-      if (!samples.length) return;
-      const latest = samples[samples.length - 1];
-      document.getElementById('ramHeap').textContent = latest.heapMB + ' MB';
-      document.getElementById('ramRss').textContent = latest.rssMB + ' MB';
-      document.getElementById('ramExt').textContent = latest.externalMB + ' MB';
-      document.getElementById('ramBadge').textContent = latest.rssMB + ' MB RSS';
-
-      const W = 600, H = 60, PAD = 4;
-      const vals = samples.map(s => s.heapMB);
-      const min = Math.min(...vals);
-      const max = Math.max(...vals) || 1;
-      const pts = vals.map((v, i) => {
-        const x = PAD + (i / Math.max(vals.length - 1, 1)) * (W - PAD * 2);
-        const y = H - PAD - ((v - min) / (max - min || 1)) * (H - PAD * 2);
-        return \`\${x.toFixed(1)},\${y.toFixed(1)}\`;
-      }).join(' ');
-      document.getElementById('ramChart').innerHTML = \`
-        <polyline points="\${pts}" fill="none" stroke="var(--accent)" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>
-        <text x="\${PAD + 2}" y="\${H - PAD - 2}" fill="var(--muted)" font-size="9" font-family="monospace">\${min.toFixed(0)} MB</text>
-        <text x="\${W - PAD - 30}" y="12" fill="var(--muted)" font-size="9" font-family="monospace">\${max.toFixed(0)} MB</text>
-      \`;
-    }
-
-    // Full refresh for slow-changing data (usage, skills, tasks, initial spawns + memory)
     async function refresh() {
       try {
-        const [usage, skills, tasks, spawns, memory] = await Promise.all([
-          fetch('/api/usage').then(r => r.json()),
-          fetch('/api/skills').then(r => r.json()),
-          fetch('/api/tasks').then(r => r.json()),
-          fetch('/api/spawns').then(r => r.json()),
-          fetch('/api/memory').then(r => r.json()),
+        var results = await Promise.all([
+          fetch('/api/usage').then(function(r) { return r.json(); }),
+          fetch('/api/skills').then(function(r) { return r.json(); }),
+          fetch('/api/tasks').then(function(r) { return r.json(); }),
+          fetch('/api/spawns').then(function(r) { return r.json(); }),
         ]);
-        renderUsage(usage);
-        renderSkills(skills);
-        renderTasks(tasks);
-
-        // Seed client-side spawn list
-        spawnList = spawns.spawns ?? [];
+        renderUsage(results[0]);
+        renderSkills(results[1]);
+        renderTasks(results[2]);
+        spawnList = results[3].spawns || [];
         renderSpawns(spawnList);
-
-        // Seed client-side memory ring buffer
-        const incoming = memory.samples ?? [];
-        for (const s of incoming) {
-          memSamples.push(s);
-          if (memSamples.length > MEM_MAX) memSamples.shift();
-        }
-        renderMemory(memSamples);
-
-        const now = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+        fmtUptime();
+        var now = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
         document.getElementById('refreshInfo').textContent = 'updated ' + now;
       } catch (e) {
         document.getElementById('refreshInfo').textContent = 'fetch error';
       }
     }
 
-    // SSE connection — replaces setInterval polling
     function connectSSE() {
-      const es = new EventSource('/api/events');
-
-      es.onopen = () => setStatus(true);
-      es.onerror = () => setStatus(false);
-
-      // init: triggered once on connect — do a full data refresh
-      es.addEventListener('init', () => {
-        refresh();
-      });
-
-      // heartbeat: every 30 s — refresh slow-changing data
-      es.addEventListener('heartbeat', () => {
-        refresh();
-      });
-
-      // memory: every 5 s — update RAM panel instantly, no full fetch needed
-      es.addEventListener('memory', (e) => {
-        try {
-          const sample = JSON.parse(e.data);
-          memSamples.push(sample);
-          if (memSamples.length > MEM_MAX) memSamples.shift();
-          renderMemory(memSamples);
-          const now = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-          document.getElementById('refreshInfo').textContent = 'live · ' + now;
-        } catch {}
-      });
-
-      // spawn: on sub-agent status change — update spawn row instantly
-      es.addEventListener('spawn', (e) => {
-        try {
-          updateSpawnEntry(JSON.parse(e.data));
-        } catch {}
-      });
-
-      // subagent_update: live progress message from a running sub-agent
-      es.addEventListener('subagent_update', (e) => {
-        try {
-          const { sessionKey, message, ts } = JSON.parse(e.data);
-          if (!subagentLogs.has(sessionKey)) subagentLogs.set(sessionKey, []);
-          const lines = subagentLogs.get(sessionKey);
-          lines.push({ ts: ts ?? new Date().toISOString(), message });
-          if (lines.length > 50) lines.shift();
-          // Re-render spawns so the log panel updates in place
-          renderSpawns(spawnList);
-        } catch {}
+      var es = new EventSource('/api/events');
+      es.onopen = function() { setStatus(true); };
+      es.onerror = function() { setStatus(false); };
+      es.addEventListener('init', function() { refresh(); });
+      es.addEventListener('heartbeat', function() { refresh(); });
+      es.addEventListener('spawn', function(e) {
+        try { updateSpawnEntry(JSON.parse(e.data)); } catch(err) {}
       });
     }
 
@@ -881,4 +743,8 @@ export function buildDashboardHtml(version: string): string {
   </script>
 </body>
 </html>`;
+}
+
+function escapeHtml(text: string): string {
+  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
 }

@@ -1,25 +1,18 @@
 {
   "name": "koda",
-  "version": "2.1.0",
+  "version": "0.10.0",
   "type": "module",
   "scripts": {
     "start": "bun run src/index.ts",
     "dev": "bun --watch run src/index.ts",
     "cli": "KODA_MODE=cli-only bun run src/index.ts",
     "koda": "bun run src/cli.ts",
-    "test": "bun test",
-    "bench": "bun run bench/runner.ts --suite deterministic",
-    "bench:deterministic": "bun run bench/runner.ts --suite deterministic",
-    "bench:judge": "bun run bench/runner.ts --suite llm-judge",
-    "bench:all": "bun run bench/runner.ts --suite all",
-    "bench:ci": "bun run bench/runner.ts --suite deterministic --format json",
-    "bench:full": "bun run bench/runner.ts --suite all --format json"
+    "test": "bun test"
   },
   "dependencies": {
     "@ai-sdk/mcp": "^1.0.21",
     "@clack/prompts": "^0.9.1",
     "@openrouter/ai-sdk-provider": "^2.1.1",
-    "@supermemory/tools": "^1.4.0",
     "ai": "^6.0.0",
     "chalk": "^5.4.1",
     "exa-js": "^2.4.0",
@@ -27,6 +20,7 @@
     "ollama-ai-provider": "^1.2.0",
     "ora": "^8.2.0",
     "supermemory": "^4.0.0",
+    "pdf-parse": "^1.1.1",
     "zod": "^4.3.0"
   },
   "engines": {

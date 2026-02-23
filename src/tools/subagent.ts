@@ -63,7 +63,6 @@ export function killSpawn(sessionKey: string): boolean {
   if (!ac) return false;
   ac.abort();
   dbSubagents.markCompleted(sessionKey, { status: "killed", toolsUsed: [], cost: 0, durationMs: 0 });
-  const entry = dbSubagents.getByName(""); // Emit updated state
   const updated = dbSubagents.listRecent(1).find((r) => r.sessionKey === sessionKey);
   if (updated) emit("spawn", updated);
   return true;

@@ -19,12 +19,15 @@ import { registerSoulTools, SoulLoader } from "./soul.js";
 import { registerStatusTools } from "./status.js";
 import { registerSkillShopTools } from "./skillshop.js";
 import { registerSandboxTools } from "./sandbox.js";
+import { registerImageTools } from "./image.js";
+import { registerFileTools } from "./files.js";
 
 interface ToolRuntimeContext {
   userId: string;
   chatId: string;
   channel: string;
   toolCost: { total: number };
+  pendingFiles: Array<{ path: string; caption?: string }>;
 }
 
 const DEFAULT_CONTEXT: ToolRuntimeContext = {
@@ -32,6 +35,7 @@ const DEFAULT_CONTEXT: ToolRuntimeContext = {
   chatId: "owner",
   channel: "cli",
   toolCost: { total: 0 },
+  pendingFiles: [],
 };
 
 const toolContextStore = new AsyncLocalStorage<ToolRuntimeContext>();
@@ -48,6 +52,18 @@ function getToolContext(): ToolRuntimeContext {
 export function addToolCost(amount: number): void {
   const ctx = toolContextStore.getStore();
   if (ctx) ctx.toolCost.total += amount;
+}
+
+/** Add a file to send after agent completes. */
+export function addPendingFile(path: string, caption?: string): void {
+  const ctx = toolContextStore.getStore();
+  if (ctx) ctx.pendingFiles.push({ path, caption });
+}
+
+/** Get pending files from current context (called by agent after completion). */
+export function getPendingFiles(): Array<{ path: string; caption?: string }> {
+  const ctx = toolContextStore.getStore();
+  return ctx?.pendingFiles ?? [];
 }
 
 export async function buildTools(deps: {
@@ -73,7 +89,7 @@ export async function buildTools(deps: {
     Object.assign(tools, registerSearchTools({
       apiKey: config.exa.apiKey,
       numResults: config.exa.numResults,
-      onCost: (amount) => { getToolContext().toolCost.total += amount; },
+      onCost: addToolCost,
     }));
     Object.assign(tools, registerSkillShopTools({ exaApiKey: config.exa.apiKey, workspace, githubToken: config.github?.token }));
   }
@@ -96,6 +112,16 @@ export async function buildTools(deps: {
 
   // Safe sandbox (async — checks Docker availability at boot)
   Object.assign(tools, await registerSandboxTools({ workspace }));
+
+  // Image generation
+  Object.assign(tools, registerImageTools({
+    apiKey: config.openrouter.apiKey,
+    model: config.openrouter.imageModel,
+    onCost: addToolCost,
+  }));
+
+  // File sending
+  Object.assign(tools, registerFileTools({ workspace }));
 
   return tools;
 }
