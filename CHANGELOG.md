@@ -5,6 +5,70 @@ all notable changes to koda.
 ---
 
 ## 2026-02-23
+### v0.12.0 — scheduler hardening, task tracking, delimiter fix, context.md, token trim, request IDs, skills
+
+hardening pass before 1.0. scheduler now skips stale one-shots (30 min grace window), tracks consecutive task failures and auto-disables after 3, and delays first tick to avoid race conditions on restart. message delimiter is properly protected inside code blocks and stripped from conversation history. workspace context loading via CONTEXT.md, token-based history trimming, request IDs for log tracing, and 4 new built-in skills.
+
+#### added
+
+- **task failure tracking** — `last_status` and `consecutive_failures` columns on tasks table (migration v4). `markResult()` helper tracks ok/error after each scheduled agent run. tasks auto-disable after 3 consecutive failures with user notification.
+- **scheduler grace window** — one-shot reminders older than 30 minutes are skipped on restart instead of firing stale. 5-second boot delay prevents race between `catchUp()` and first tick.
+- **`splitOnDelimiter()` export** — code-block-aware message splitting. protects `<|msg|>` inside fenced and inline code blocks from being split. used by telegram, repl, and streaming channels.
+- **CONTEXT.md support** — place a `CONTEXT.md` file in your workspace (`~/.koda/CONTEXT.md`) to inject project context into every system prompt. hot-reloads on file change with 300ms debounce.
+- **token-based history trim** — replaces fixed message count (24) with estimated token budget (6000 tokens ≈ 24k chars). keeps more short messages, trims fewer long ones.
+- **request IDs** — every agent request gets an 8-char UUID prefix in logs (e.g. `[a1b2c3d4]`). sub-agents use `[sub-xxxxxxxx]` prefix. threads through all downstream log calls.
+- **4 new built-in skills** — `code-review`, `summarize-url`, `deep-research`, `task-breakdown`. follows existing SKILL.md format.
+
+#### changed
+
+- **delimiter handling** — `<|msg|>` references removed from soul.md, response.md, DEFAULT_SOUL, generateDefault(), createDefaultSoulDir(). `buildSystemPrompt` in agent.ts remains the single source of truth for delimiter instructions. delimiters are now stripped from conversation history before DB storage and memory ingestion.
+- **streaming split** — telegram streaming now tracks code block fence count and only splits buffer when outside code blocks.
+
+#### config
+
+- **version**: `0.11.0` → `0.12.0`
+
+---
+
+## 2026-02-23
+### v0.11.0 — voice, memory cleanup, scheduler fix, tiered prompt, skills merge, sub-agent improvements
+
+hardening pass. voice notes via Gemini Flash transcription, Supermemory as sole memory provider (local/stub removed), scheduler double-fire race condition fixed, token savings via tiered system prompts, skills+skillshop merged into one tool, and sub-agents get tier/context/timeout control.
+
+#### added
+
+- **voice message transcription** — send voice messages or circle videos in Telegram. audio is transcribed via Gemini Flash (OpenRouter `input_audio` content part) and passed to the agent as `[voice message]` text.
+- **tiered system prompt** — fast tier gets an abbreviated system prompt (~800-1000 fewer tokens): no XML time tags, no workspace path, one-line delimiter rules, skills summary skipped.
+- **sub-agent tier control** — `spawnAgent` accepts optional `tier` param to force sub-agent to fast or deep tier.
+- **sub-agent context passing** — `spawnAgent` accepts optional `context` param to share relevant conversation context with the child agent.
+- **sub-agent custom timeout** — `spawnAgent` accepts optional `timeoutMs` (10s–5min) for per-spawn timeout control.
+- **sub-agent writeFile** — `writeFile` added to default sub-agent tool allowlist.
+
+#### changed
+
+- **memory: Supermemory-only** — removed local embeddings provider (Ollama + cosine similarity), stub provider (SQLite keyword fallback), `setMemoryTimeout()`, `ollamaEmbed()`, `cosineSimilarity()`. factory now returns Supermemory or a graceful no-op.
+- **skills + skillshop merged** — single `skills` tool with 6 actions: list, load, create, search, preview, install. `skillshop.ts` deleted. Exa import is conditional (search/preview/install gracefully fail without key).
+- **scheduler race fix** — recurring tasks now advance `next_run_at` BEFORE running the agent (prevents double-fire when tick fires again during async agent execution). Agent call is fire-and-forget.
+- **sub-agent system prompt** — restructured with ## headers (Your task, Context from parent, Rules) for clarity.
+
+#### removed
+
+- `src/tools/skillshop.ts` — merged into `src/tools/skills.ts`
+- `vector_memories` table — removed from schema, migration v2, and exports
+- `embeddings` config block — removed from Zod schema
+- `setMemoryTimeout()` export — no longer needed
+- `createLocalMemoryProvider()` — removed
+- `createStubMemoryProvider()` — removed
+- `skillShop` from sub-agent ALWAYS_BLOCKED — tool no longer exists
+
+#### config
+
+- **removed**: `embeddings` block (was: `enabled`, `ollamaUrl`, `model`, `maxMemories`)
+- **version**: `0.10.0` → `0.11.0`
+
+---
+
+## 2026-02-23
 ### v0.10.0 — feature pass
 
 substantial feature release filling real gaps before 1.0. koda now handles documents, respects reply context, generates images, sends files, backs up its database, supports webhook mode, and has a cleaner dashboard.

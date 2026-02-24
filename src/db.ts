@@ -1,7 +1,7 @@
 /**
  * SQLite persistence layer via bun:sqlite.
  *
- * Tables: messages, tasks, usage, state, subagents, vector_memories (learnings dropped in v0.9.0)
+ * Tables: messages, tasks, usage, state, subagents
  * WAL mode for concurrent reads.
  */
 
@@ -15,7 +15,7 @@ let stmtAppendMessage: ReturnType<Database["prepare"]> | null = null;
 let stmtGetHistory: ReturnType<Database["prepare"]> | null = null;
 let stmtTrackUsage: ReturnType<Database["prepare"]> | null = null;
 
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 
 export function initDb(dbPath: string): Database {
   currentDbPath = dbPath;
@@ -84,14 +84,6 @@ export function initDb(dbPath: string): Database {
     CREATE INDEX IF NOT EXISTS idx_subagents_name ON subagents(name, updated_at DESC);
     CREATE INDEX IF NOT EXISTS idx_subagents_updated ON subagents(updated_at DESC);
 
-    CREATE TABLE IF NOT EXISTS vector_memories (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id TEXT NOT NULL,
-      content TEXT NOT NULL,
-      embedding BLOB NOT NULL,
-      created_at TEXT NOT NULL DEFAULT (datetime('now'))
-    );
-    CREATE INDEX IF NOT EXISTS idx_vector_user ON vector_memories(user_id, id DESC);
   `);
 
   stmtAppendMessage = db.prepare("INSERT INTO messages (session_key, role, content, tools_used) VALUES (?, ?, ?, ?)");
@@ -132,15 +124,6 @@ function runMigrations(database: Database): void {
       );
       CREATE INDEX IF NOT EXISTS idx_subagents_name ON subagents(name, updated_at DESC);
       CREATE INDEX IF NOT EXISTS idx_subagents_updated ON subagents(updated_at DESC);
-
-      CREATE TABLE IF NOT EXISTS vector_memories (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id TEXT NOT NULL,
-        content TEXT NOT NULL,
-        embedding BLOB NOT NULL,
-        created_at TEXT NOT NULL DEFAULT (datetime('now'))
-      );
-      CREATE INDEX IF NOT EXISTS idx_vector_user ON vector_memories(user_id, id DESC);
     `);
     database.run(
       "INSERT OR REPLACE INTO state (key, value, updated_at) VALUES ('schema_version', '2', datetime('now'))",
@@ -159,6 +142,13 @@ function runMigrations(database: Database): void {
       "INSERT OR REPLACE INTO state (key, value, updated_at) VALUES ('schema_version', '3', datetime('now'))",
     );
     console.log("[db] Migrated to schema version 3");
+  }
+
+  if (currentVersion < 4) {
+    try { database.exec("ALTER TABLE tasks ADD COLUMN last_status TEXT DEFAULT NULL"); } catch {}
+    try { database.exec("ALTER TABLE tasks ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0"); } catch {}
+    database.run("INSERT OR REPLACE INTO state (key, value, updated_at) VALUES ('schema_version', '4', datetime('now'))");
+    console.log("[db] Migrated to schema version 4");
   }
 }
 
@@ -244,13 +234,22 @@ export const tasks = {
     insertAll();
   },
 
+  markResult(id: string, status: "ok" | "error"): void {
+    if (status === "ok") {
+      getDb().run("UPDATE tasks SET last_status = 'ok', consecutive_failures = 0 WHERE id = ?", [id]);
+    } else {
+      getDb().run("UPDATE tasks SET last_status = 'error', consecutive_failures = consecutive_failures + 1 WHERE id = ?", [id]);
+    }
+  },
+
   getReady(now: string): Array<{
     id: string; userId: string; chatId: string; channel: string;
     type: string; description: string; prompt: string | null; cron: string | null;
     nextRunAt: string; oneShot: boolean; lastRunAt: string | null;
+    lastStatus: string | null; consecutiveFailures: number;
   }> {
     return (getDb()
-      .query("SELECT id, user_id as userId, chat_id as chatId, channel, type, description, prompt, cron, next_run_at as nextRunAt, one_shot as oneShot, last_run_at as lastRunAt FROM tasks WHERE enabled = 1 AND next_run_at <= ? ORDER BY next_run_at ASC")
+      .query("SELECT id, user_id as userId, chat_id as chatId, channel, type, description, prompt, cron, next_run_at as nextRunAt, one_shot as oneShot, last_run_at as lastRunAt, last_status as lastStatus, consecutive_failures as consecutiveFailures FROM tasks WHERE enabled = 1 AND next_run_at <= ? ORDER BY next_run_at ASC")
       .all(now) as Array<any>).map((r) => ({ ...r, oneShot: r.oneShot === 1 }));
   },
 
@@ -273,9 +272,10 @@ export const tasks = {
   listByUser(userId: string): Array<{
     id: string; type: string; description: string; cron: string | null;
     nextRunAt: string; lastRunAt: string | null;
+    lastStatus: string | null; consecutiveFailures: number;
   }> {
     return getDb()
-      .query("SELECT id, type, description, cron, next_run_at as nextRunAt, last_run_at as lastRunAt FROM tasks WHERE user_id = ? AND enabled = 1 ORDER BY next_run_at")
+      .query("SELECT id, type, description, cron, next_run_at as nextRunAt, last_run_at as lastRunAt, last_status as lastStatus, consecutive_failures as consecutiveFailures FROM tasks WHERE user_id = ? AND enabled = 1 ORDER BY next_run_at")
       .all(userId) as any[];
   },
 };
@@ -371,39 +371,6 @@ export const subagents = {
 
   getRunning(): SpawnRow[] {
     return subagents.listRecent(200).filter((r) => r.status === "running");
-  },
-};
-
-// --- Vector memories ---
-
-export const vectorMemories = {
-  insert(userId: string, content: string, embedding: Float32Array): void {
-    const blob = Buffer.from(embedding.buffer, embedding.byteOffset, embedding.byteLength);
-    getDb().run(
-      "INSERT INTO vector_memories (user_id, content, embedding) VALUES (?, ?, ?)",
-      [userId, content, blob],
-    );
-  },
-
-  listByUser(userId: string): Array<{ id: number; content: string; embedding: Buffer }> {
-    return getDb()
-      .query("SELECT id, content, embedding FROM vector_memories WHERE user_id = ? ORDER BY id DESC")
-      .all(userId) as any[];
-  },
-
-  count(userId: string): number {
-    const row = getDb()
-      .query("SELECT COUNT(*) as cnt FROM vector_memories WHERE user_id = ?")
-      .get(userId) as { cnt: number } | null;
-    return row?.cnt ?? 0;
-  },
-
-  deleteOldest(userId: string, keepCount: number): void {
-    getDb().run(
-      `DELETE FROM vector_memories WHERE user_id = ? AND id NOT IN
-       (SELECT id FROM vector_memories WHERE user_id = ? ORDER BY id DESC LIMIT ?)`,
-      [userId, userId, keepCount],
-    );
   },
 };
 

@@ -10,6 +10,8 @@ import { parseCronNext } from "./time.js";
 import { log } from "./log.js";
 
 const NEAR_TERM_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes
+const GRACE_WINDOW_MS = 30 * 60 * 1000;  // skip one-shots older than 30 min
+const BOOT_DELAY_MS = 5_000;              // wait 5s before first tick
 
 // Module-level nudge — allows schedule tools to trigger a precise check for near-term reminders
 let _checkTasksFn: (() => Promise<void>) | null = null;
@@ -42,13 +44,20 @@ export interface ProactiveDeps {
 
 export function startProactive(deps: ProactiveDeps): { stop: () => void } {
   const { config } = deps;
+  let booted = false;
 
-  // Catch-up: fire missed one-shot reminders on startup
+  // Catch-up: fire missed one-shot reminders on startup (skip stale ones)
   const catchUp = async () => {
     const now = new Date();
     const ready = dbTasks.getReady(now.toISOString());
     for (const task of ready) {
       if (task.oneShot) {
+        const ageMs = now.getTime() - new Date(task.nextRunAt).getTime();
+        if (ageMs > GRACE_WINDOW_MS) {
+          log("proactive", "stale one-shot skipped: %s (age %dmin)", task.description, Math.round(ageMs / 60_000));
+          dbTasks.delete(task.id);
+          continue;
+        }
         const text = `${task.prompt ?? task.description} (delayed)`;
         await deps.sendDirect(task.channel, task.chatId, text);
         dbMessages.append(`${task.channel}_${task.chatId}`, "assistant", text);
@@ -61,9 +70,11 @@ export function startProactive(deps: ProactiveDeps): { stop: () => void } {
         dbTasks.advance(task.id, nextRun.toISOString());
       }
     }
+    booted = true;
   };
 
   const checkTasks = async () => {
+    if (!booted) return;
     const now = new Date();
     const ready = dbTasks.getReady(now.toISOString());
 
@@ -75,24 +86,34 @@ export function startProactive(deps: ProactiveDeps): { stop: () => void } {
         dbMessages.append(`${task.channel}_${task.chatId}`, "assistant", text);
         dbTasks.delete(task.id);
       } else {
-        // Recurring: run through agent
-        await deps.runAgent({
+        // Recurring: advance next_run_at FIRST to prevent double-fire
+        if (task.cron) {
+          const nextRun = parseCronNext(task.cron, now, config.scheduler.timezone);
+          dbTasks.advance(task.id, nextRun.toISOString());
+        }
+        // Fire and track — don't block the tick loop
+        deps.runAgent({
           content: `[scheduled task] ${task.prompt}`,
           senderId: task.userId,
           chatId: task.chatId,
           channel: task.channel,
           sessionKey: `${task.channel}_${task.chatId}`,
           source: "scheduler",
-        });
-
-        if (task.cron) {
-          const nextRun = parseCronNext(task.cron, now, config.scheduler.timezone);
-          dbTasks.advance(task.id, nextRun.toISOString());
-        }
+        })
+          .then(() => { dbTasks.markResult(task.id, "ok"); })
+          .catch((err) => {
+            console.error("[proactive] Agent error:", err);
+            dbTasks.markResult(task.id, "error");
+            if ((task.consecutiveFailures ?? 0) + 1 >= 3) {
+              dbTasks.disable(task.id);
+              deps.sendDirect(task.channel, task.chatId,
+                `yo heads up — i auto-disabled the task "${task.description}" after 3 failures in a row. you can re-enable it if you want.`
+              ).catch(() => {});
+            }
+          });
       }
     }
     log("proactive", "tick");
-
   };
 
   const tick = async () => {
@@ -108,11 +129,12 @@ export function startProactive(deps: ProactiveDeps): { stop: () => void } {
     if (config.features.scheduler) await catchUp();
   })();
 
-  tick().catch(console.error);
+  const bootTimer = setTimeout(() => tick().catch(console.error), BOOT_DELAY_MS);
   const timer = setInterval(() => tick().catch(console.error), config.proactive.tickIntervalMs);
 
   return {
     stop: () => {
+      clearTimeout(bootTimer);
       clearInterval(timer);
       _checkTasksFn = null;
       for (const t of _pendingTimers) clearTimeout(t);

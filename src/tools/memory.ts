@@ -1,19 +1,13 @@
 /**
- * Memory tools — dual-provider: Supermemory cloud or local SQLite + Ollama embeddings.
+ * Memory tools — Supermemory cloud provider with circuit-breaker.
  *
- * Provider selection (in priority order):
- *   1. Local embeddings  — if config.embeddings.enabled (Ollama + cosine similarity)
- *   2. Supermemory cloud — if config.supermemory.apiKey is set
- *   3. Stub (SQLite keyword fallback) — if neither is configured
- *
- * All providers implement the same MemoryProvider interface, so the rest of the
- * codebase is completely unaware of which backend is active.
+ * If no Supermemory API key is configured, memory is gracefully disabled (no-op).
  */
 
 import { tool, type ToolSet } from "ai";
 import { z } from "zod";
 import Supermemory from "supermemory";
-import { messages as dbMessages, state as dbState, vectorMemories } from "../db.js";
+import { messages as dbMessages, state as dbState } from "../db.js";
 import { log } from "../log.js";
 import type { Config } from "../config.js";
 
@@ -38,7 +32,7 @@ export interface MemoryProvider {
 }
 
 // ============================================================
-// Provider 1: Supermemory (cloud, circuit-breaker guarded)
+// Supermemory (cloud, circuit-breaker guarded)
 // ============================================================
 
 let failures = 0;
@@ -201,177 +195,24 @@ Skip:
 }
 
 // ============================================================
-// Provider 2: Local (Ollama embeddings + SQLite + cosine sim)
-// ============================================================
-
-function cosineSimilarity(a: Float32Array, b: Float32Array): number {
-  let dot = 0, normA = 0, normB = 0;
-  for (let i = 0; i < a.length; i++) {
-    dot += a[i]! * b[i]!;
-    normA += a[i]! * a[i]!;
-    normB += b[i]! * b[i]!;
-  }
-  return dot / (Math.sqrt(normA * normB) || 1);
-}
-
-let memoryTimeoutMs = 10_000;
-
-/** Set the memory operation timeout from config. Called once at boot. */
-export function setMemoryTimeout(ms: number): void {
-  memoryTimeoutMs = ms;
-}
-
-async function ollamaEmbed(ollamaUrl: string, model: string, text: string): Promise<Float32Array> {
-  const res = await fetch(`${ollamaUrl}/api/embeddings`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ model, prompt: text }),
-    signal: AbortSignal.timeout(memoryTimeoutMs),
-  });
-  if (!res.ok) throw new Error(`Ollama embed HTTP ${res.status}`);
-  const data = await res.json() as { embedding: number[] };
-  if (!Array.isArray(data.embedding)) throw new Error("Ollama embed: missing embedding field");
-  return new Float32Array(data.embedding);
-}
-
-function createLocalMemoryProvider(ollamaUrl: string, embeddingModel: string, maxMemoriesPerUser: number): MemoryProvider {
-  async function storeVec(userId: string, content: string): Promise<void> {
-    const vec = await ollamaEmbed(ollamaUrl, embeddingModel, content);
-    vectorMemories.insert(userId, content, vec);
-    if (vectorMemories.count(userId) > maxMemoriesPerUser) {
-      vectorMemories.deleteOldest(userId, maxMemoriesPerUser);
-    }
-  }
-
-  async function recallVec(userId: string, query: string, limit: number): Promise<string[]> {
-    const queryVec = await ollamaEmbed(ollamaUrl, embeddingModel, query);
-    const rows = vectorMemories.listByUser(userId);
-    const scored = rows.map((row) => {
-      const emb = new Float32Array(row.embedding.buffer, row.embedding.byteOffset, row.embedding.byteLength / 4);
-      return { content: row.content, score: cosineSimilarity(queryVec, emb) };
-    });
-    scored.sort((a, b) => b.score - a.score);
-    return scored.slice(0, limit).map((r) => r.content);
-  }
-
-  return {
-    get isDegraded() { return false; },
-
-    async store(userId, content) {
-      try {
-        await storeVec(userId, content);
-        return { id: "local" };
-      } catch (err) {
-        console.error("[memory:local] store failed:", (err as Error).message);
-        return { id: "unavailable" };
-      }
-    },
-
-    async recall(userId, query, limit = 5) {
-      try {
-        return await recallVec(userId, query, limit);
-      } catch (err) {
-        console.error("[memory:local] recall failed:", (err as Error).message);
-        return [];
-      }
-    },
-
-    async getProfile(userId, query?) {
-      try {
-        const [staticResults, dynamicResults] = await Promise.all([
-          recallVec(userId, "user preferences background facts interests goals", 5),
-          query ? recallVec(userId, query, 5) : Promise.resolve([]),
-        ]);
-        return { static: staticResults, dynamic: [], memories: dynamicResults };
-      } catch {
-        return { static: [], dynamic: [], memories: [] };
-      }
-    },
-
-    async ingestConversation(sessionKey, userId, msgs) {
-      const lastUser = [...msgs].reverse().find((m) => m.role === "user");
-      const lastAssistant = [...msgs].reverse().find((m) => m.role === "assistant");
-      if (!lastUser || !lastAssistant) return;
-      const summary = `Session ${sessionKey}:\nUser: ${lastUser.content.slice(0, 300)}\nKoda: ${lastAssistant.content.slice(0, 300)}`;
-      try {
-        await storeVec(userId, summary);
-        log("memory", "local ingest: stored for session %s", sessionKey);
-      } catch (err) {
-        console.error("[memory:local] ingest failed:", (err as Error).message);
-      }
-    },
-
-    async setupEntityContext() {
-      // No-op: local provider has no external entity context concept
-    },
-
-    async healthCheck() {
-      try {
-        const res = await fetch(`${ollamaUrl}/api/tags`, { signal: AbortSignal.timeout(2_000) });
-        return res.ok;
-      } catch {
-        return false;
-      }
-    },
-  };
-}
-
-// ============================================================
-// Provider 3: Stub (SQLite keyword search, no vector ops)
-// ============================================================
-
-function createStubMemoryProvider(): MemoryProvider {
-  return {
-    get isDegraded() { return true; },
-
-    async store() {
-      return { id: "unavailable" };
-    },
-
-    async recall(userId, query, limit = 5, sessionKey) {
-      const history = dbMessages.getHistory(sessionKey ?? `sqlite_${userId}`, 50);
-      const lower = query.toLowerCase();
-      return history
-        .filter((m) => m.content.toLowerCase().includes(lower))
-        .slice(0, limit)
-        .map((m) => m.content);
-    },
-
-    async getProfile(userId, query?, sessionKey?) {
-      const memories = query
-        ? (await this.recall(userId, query, 5, sessionKey))
-        : [];
-      return { static: [], dynamic: [], memories };
-    },
-
-    async ingestConversation() {
-      // No-op: stub cannot persist semantics without a vector store
-    },
-
-    async setupEntityContext() {},
-
-    async healthCheck() { return false; },
-  };
-}
-
-// ============================================================
-// Factory — selects provider based on config
+// Factory — Supermemory or disabled
 // ============================================================
 
 export function createMemoryProvider(config: Config): MemoryProvider {
-  if (config.embeddings?.enabled) {
-    const { ollamaUrl, model, maxMemories } = config.embeddings;
-    console.log(`[memory] Using local embeddings (Ollama: ${model} @ ${ollamaUrl})`);
-    return createLocalMemoryProvider(ollamaUrl, model, maxMemories);
+  if (!config.supermemory?.apiKey) {
+    console.warn("[memory] No Supermemory API key — memory disabled");
+    return {
+      get isDegraded() { return true; },
+      async store() { return { id: "unavailable" }; },
+      async recall() { return []; },
+      async getProfile() { return { static: [], dynamic: [], memories: [] }; },
+      async ingestConversation() {},
+      async setupEntityContext() {},
+      async healthCheck() { return false; },
+    };
   }
-
-  if (config.supermemory?.apiKey) {
-    console.log("[memory] Using Supermemory cloud provider");
-    return createSupermemoryProvider(config.supermemory.apiKey);
-  }
-
-  console.log("[memory] No vector store configured — using SQLite keyword fallback");
-  return createStubMemoryProvider();
+  console.log("[memory] Using Supermemory cloud provider");
+  return createSupermemoryProvider(config.supermemory.apiKey);
 }
 
 // ============================================================

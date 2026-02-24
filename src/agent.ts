@@ -28,6 +28,7 @@ export interface AgentInput {
   sessionKey: string;
   source?: string;
   tierOverride?: Tier;
+  requestId?: string;
   abortSignal?: AbortSignal;
   onAck?: (text: string) => void;
   onTypingStart?: () => void;
@@ -46,6 +47,7 @@ export interface AgentDeps {
   config: Config;
   tools: ToolSet;
   getSoulPrompt: () => string | null;
+  getContextPrompt: () => string | null;
   getSkillsSummary: () => Promise<string | null>;
   getProfile: (userId: string, query: string, sessionKey?: string) => Promise<UserProfile>;
   ingestConversation: (sessionKey: string, userId: string, messages: Array<{ role: string; content: string }>) => Promise<void>;
@@ -56,7 +58,17 @@ const ACK_TEMPLATES = [
   "on it - give me a sec to work through that.",
   "bet - i'll handle this and report back.",
 ];
-const MESSAGE_DELIMITER = "<|msg|>";
+export const MESSAGE_DELIMITER = "<|msg|>";
+
+export function splitOnDelimiter(text: string): string[] {
+  const PLACEHOLDER = "\x00DELIM\x00";
+  let safe = text;
+  safe = safe.replace(/```[\s\S]*?```/g, (block) => block.replaceAll(MESSAGE_DELIMITER, PLACEHOLDER));
+  safe = safe.replace(/`[^`]+`/g, (inline) => inline.replaceAll(MESSAGE_DELIMITER, PLACEHOLDER));
+  return safe.split(MESSAGE_DELIMITER)
+    .map((s) => s.replaceAll(PLACEHOLDER, MESSAGE_DELIMITER).trim())
+    .filter(Boolean);
+}
 
 let llmFailures = 0;
 let lastLlmFailure = 0;
@@ -90,21 +102,40 @@ export function isLlmCircuitOpen(): boolean {
 
 /**
  * Pre-flight history compaction — called BEFORE handing messages to generateText/streamText.
- * Keeps the most recent `maxMessages` messages and inserts a single placeholder for
- * everything older, so the SDK never sees a mid-run mutation of the array it holds.
+ * Trims by estimated token count (chars / 4) rather than fixed message count,
+ * so short messages are kept and long ones are trimmed more aggressively.
  */
-function trimHistory(messages: ModelMessage[], maxMessages = 24): ModelMessage[] {
-  if (messages.length <= maxMessages) return messages;
-  const removed = messages.length - maxMessages;
-  const kept = messages.slice(removed);
+const HISTORY_TOKEN_BUDGET = 6000;
+const CHARS_PER_TOKEN = 4;
+
+function trimHistory(messages: ModelMessage[], maxTokens = HISTORY_TOKEN_BUDGET): ModelMessage[] {
+  let totalChars = 0;
+  for (const msg of messages) {
+    totalChars += (typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content)).length;
+  }
+  if (totalChars / CHARS_PER_TOKEN <= maxTokens) return messages;
+
+  let removed = 0, charsRemoved = 0;
+  while (removed < messages.length - 1) {
+    if ((totalChars - charsRemoved) / CHARS_PER_TOKEN <= maxTokens) break;
+    const content = typeof messages[removed]!.content === "string"
+      ? messages[removed]!.content as string
+      : JSON.stringify(messages[removed]!.content);
+    charsRemoved += content.length;
+    removed++;
+  }
+  if (removed === 0) return messages;
+
   return [
     { role: "user" as const, content: `[${removed} earlier messages omitted — context trimmed for length]` },
-    ...kept,
+    ...messages.slice(removed),
   ];
 }
 
 function buildSystemPrompt(deps: {
+  tier: Tier;
   soulPrompt: string | null;
+  contextPrompt: string | null;
   skillsSummary: string | null;
   profile: UserProfile;
   isProfileDegraded: boolean;
@@ -118,7 +149,12 @@ function buildSystemPrompt(deps: {
 
   const parts: string[] = [];
 
-  parts.push(`## current time
+  if (deps.tier === "fast") {
+    parts.push(`current time: ${timeParts}, ${formatted}
+
+split replies with ${MESSAGE_DELIMITER}. keep messages short and casual. 1-2 sentences each.`);
+  } else {
+    parts.push(`## current time
 <current_time>
 time: ${timeParts}
 date: ${formatted}
@@ -141,8 +177,13 @@ rules:
 - 2-4 messages per reply is ideal
 - simple one-word or one-line answers don't need splitting
 - after using tools, still summarize what you did in a brief response`);
+  }
 
   if (deps.soulPrompt) parts.push(deps.soulPrompt);
+
+  if (deps.contextPrompt) {
+    parts.push(`## Project Context\n${deps.contextPrompt}`);
+  }
 
   if (deps.isProfileDegraded) {
     parts.push("## System Status\nMemory service is temporarily unavailable. Rely on conversation history only.");
@@ -181,7 +222,7 @@ you have the webSearch tool. use it whenever asked about:
 your training data is outdated. for anything time-sensitive — search first, answer second.`);
   }
 
-  if (deps.skillsSummary) {
+  if (deps.tier !== "fast" && deps.skillsSummary) {
     parts.push(`# Available Skills\n\nTo use a skill, read its SKILL.md file using the readFile tool.\n\n${deps.skillsSummary}`);
   }
 
@@ -204,14 +245,16 @@ function classifyAndAck(input: AgentInput, logPrefix: string): { tier: Tier; ski
 }
 
 /** Fetch profile + skills summary, build system prompt. */
-async function buildAgentContext(deps: AgentDeps, input: AgentInput, skipQuery: boolean): Promise<string> {
+async function buildAgentContext(deps: AgentDeps, input: AgentInput, tier: Tier, skipQuery: boolean): Promise<string> {
   const [profile, skillsSummary] = await Promise.all([
     deps.getProfile(input.senderId, skipQuery ? "" : input.content, input.sessionKey),
-    deps.getSkillsSummary(),
+    tier === "fast" ? Promise.resolve(null) : deps.getSkillsSummary(),
   ]);
 
   return buildSystemPrompt({
+    tier,
     soulPrompt: deps.getSoulPrompt(),
+    contextPrompt: deps.getContextPrompt(),
     skillsSummary,
     profile,
     isProfileDegraded: false,
@@ -302,10 +345,11 @@ function finalizeResult(
 
   const fallback = "aight that's handled.";
   const responseText = text || fallback;
+  const cleanedForHistory = responseText.replaceAll(MESSAGE_DELIMITER, " ").replace(/\s{2,}/g, " ");
   dbMessages.append(input.sessionKey, "user", input.content);
-  dbMessages.append(input.sessionKey, "assistant", responseText, uniqueTools);
+  dbMessages.append(input.sessionKey, "assistant", cleanedForHistory, uniqueTools);
 
-  const allMessages = [...history, { role: "user", content: input.content }, { role: "assistant", content: responseText }];
+  const allMessages = [...history, { role: "user", content: input.content }, { role: "assistant", content: cleanedForHistory }];
   deps.ingestConversation(input.sessionKey, input.senderId, allMessages).catch(() => {});
 
   const pendingFiles = getPendingFiles();
@@ -329,8 +373,11 @@ export function createAgent(deps: AgentDeps) {
   const tierOrder: Tier[] = ["fast", "deep"];
 
   return async function runAgent(input: AgentInput): Promise<AgentResult> {
-    const { tier, skipQuery } = classifyAndAck(input, "");
-    const systemPrompt = await buildAgentContext(deps, input, skipQuery);
+    const requestId = input.requestId ?? crypto.randomUUID().slice(0, 8);
+    const logPrefix = `[${requestId}] `;
+
+    const { tier, skipQuery } = classifyAndAck(input, logPrefix);
+    const systemPrompt = await buildAgentContext(deps, input, tier, skipQuery);
     const history = dbMessages.getHistory(input.sessionKey, 30);
     const messageList = trimHistory(buildMessages(input, history));
 
@@ -350,7 +397,7 @@ export function createAgent(deps: AgentDeps) {
         pendingFiles: [],
       }, async () => {
         const modelId = getModelId(state.currentTier, config);
-        log("agent", "model=%s session=%s", modelId, input.sessionKey);
+        log("agent", "%smodel=%s session=%s", logPrefix, modelId, input.sessionKey);
         const fallbackIds = FAILOVER[state.currentTier] ?? [];
         const model = provider(modelId, { models: fallbackIds });
 
@@ -367,8 +414,8 @@ export function createAgent(deps: AgentDeps) {
           maxOutputTokens: config.agent.maxTokens,
           temperature: config.agent.temperature,
           abortSignal: input.abortSignal,
-          prepareStep: makePrepareStep(provider, tierOrder, config, state, ""),
-          onStepFinish: makeOnStepFinish(toolsUsed, state, ""),
+          prepareStep: makePrepareStep(provider, tierOrder, config, state, logPrefix),
+          onStepFinish: makeOnStepFinish(toolsUsed, state, logPrefix),
         });
 
         llmFailures = 0;
@@ -376,7 +423,7 @@ export function createAgent(deps: AgentDeps) {
         const promptTokens = result.totalUsage?.inputTokens ?? result.usage?.inputTokens ?? 0;
         const completionTokens = result.totalUsage?.outputTokens ?? result.usage?.outputTokens ?? 0;
 
-        return finalizeResult(deps, input, history, state.currentTier, toolsUsed, result.text, finalModelId, promptTokens, completionTokens, "", toolCostRef.total);
+        return finalizeResult(deps, input, history, state.currentTier, toolsUsed, result.text, finalModelId, promptTokens, completionTokens, logPrefix, toolCostRef.total);
       });
     } catch (err) {
       console.error("[agent] LLM generate error:", err);
@@ -409,8 +456,11 @@ export function createStreamAgent(deps: AgentDeps) {
   const tierOrder: Tier[] = ["fast", "deep"];
 
   return async function streamAgent(input: AgentInput): Promise<StreamAgentResult> {
-    const { tier, skipQuery } = classifyAndAck(input, "stream ");
-    const systemPrompt = await buildAgentContext(deps, input, skipQuery);
+    const requestId = input.requestId ?? crypto.randomUUID().slice(0, 8);
+    const logPrefix = `[${requestId}] stream `;
+
+    const { tier, skipQuery } = classifyAndAck(input, logPrefix);
+    const systemPrompt = await buildAgentContext(deps, input, tier, skipQuery);
     const history = dbMessages.getHistory(input.sessionKey, 30);
     const messageList = trimHistory(buildMessages(input, history));
 
@@ -418,7 +468,7 @@ export function createStreamAgent(deps: AgentDeps) {
     const state = { currentTier: tier, stepCount: 0 };
 
     const modelId = getModelId(state.currentTier, config);
-    log("agent", "stream model=%s session=%s", modelId, input.sessionKey);
+    log("agent", "%smodel=%s session=%s", logPrefix, modelId, input.sessionKey);
     const fallbackIds = FAILOVER[state.currentTier] ?? [];
     const model = provider(modelId, { models: fallbackIds });
 
@@ -440,8 +490,8 @@ export function createStreamAgent(deps: AgentDeps) {
         stopWhen: stepCountIs(config.agent.maxSteps),
         maxOutputTokens: config.agent.maxTokens,
         temperature: config.agent.temperature,
-        prepareStep: makePrepareStep(provider, tierOrder, config, state, "stream "),
-        onStepFinish: makeOnStepFinish(toolsUsed, state, "stream "),
+        prepareStep: makePrepareStep(provider, tierOrder, config, state, logPrefix),
+        onStepFinish: makeOnStepFinish(toolsUsed, state, logPrefix),
         onError: ({ error }) => {
           console.error("[agent] Stream error:", error);
         },
@@ -455,7 +505,7 @@ export function createStreamAgent(deps: AgentDeps) {
         const promptTokens = (usage as any)?.inputTokens ?? 0;
         const completionTokens = (usage as any)?.outputTokens ?? 0;
 
-        return finalizeResult(deps, input, history, state.currentTier, toolsUsed, text, finalModelId, promptTokens, completionTokens, "stream ", toolCostRef.total);
+        return finalizeResult(deps, input, history, state.currentTier, toolsUsed, text, finalModelId, promptTokens, completionTokens, logPrefix, toolCostRef.total);
       },
     );
 

@@ -1,7 +1,7 @@
 <h1 align="center">koda</h1>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/v0.10.0-pre--release-10b981?style=flat-square" alt="v0.10.0" />
+  <img src="https://img.shields.io/badge/v0.12.0-pre--release-10b981?style=flat-square" alt="v0.12.0" />
   <img src="https://img.shields.io/badge/bun-runtime-f472b6?style=flat-square" alt="Bun" />
   <img src="https://img.shields.io/badge/typescript-strict-3178c6?style=flat-square" alt="TypeScript" />
   <img src="https://img.shields.io/badge/license-MIT-yellow?style=flat-square" alt="MIT" />
@@ -9,12 +9,12 @@
 
 <p align="center">
   a personal ai that actually feels personal.<br/>
-  <sub>remembers everything. browses the web. schedules tasks. delegates to sub-agents. reads documents. generates images. texts like a real one.</sub>
+  <sub>remembers everything. browses the web. schedules tasks. delegates to sub-agents. reads documents. transcribes voice. generates images. loads workspace context. texts like a real one.</sub>
 </p>
 
 ---
 
-a long-running ai assistant that connects to telegram or a local cli, routes every message through the right model for the job, remembers your preferences via semantic memory, creates its own skills, schedules reminders, browses the web, spawns sub-agents for parallel work, reads PDFs and documents, generates images, and replies like a real person.
+a long-running ai assistant that connects to telegram or a local cli, routes every message through the right model for the job, remembers your preferences via semantic memory, creates its own skills, schedules reminders, browses the web, spawns sub-agents for parallel work, reads PDFs and documents, transcribes voice messages, generates images, and replies like a real person.
 
 built on bun. runs on a $5 vps. no bloat.
 
@@ -42,15 +42,14 @@ you (telegram / cli)
    |  memory - search - sandbox  |
    |  filesystem - schedule      |
    |  skills - soul - status     |
-   |  subagent - skillshop       |
-   |  image - sendFile           |
+   |  subagent - image - sendFile|
    +------------------------------+
          |
          v
    +----------+
    |  sqlite   |  messages, tasks, usage,
-   |  wal mode |  state, subagents,
-   +----------+  vector_memories
+   |  wal mode |  state, subagents
+   +----------+
 ```
 
 the agent calls `generateText` or `streamText` with tools, the ai sdk handles the loop, and channels call `runAgent()` or `streamAgent()` directly. tool context (userId, chatId, channel) is threaded via AsyncLocalStorage so every tool knows who it's serving without passing state around.
@@ -94,7 +93,7 @@ create `~/.koda/.env`:
 KODA_OPENROUTER_API_KEY=sk-or-...
 KODA_TELEGRAM_TOKEN=123456:ABC...     # required unless cli-only
 KODA_EXA_API_KEY=...                  # optional — web search + skill shop
-KODA_SUPERMEMORY_API_KEY=...          # optional — cloud memory (local embeddings work without it)
+KODA_SUPERMEMORY_API_KEY=...          # optional — semantic memory (gracefully disabled without it)
 ```
 
 ## telegram commands
@@ -112,6 +111,7 @@ KODA_SUPERMEMORY_API_KEY=...          # optional — cloud memory (local embeddi
 
 ## features
 
+- **voice messages** — send voice messages or circle videos. koda transcribes them via Gemini Flash and responds.
 - **document ingestion** — send PDFs, text files (.txt, .md, .csv, .json, .html, .xml) directly in Telegram. koda extracts the text and responds in context.
 - **reply threading** — reply to any message and koda sees the original text as context.
 - **forwarded messages** — forward messages to koda and it knows who/where they came from.
@@ -127,12 +127,12 @@ KODA_SUPERMEMORY_API_KEY=...          # optional — cloud memory (local embeddi
 - **tool cost tracking** — external API costs (Exa, image generation) tracked separately from LLM costs.
 - **MCP** — connect external tool servers (Notion, GitHub, etc.) via `@ai-sdk/mcp`. stdio, SSE, and HTTP transports. auto-reconnect on crash.
 - **sub-agents** — spawn focused child agents for parallel work. isolated sessions, filtered tools, config-driven limits. live progress via `streamUpdate`. structured results via `returnResult`. addressable via `@AgentName: ...`.
-- **skill shop** — search and install community skills from GitHub. safety scoring before install.
 - **docker sandbox** — run untrusted code in isolated containers with hard resource limits.
-- **local embeddings** — optional vector memory via Ollama for fully offline operation.
 - **Ollama** — use local LLMs for fast tier when configured. falls back to OpenRouter when unavailable.
 - **soul personality** — editable `soul.md` + `soul.d/*.md` with filesystem watcher for hot-reload.
-- **memory provider selection** — automatic: local embeddings (Ollama) > Supermemory cloud > SQLite keyword fallback.
+- **workspace context** — place a `CONTEXT.md` in your workspace to inject project context into every system prompt. hot-reloads on change.
+- **request tracing** — every request gets an 8-char ID prefix in logs for easy tracing across agent and sub-agent calls.
+- **task failure tracking** — recurring tasks auto-disable after 3 consecutive failures with user notification.
 
 ## config reference
 
@@ -161,7 +161,6 @@ all fields are optional except `openrouter.apiKey` (via env var).
 | `ollama` | `enabled` | `false` | use local Ollama for fast tier |
 | `ollama` | `baseUrl` | `http://localhost:11434` | Ollama server URL |
 | `ollama` | `model` | `llama3.2` | Ollama model name |
-| `embeddings` | `enabled` | `false` | local vector memory via Ollama |
 | `mcp` | `servers` | `[]` | MCP server configurations (stdio, sse, http) |
 | `telegram` | `useWebhook` | `false` | use webhook instead of polling |
 | `telegram` | `webhookUrl` | — | webhook URL (e.g., `https://koda.example.com/telegram`) |
@@ -171,13 +170,12 @@ all fields are optional except `openrouter.apiKey` (via env var).
 
 | tool | what it does |
 |------|-------------|
-| **remember** / **recall** | semantic memory — stores facts, retrieves relevant context. supermemory cloud or local sqlite vector (ollama embeddings) or sqlite keyword fallback. |
+| **remember** / **recall** | semantic memory via Supermemory — stores facts, retrieves relevant context. gracefully disabled without API key. |
 | **webSearch** / **extractUrl** | exa-powered web search + page content extraction. cost tracked per call. |
 | **readFile** / **writeFile** / **listFiles** | workspace-scoped filesystem. blocked patterns for .env, secrets, node_modules. |
 | **runSandboxed** | isolated Docker container execution with resource limits (512MB RAM, 0.5 CPU, no network). |
 | **createReminder** / **createRecurringTask** / **listTasks** / **deleteTask** | timezone-aware scheduling with natural language ("every Monday at 9am") and cron format. |
-| **skills** | list, load, or create SKILL.md files. koda teaches itself new abilities at runtime. |
-| **skillShop** | search and install community skills from GitHub via Exa. |
+| **skills** | list, load, create, search, preview, install SKILL.md files. unified skill management + community skill shop via Exa. |
 | **getSoul** / **updateSoul** | read or rewrite personality sections. hot-reloaded without restart. |
 | **systemStatus** | uptime, memory usage, circuit breaker state, today's cost, next scheduled task. |
 | **spawnAgent** | delegate sub-tasks to isolated child agents with filtered toolsets. multiple spawns run concurrently. returns structured results. |
@@ -186,7 +184,7 @@ all fields are optional except `openrouter.apiKey` (via env var).
 
 ## database
 
-6 tables in SQLite (WAL mode):
+5 tables in SQLite (WAL mode):
 
 | table | purpose |
 |-------|---------|
@@ -195,7 +193,6 @@ all fields are optional except `openrouter.apiKey` (via env var).
 | `usage` | per-request cost, tool cost, and token tracking |
 | `state` | key-value store (schema version, seeds) |
 | `subagents` | sub-agent spawn records |
-| `vector_memories` | local embedding vectors |
 
 ## deploy
 
@@ -227,7 +224,7 @@ runs on anything that runs bun. 128mb ram is plenty. health checks at `/health`.
 | language | typescript 5.9 (strict) |
 | ai | [vercel ai sdk v6](https://sdk.vercel.ai) |
 | llm routing | [openrouter](https://openrouter.ai) — 2-tier auto-routing |
-| memory | [supermemory](https://supermemory.ai) (optional) + local sqlite vectors |
+| memory | [supermemory](https://supermemory.ai) (optional) |
 | search | [exa](https://exa.ai) |
 | telegram | [grammy](https://grammy.dev) |
 | database | sqlite via bun:sqlite (wal mode) |

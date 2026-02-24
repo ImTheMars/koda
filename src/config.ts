@@ -107,12 +107,6 @@ const ConfigSchema = z.object({
   github: withEmptyDefault(z.object({
     token: z.string().optional(),
   })),
-  embeddings: withEmptyDefault(z.object({
-    enabled: z.boolean().default(false),
-    ollamaUrl: z.string().default("http://localhost:11434"),
-    model: z.string().default("nomic-embed-text"),
-    maxMemories: z.number().min(10).max(10_000).default(1_000),
-  })),
   workspace: z.string().default("~/.koda"),
 });
 

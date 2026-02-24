@@ -31,7 +31,6 @@ const ALWAYS_BLOCKED = new Set([
   "listTasks",            // no scheduling side effects
   "deleteTask",           // no scheduling side effects
   "runSandboxed",         // sandbox access only from main agent
-  "skillShop",            // no installs inside a sub-agent
   "getSoul",              // soul is a main-agent concern
   "updateSoul",           // soul is a main-agent concern
 ]);
@@ -43,6 +42,7 @@ const DEFAULT_ALLOWED = new Set([
   "remember",
   "recall",
   "readFile",
+  "writeFile",
   "listFiles",
   "skills",
   "systemStatus",
@@ -118,9 +118,12 @@ export function registerSubAgentTools(deps: {
         `Allowlist of tool names the sub-agent can use. Defaults to: ${[...DEFAULT_ALLOWED].join(", ")}`,
       ),
       maxSteps: z.number().min(1).max(maxStepsCap).optional().default(5).describe(`Max steps before the sub-agent stops (1–${maxStepsCap}, default 5)`),
+      tier: z.enum(["fast", "deep"]).optional().describe("Force sub-agent to use a specific tier"),
+      context: z.string().optional().describe("Relevant context from the current conversation to share with the sub-agent"),
+      timeoutMs: z.number().min(10_000).max(300_000).optional().describe("Custom timeout (default from config, max 5 min)"),
     }),
 
-    execute: async ({ name, task, tools: toolAllowlist, maxSteps }) => {
+    execute: async ({ name, task, tools: toolAllowlist, maxSteps, tier: tierOverride, context, timeoutMs: customTimeout }) => {
       const allowed = toolAllowlist ? new Set(toolAllowlist) : DEFAULT_ALLOWED;
       const subTools = buildSubToolset(masterTools, allowed);
       const sessionKey = freshSessionKey();
@@ -170,14 +173,20 @@ export function registerSubAgentTools(deps: {
       const subDeps: AgentDeps = {
         ...agentDeps,
         tools: subToolsWithExtras,
-        getSoulPrompt: () =>
-          `You are ${name} — a focused sub-agent.\n` +
-          `Your ONLY job: ${task}\n` +
-          `Rules:\n` +
-          `- Use streamUpdate to report progress after each major step.\n` +
-          `- When you are DONE, call returnResult({ summary, data }) with your structured findings.\n` +
-          `- Do NOT use the <|msg|> delimiter.\n` +
-          `- Complete the task thoroughly, then stop.`,
+        getSoulPrompt: () => {
+          const lines = [
+            `You are ${name} — a focused sub-agent spawned by the main Koda agent.`,
+            ``, `## Your task`, task,
+          ];
+          if (context) lines.push(``, `## Context from parent`, context);
+          lines.push(``, `## Rules`,
+            `- Use streamUpdate after each major step to show progress.`,
+            `- When DONE, call returnResult({ summary, data }) with your findings.`,
+            `- Do NOT use the <|msg|> delimiter.`,
+            `- Be thorough but concise. If stuck, return what you have so far.`,
+          );
+          return lines.join("\n");
+        },
         getSkillsSummary: async () => null,
         ingestConversation: async () => {},
       };
@@ -185,8 +194,9 @@ export function registerSubAgentTools(deps: {
       const runSubAgent = createAgent(subDeps);
       structuredResults.delete(sessionKey); // clear any stale result from prior run
 
+      const effectiveTimeout = customTimeout ?? timeoutMs;
       const timeoutPromise = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error(`timeout after ${timeoutMs / 1000}s`)), timeoutMs),
+        setTimeout(() => reject(new Error(`timeout after ${effectiveTimeout / 1000}s`)), effectiveTimeout),
       );
 
       try {
@@ -198,6 +208,8 @@ export function registerSubAgentTools(deps: {
             channel: "subagent",
             sessionKey,
             source: "subagent",
+            tierOverride,
+            requestId: `sub-${sessionKey.slice(-8)}`,
             abortSignal: ac.signal,
           }),
           timeoutPromise,

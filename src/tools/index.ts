@@ -17,7 +17,6 @@ import { registerScheduleTools } from "./schedule.js";
 import { registerSkillTools } from "./skills.js";
 import { registerSoulTools, SoulLoader } from "./soul.js";
 import { registerStatusTools } from "./status.js";
-import { registerSkillShopTools } from "./skillshop.js";
 import { registerSandboxTools } from "./sandbox.js";
 import { registerImageTools } from "./image.js";
 import { registerFileTools } from "./files.js";
@@ -81,17 +80,16 @@ export async function buildTools(deps: {
       getUserId: () => getToolContext().userId,
     }),
     ...registerFilesystemTools({ workspace }),
-    ...registerSkillTools({ skillLoader, workspace }),
+    ...registerSkillTools({ skillLoader, workspace, exaApiKey: config.exa.apiKey, githubToken: config.github?.token }),
   };
 
-  // Search + Skill Shop (optional — needs Exa key)
+  // Search (optional — needs Exa key)
   if (config.exa.apiKey) {
     Object.assign(tools, registerSearchTools({
       apiKey: config.exa.apiKey,
       numResults: config.exa.numResults,
       onCost: addToolCost,
     }));
-    Object.assign(tools, registerSkillShopTools({ exaApiKey: config.exa.apiKey, workspace, githubToken: config.github?.token }));
   }
 
   // Schedule

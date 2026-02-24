@@ -3,7 +3,7 @@
  */
 
 import * as readline from "readline";
-const MESSAGE_DELIMITER = "<|msg|>";
+import { splitOnDelimiter } from "../agent.js";
 
 export interface ReplDeps {
   runAgent: (input: { content: string; senderId: string; chatId: string; channel: string; sessionKey: string }) => Promise<{ text: string }>;
@@ -29,8 +29,7 @@ export function startRepl(deps: ReplDeps): { stop: () => void } {
     });
 
     const prefix = deps.prompt ? `${deps.prompt}: ` : "";
-    // Split on the same delimiter used by Telegram.
-    const segments = result.text.split(MESSAGE_DELIMITER).map((s) => s.trim()).filter(Boolean);
+    const segments = splitOnDelimiter(result.text);
     for (const seg of segments) {
       console.log(`${prefix}${seg}`);
     }

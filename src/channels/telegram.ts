@@ -9,7 +9,7 @@ import type { Config, Tier } from "../config.js";
 import { persistConfig } from "../config.js";
 import { messages as dbMessages, usage as dbUsage, tasks as dbTasks } from "../db.js";
 import type { StreamAgentResult } from "../agent.js";
-import { isLlmCircuitOpen } from "../agent.js";
+import { isLlmCircuitOpen, splitOnDelimiter } from "../agent.js";
 import { VERSION } from "../version.js";
 import { log } from "../log.js";
 import { readFileSync } from "fs";
@@ -34,11 +34,41 @@ export interface TelegramResult {
   handleWebhook?: (req: Request) => Promise<Response>;
 }
 
+/** Transcribe audio via OpenRouter (Gemini Flash with native audio support). */
+async function transcribeAudio(audioBuffer: Buffer, config: Config): Promise<string | null> {
+  const base64 = audioBuffer.toString("base64");
+  try {
+    const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${config.openrouter.apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: config.openrouter.fastModel,
+        messages: [{
+          role: "user",
+          content: [
+            { type: "input_audio", input_audio: { data: base64, format: "ogg" } },
+            { type: "text", text: "Transcribe this audio exactly as spoken. Return ONLY the transcription, nothing else." },
+          ],
+        }],
+        max_tokens: 2000,
+      }),
+      signal: AbortSignal.timeout(30_000),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data.choices?.[0]?.message?.content?.trim() ?? null;
+  } catch {
+    return null;
+  }
+}
+
 /** Safety timeout: auto-stop typing after 2 minutes */
 const TYPING_TIMEOUT_MS = 120_000;
 const DEDUP_CLEANUP_MS = 5 * 60_000;
 const RATE_LIMIT = { maxRequests: 10, windowMs: 60_000 };
-const MESSAGE_DELIMITER = "<|msg|>";
 const SEGMENT_DELAY_MS = 400;
 const MAX_DOCUMENT_SIZE = 20 * 1024 * 1024; // 20MB
 const MAX_DOCUMENT_TEXT = 30_000; // chars
@@ -148,7 +178,7 @@ export function startTelegram(deps: TelegramDeps): TelegramResult {
   };
 
   const sendReply = async (chatId: number, text: string) => {
-    const segments = text.split(MESSAGE_DELIMITER).map((s) => s.trim()).filter(Boolean);
+    const segments = splitOnDelimiter(text);
     for (let i = 0; i < segments.length; i++) {
       await sendSegment(chatId, segments[i]!);
       if (i < segments.length - 1) await new Promise((r) => setTimeout(r, SEGMENT_DELAY_MS + Math.random() * 200));
@@ -160,15 +190,18 @@ export function startTelegram(deps: TelegramDeps): TelegramResult {
     try {
       for await (const chunk of stream) {
         buffer += chunk;
-        const parts = buffer.split(MESSAGE_DELIMITER);
-        for (let i = 0; i < parts.length - 1; i++) {
-          const segment = parts[i]!.trim();
-          if (segment) {
-            await sendSegment(chatId, segment);
+        // Track whether we're inside a code block — don't split there
+        const fenceCount = (buffer.match(/```/g) || []).length;
+        const inCodeBlock = fenceCount % 2 !== 0;
+        if (inCodeBlock) continue;
+        const segments = splitOnDelimiter(buffer);
+        if (segments.length > 1) {
+          for (let i = 0; i < segments.length - 1; i++) {
+            await sendSegment(chatId, segments[i]!);
             await new Promise((r) => setTimeout(r, SEGMENT_DELAY_MS + Math.random() * 200));
           }
+          buffer = segments[segments.length - 1] ?? "";
         }
-        buffer = parts[parts.length - 1] ?? "";
       }
       const remaining = buffer.trim();
       if (remaining) await sendSegment(chatId, remaining);
@@ -302,6 +335,7 @@ export function startTelegram(deps: TelegramDeps): TelegramResult {
       "/recap - summarize recent conversation\n" +
       "/model - view or change models\n\n" +
       "i can also search the web, remember things, run code, set reminders, manage files, generate images, and load skills.\n" +
+      "send me voice messages — i'll transcribe and respond.\n" +
       "send me PDFs and text files — i'll read them. reply to messages for context.",
     );
   });
@@ -604,6 +638,122 @@ export function startTelegram(deps: TelegramDeps): TelegramResult {
       stopTyping(chatId);
       console.error("[telegram] Document stream error:", err);
       await ctx.reply("ran into an issue processing that file.").catch(() => {});
+    }
+  });
+
+  // --- Voice messages ---
+  bot.on("message:voice", async (ctx) => {
+    const senderId = String(ctx.from?.id);
+    if (!isAllowed(senderId)) return;
+    const key = dedupKey(ctx.chat.id, ctx.message.message_id);
+    if (processedMessages.has(key)) return;
+    processedMessages.add(key);
+    const chatId = String(ctx.chat.id);
+    log("telegram", "voice from=%s chat=%s", senderId, chatId);
+    if (isRateLimited(chatId)) { await ctx.reply("slow down!"); return; }
+
+    const voice = ctx.message.voice;
+    const file = await ctx.api.getFile(voice.file_id);
+    if (!file.file_path) {
+      await ctx.reply("I couldn't access that voice message.");
+      return;
+    }
+    const url = `https://api.telegram.org/file/bot${token}/${file.file_path}`;
+    const response = await fetch(url);
+    if (!response.ok) {
+      await ctx.reply("I couldn't download that voice message.");
+      return;
+    }
+    const buffer = Buffer.from(await response.arrayBuffer());
+
+    const transcription = await transcribeAudio(buffer, config);
+    if (!transcription) {
+      await ctx.reply("I couldn't transcribe that voice message. Try again or send it as text.");
+      return;
+    }
+
+    let content = `[voice message] ${transcription}`;
+    content = enrichContent(content, ctx.message);
+    const tierOverride = consumeTierOverride(chatId);
+
+    startTyping(chatId);
+    try {
+      const streamResult = await deps.streamAgent({
+        content,
+        senderId, chatId, channel: "telegram",
+        sessionKey: `telegram_${chatId}`,
+        tierOverride,
+        onAck: (text) => ctx.reply(text).catch(() => {}),
+      });
+
+      consecutiveErrors = 0;
+      await sendStreamReply(Number(chatId), streamResult.fullStream, () => stopTyping(chatId));
+      const agentResult = await streamResult.finishedPromise.catch((err) => { console.error(err); return null; });
+      if (agentResult?.files?.length) {
+        await sendPendingFiles(Number(chatId), agentResult.files);
+      }
+    } catch (err) {
+      stopTyping(chatId);
+      console.error("[telegram] Voice stream error:", err);
+      await ctx.reply("ran into an issue, try again?").catch(() => {});
+    }
+  });
+
+  // --- Video note (circle video) messages ---
+  bot.on("message:video_note", async (ctx) => {
+    const senderId = String(ctx.from?.id);
+    if (!isAllowed(senderId)) return;
+    const key = dedupKey(ctx.chat.id, ctx.message.message_id);
+    if (processedMessages.has(key)) return;
+    processedMessages.add(key);
+    const chatId = String(ctx.chat.id);
+    log("telegram", "video_note from=%s chat=%s", senderId, chatId);
+    if (isRateLimited(chatId)) { await ctx.reply("slow down!"); return; }
+
+    const videoNote = ctx.message.video_note;
+    const file = await ctx.api.getFile(videoNote.file_id);
+    if (!file.file_path) {
+      await ctx.reply("I couldn't access that video note.");
+      return;
+    }
+    const url = `https://api.telegram.org/file/bot${token}/${file.file_path}`;
+    const response = await fetch(url);
+    if (!response.ok) {
+      await ctx.reply("I couldn't download that video note.");
+      return;
+    }
+    const buffer = Buffer.from(await response.arrayBuffer());
+
+    const transcription = await transcribeAudio(buffer, config);
+    if (!transcription) {
+      await ctx.reply("I couldn't transcribe that video note. Try again or send it as text.");
+      return;
+    }
+
+    let content = `[voice message] ${transcription}`;
+    content = enrichContent(content, ctx.message);
+    const tierOverride = consumeTierOverride(chatId);
+
+    startTyping(chatId);
+    try {
+      const streamResult = await deps.streamAgent({
+        content,
+        senderId, chatId, channel: "telegram",
+        sessionKey: `telegram_${chatId}`,
+        tierOverride,
+        onAck: (text) => ctx.reply(text).catch(() => {}),
+      });
+
+      consecutiveErrors = 0;
+      await sendStreamReply(Number(chatId), streamResult.fullStream, () => stopTyping(chatId));
+      const agentResult = await streamResult.finishedPromise.catch((err) => { console.error(err); return null; });
+      if (agentResult?.files?.length) {
+        await sendPendingFiles(Number(chatId), agentResult.files);
+      }
+    } catch (err) {
+      stopTyping(chatId);
+      console.error("[telegram] Video note stream error:", err);
+      await ctx.reply("ran into an issue, try again?").catch(() => {});
     }
   });
 

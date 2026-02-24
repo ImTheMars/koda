@@ -4,15 +4,16 @@
  * loadConfig → initDb → init providers → build tools → register channels → start proactive
  */
 
-import { mkdir } from "fs/promises";
+import { mkdir, readFile } from "fs/promises";
 import { resolve } from "path";
+import { watch, type FSWatcher } from "fs";
 import { loadConfig, type Config } from "./config.js";
 import { initDb, closeDb, messages as dbMessages, state as dbState, tasks as dbTasks, vacuumDb, backupDatabase } from "./db.js";
 import { parseCronNext } from "./time.js";
 import { createAgent, createStreamAgent, initOllama, type AgentDeps } from "./agent.js";
 import { SoulLoader } from "./tools/soul.js";
 import { SkillLoader } from "./tools/skills.js";
-import { createMemoryProvider, setMemoryTimeout } from "./tools/memory.js";
+import { createMemoryProvider } from "./tools/memory.js";
 import { startRepl } from "./channels/repl.js";
 import { startTelegram, type TelegramResult } from "./channels/telegram.js";
 import { startProactive } from "./proactive.js";
@@ -46,14 +47,44 @@ if (cleanedMessages > 0) {
 }
 console.log("[boot] Database initialized");
 
-// --- Timeouts from config ---
-setMemoryTimeout(config.timeouts.memory);
-
 // --- Providers ---
 const memoryProvider = createMemoryProvider(config);
 const soulLoader = new SoulLoader(config.soul.path, config.soul.dir);
 await soulLoader.initialize();
 console.log(`[boot] Soul: ${soulLoader.getSoul().identity.name}`);
+
+// --- CONTEXT.md ---
+let contextContent: string | null = null;
+const contextPath = resolve(config.workspace, "CONTEXT.md");
+
+async function loadContext(): Promise<void> {
+  try {
+    contextContent = await readFile(contextPath, "utf-8");
+  } catch {
+    contextContent = null;
+  }
+}
+
+await loadContext();
+if (contextContent !== null) console.log(`[boot] CONTEXT.md loaded (${(contextContent as string).length} chars)`);
+
+let contextWatcher: FSWatcher | null = null;
+let contextDirWatcher: FSWatcher | null = null;
+let contextReloadTimeout: ReturnType<typeof setTimeout> | null = null;
+
+function scheduleContextReload(): void {
+  if (contextReloadTimeout) clearTimeout(contextReloadTimeout);
+  contextReloadTimeout = setTimeout(() => {
+    loadContext().then(() => {
+      if (contextContent) console.log("[context] CONTEXT.md reloaded");
+    });
+  }, 300);
+}
+
+try { contextWatcher = watch(contextPath, () => scheduleContextReload()); } catch {}
+try { contextDirWatcher = watch(config.workspace, { recursive: false }, (_, filename) => {
+  if (filename === "CONTEXT.md") scheduleContextReload();
+}); } catch {}
 
 const skillLoader = new SkillLoader(config.workspace);
 const skills = await skillLoader.listSkills();
@@ -139,6 +170,7 @@ const agentDeps: AgentDeps = {
   config,
   tools,
   getSoulPrompt: () => soulLoader.generatePrompt(),
+  getContextPrompt: () => contextContent,
   getSkillsSummary: () => skillLoader.buildSkillsSummary(),
   getProfile: (userId, query, sessionKey) => memoryProvider.getProfile(userId, query || undefined, sessionKey),
   ingestConversation: (sessionKey, userId, messages) => memoryProvider.ingestConversation(sessionKey, userId, messages),
@@ -329,6 +361,9 @@ const shutdown = async (signal: string) => {
   repl?.stop();
   if (telegram) await telegram.stop();
   soulLoader.dispose();
+  contextWatcher?.close();
+  contextDirWatcher?.close();
+  if (contextReloadTimeout) clearTimeout(contextReloadTimeout);
   for (const mcp of mcpClients) {
     try { await mcp.client.close(); } catch {}
   }
