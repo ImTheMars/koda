@@ -130,7 +130,24 @@ function isDuplicate(newFact: string, existingFacts: string[]): boolean {
 }
 
 // Rate limit: only run extraction every 3rd call per session
+// Capped at 500 entries — evict oldest half when limit is reached
 const ingestCallCounts = new Map<string, number>();
+const INGEST_COUNT_CAP = 500;
+
+function bumpIngestCount(sessionKey: string): number {
+  const count = (ingestCallCounts.get(sessionKey) ?? 0) + 1;
+  ingestCallCounts.set(sessionKey, count);
+  if (ingestCallCounts.size > INGEST_COUNT_CAP) {
+    // Delete the oldest half (Map iteration order = insertion order)
+    const evict = Math.floor(INGEST_COUNT_CAP / 2);
+    let i = 0;
+    for (const key of ingestCallCounts.keys()) {
+      if (i++ >= evict) break;
+      ingestCallCounts.delete(key);
+    }
+  }
+  return count;
+}
 
 function createSupermemoryProvider(apiKey: string, config?: Config): MemoryProvider {
   const client = new Supermemory({ apiKey });
@@ -215,8 +232,7 @@ function createSupermemoryProvider(apiKey: string, config?: Config): MemoryProvi
       if (isCircuitOpen()) { log("memory", "ingest: circuit open, skipping"); return; }
 
       // Rate limit: only extract every 3rd call
-      const count = (ingestCallCounts.get(sessionKey) ?? 0) + 1;
-      ingestCallCounts.set(sessionKey, count);
+      const count = bumpIngestCount(sessionKey);
 
       if (count % 3 !== 0 || !config) {
         // Fallback to simple excerpt storage

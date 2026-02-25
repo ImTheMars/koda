@@ -4,7 +4,7 @@
  * bootConfig → initDb → bootProviders → build tools → bootMcp → agent → channels → proactive → bootServer
  */
 
-import { mkdir } from "fs/promises";
+import { mkdir, readFile, writeFile, unlink } from "fs/promises";
 import { resolve } from "path";
 import { initDb, closeDb, messages as dbMessages, state as dbState, tasks as dbTasks, vacuumDb, backupDatabase } from "./db.js";
 import { parseCronNext } from "./time.js";
@@ -19,6 +19,7 @@ import { bootConfig } from "./boot/config.js";
 import { bootProviders } from "./boot/providers.js";
 import { bootMcp, reconnectMcpServer, type McpEntry } from "./boot/mcp.js";
 import { bootServer } from "./boot/server.js";
+import { startRailwayMonitor } from "./boot/railway-monitor.js";
 
 // --- CLI routing ---
 const command = process.argv[2];
@@ -170,8 +171,29 @@ let repl: { stop: () => void } | null = null;
 const routedStreamAgent = makeNamedStreamAgent(streamAgentFn);
 
 if (config.mode !== "cli-only" && config.telegram.token) {
-  telegram = await startTelegram({ streamAgent: routedStreamAgent, config });
+  // Read deploy timestamp written by SIGTERM handler on the previous run
+  const deployTsFile = resolve(config.workspace, ".koda-deploy-ts");
+  let deployDurationMs: number | undefined;
+  try {
+    const raw = await readFile(deployTsFile, "utf-8");
+    const shutdownAt = parseInt(raw.trim(), 10);
+    if (!Number.isNaN(shutdownAt)) deployDurationMs = Date.now() - shutdownAt;
+    await unlink(deployTsFile).catch(() => {});
+  } catch {
+    // No timestamp file — fresh start or non-deploy restart
+  }
+
+  telegram = await startTelegram({ streamAgent: routedStreamAgent, config, deployDurationMs });
   console.log(`[boot] Channel: telegram enabled${config.telegram.useWebhook ? " (webhook)" : " (polling)"}`);
+}
+
+// --- Railway build monitor ---
+let railwayMonitor: { stop(): void } | null = null;
+if (telegram) {
+  railwayMonitor = startRailwayMonitor({
+    onBuildDetected: (msg) => telegram!.notifyAdmins(msg).catch(() => {}),
+    onBuildFailed: (msg) => telegram!.notifyAdmins(msg).catch(() => {}),
+  });
 }
 
 if (config.mode === "cli-only") {
@@ -254,13 +276,21 @@ const server = bootServer({
 });
 
 // --- Graceful shutdown ---
-const shutdown = async (signal: string) => {
+const shutdown = async (signal: "SIGTERM" | "SIGINT") => {
   console.log(`\n[${signal}] Shutting down...`);
   if (backupTimer) clearInterval(backupTimer);
   clearInterval(hourlyCleanTimer);
+  railwayMonitor?.stop();
   proactive?.stop();
   repl?.stop();
-  if (telegram) await telegram.stop();
+
+  // Write shutdown timestamp so next boot can compute deploy duration (SIGTERM = Railway deploy)
+  if (signal === "SIGTERM") {
+    const deployTsFile = resolve(config.workspace, ".koda-deploy-ts");
+    await writeFile(deployTsFile, String(Date.now())).catch(() => {});
+  }
+
+  if (telegram) await telegram.stop(signal);
   soulLoader.dispose();
   contextWatcher?.close();
   contextDirWatcher?.close();

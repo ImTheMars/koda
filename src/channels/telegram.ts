@@ -26,10 +26,12 @@ export interface TelegramDeps {
     onTypingStop?: () => void;
   }) => Promise<StreamAgentResult>;
   config: Config;
+  /** If provided, startup message includes "deployed in Xs" */
+  deployDurationMs?: number;
 }
 
 export interface TelegramResult {
-  stop: () => Promise<void>;
+  stop: (signal?: "SIGTERM" | "SIGINT") => Promise<void>;
   sendDirect: (chatId: string, text: string) => Promise<void>;
   handleWebhook?: (req: Request) => Promise<Response>;
   notifyAdmins: (text: string) => Promise<void>;
@@ -90,6 +92,11 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
   const dedupTimer = setInterval(() => {
     processedMessages.clear();
     sentMessages.clear();
+    // Sweep stale rate limit entries (entries self-expire via resetAt but are never deleted)
+    const now = Date.now();
+    for (const [id, entry] of rateCounts) {
+      if (now > entry.resetAt) rateCounts.delete(id);
+    }
   }, DEDUP_CLEANUP_MS);
 
   const isAllowed = (userId: string) => allowFrom.size === 0 || allowFrom.has(userId);
@@ -135,14 +142,36 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
       .replace(/>/g, "&gt;");
 
   const markdownToTelegramHtml = (text: string): string => {
+    // HTML-escape first so code block content is safe
     let html = escapeHtml(text);
-    html = html.replace(/```[\w-]*\n([\s\S]*?)```/g, (_m, code: string) => `<pre><code>${code.trim()}</code></pre>`);
+
+    // Extract code blocks to placeholders so list conversion doesn't corrupt them
+    const codeBlocks: string[] = [];
+    html = html.replace(/```[\w-]*\n([\s\S]*?)```/g, (_m, code: string) => {
+      const idx = codeBlocks.length;
+      codeBlocks.push(`<pre><code>${code.trim()}</code></pre>`);
+      return `\x00BLOCK${idx}\x00`;
+    });
+
+    // Inline formatting
     html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
     html = html.replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>");
     html = html.replace(/\*([^*]+)\*/g, "<i>$1</i>");
     html = html.replace(/~~([^~]+)~~/g, "<s>$1</s>");
     html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '<a href="$2">$1</a>');
-    return html.replace(/\n{3,}/g, "\n\n");
+
+    // List and todo conversion (applied per-line, safe now that code blocks are out)
+    html = html.replace(/^(\s*)[-*] \[[xX]\] /gm, "$1✅ ");   // checked todo
+    html = html.replace(/^(\s*)[-*] \[ \] /gm, "$1☐ ");        // unchecked todo
+    html = html.replace(/^(  )[-*] /gm, "$1◦ ");               // nested bullet (2-space indent)
+    html = html.replace(/^[-*] /gm, "• ");                     // top-level bullet
+
+    html = html.replace(/\n{3,}/g, "\n\n");
+
+    // Restore code blocks
+    html = html.replace(/\x00BLOCK(\d+)\x00/g, (_m, i) => codeBlocks[Number(i)]!);
+
+    return html;
   };
 
   const chunkMessage = (text: string, maxLen = 4000): string[] => {
@@ -943,8 +972,11 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
       }
     }, 10_000);
 
-    // Notify admins bot is online
-    await notifyAdmins(`koda v${VERSION} is online. [${kodaEnv}]`);
+    // Notify admins bot is online (include deploy duration if we know it)
+    const durationSuffix = deps.deployDurationMs
+      ? ` — deployed in ${Math.round(deps.deployDurationMs / 1000)}s`
+      : "";
+    await notifyAdmins(`koda v${VERSION} is online${durationSuffix} [${kodaEnv}]`);
 
     return {
       notifyAdmins,
@@ -953,12 +985,15 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
         if (!Number.isFinite(id)) throw new Error("Invalid chat id");
         await sendReply(id, text);
       },
-      async stop() {
+      async stop(signal: "SIGTERM" | "SIGINT" = "SIGTERM") {
         for (const chatId of typingIntervals.keys()) stopTyping(chatId);
         clearInterval(dedupTimer);
         processedMessages.clear();
         sentMessages.clear();
-        await notifyAdmins(`koda is updating, give me a sec... [${kodaEnv}]`);
+        const msg = signal === "SIGTERM"
+          ? `deploying now, switching over... [${kodaEnv}]`
+          : `restarting unexpectedly... [${kodaEnv}]`;
+        await notifyAdmins(msg);
         // Do NOT call deleteWebhook() — during Railway zero-downtime deploys,
         // the new container sets the webhook first, then the old container shuts down.
         // Calling deleteWebhook here would wipe the new container's registration.
@@ -993,12 +1028,15 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
       if (!Number.isFinite(id)) throw new Error("Invalid chat id");
       await sendReply(id, text);
     },
-    async stop() {
+    async stop(signal: "SIGTERM" | "SIGINT" = "SIGTERM") {
       for (const chatId of typingIntervals.keys()) stopTyping(chatId);
       clearInterval(dedupTimer);
       processedMessages.clear();
       sentMessages.clear();
-      await notifyAdmins(`koda is updating, give me a sec... [${kodaEnv}]`);
+      const msg = signal === "SIGTERM"
+        ? `deploying now, switching over... [${kodaEnv}]`
+        : `restarting unexpectedly... [${kodaEnv}]`;
+      await notifyAdmins(msg);
       await bot.stop();
     },
   };

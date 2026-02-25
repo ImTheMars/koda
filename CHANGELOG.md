@@ -31,6 +31,26 @@ deployed koda to railway with auto-deploy on push. fixed critical webhook issues
 - **health check**: `/health` endpoint with version and uptime
 - **webhook endpoint**: `/telegram` with secret token verification
 
+#### railway build monitor
+
+- **proactive build detection** (`src/boot/railway-monitor.ts`) — polls Railway GraphQL API every 60s. notifies admins as soon as a new deployment enters `BUILDING` state, before SIGTERM arrives. includes git branch + short SHA in the message (e.g. `"new build incoming — main@a3f91b2 [production]"`). auto-no-op in dev when Railway env vars are absent.
+- **failed build alerts** — detects `FAILED`/`CRASHED` deployment status and notifies immediately.
+- **SIGTERM vs SIGINT** — `SIGTERM` (Railway deploy) sends `"deploying now, switching over..."`. `SIGINT` (manual/unexpected) sends `"restarting unexpectedly..."`.
+- **deploy duration** — SIGTERM records a shutdown timestamp to workspace. on next startup, computes elapsed time and includes it in the online message (e.g. `"koda v1.0.1 is online — deployed in 47s [production]"`).
+
+#### sandbox
+
+- **native exec fallback** (`src/tools/sandbox.ts`) — Railway containers have no Docker, so `runSandboxed` previously went unavailable entirely. added `runNative` path using `Bun.spawn` with the same timeout + output caps. Railway's container OS provides the isolation. result includes `sandboxed: false, nativeExec: true` so the agent knows the mode.
+
+#### performance
+
+- **`rateCounts` sweep** (`src/channels/telegram.ts`) — rate limit Map was never pruned. stale entries now swept every 5 minutes alongside the existing dedup timer.
+- **`ingestCallCounts` cap** (`src/tools/memory.ts`) — per-session call count Map capped at 500 entries with half-eviction to bound memory.
+
+#### rendering
+
+- **list and todo formatting** (`src/channels/telegram.ts`) — `markdownToTelegramHtml()` now converts markdown lists to clean Unicode. `- [ ]` → `☐`, `- [x]` → `✅`, `- item` → `•`, nested `  - item` → `  ◦`. ordered lists kept as-is.
+
 ---
 
 ## 2026-02-24
