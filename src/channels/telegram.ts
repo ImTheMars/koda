@@ -904,11 +904,28 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
 
   // --- Webhook or polling ---
   if (config.telegram.useWebhook && config.telegram.webhookUrl) {
-    // Webhook mode — don't start polling
-    await bot.api.setWebhook(config.telegram.webhookUrl!, {
-      secret_token: config.telegram.webhookSecret,
-    });
-    console.log("[telegram] Webhook set:", config.telegram.webhookUrl);
+    // Webhook mode — register with retry (Railway networking may not be ready on first boot)
+    const setWebhookWithRetry = async (retries = 5, delay = 3000) => {
+      for (let i = 0; i < retries; i++) {
+        try {
+          await bot.api.setWebhook(config.telegram.webhookUrl!, {
+            secret_token: config.telegram.webhookSecret,
+          });
+          // Verify it actually took
+          const info = await bot.api.getWebhookInfo();
+          if (info.url === config.telegram.webhookUrl) {
+            console.log("[telegram] Webhook set:", config.telegram.webhookUrl);
+            return;
+          }
+          console.warn(`[telegram] Webhook URL mismatch after set (got "${info.url}"), retrying...`);
+        } catch (err) {
+          console.warn(`[telegram] setWebhook attempt ${i + 1}/${retries} failed:`, (err as Error).message);
+        }
+        if (i < retries - 1) await new Promise((r) => setTimeout(r, delay));
+      }
+      console.error("[telegram] Failed to set webhook after all retries!");
+    };
+    await setWebhookWithRetry();
 
     // Notify admins bot is online
     await notifyAdmins(`koda v${VERSION} is online. [${kodaEnv}]`);
