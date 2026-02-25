@@ -927,6 +927,22 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
     };
     await setWebhookWithRetry();
 
+    // Re-register webhook after 10s to survive old container's shutdown race
+    setTimeout(async () => {
+      try {
+        const info = await bot.api.getWebhookInfo();
+        if (info.url !== config.telegram.webhookUrl) {
+          console.warn("[telegram] Webhook was cleared (deploy race), re-registering...");
+          await bot.api.setWebhook(config.telegram.webhookUrl!, {
+            secret_token: config.telegram.webhookSecret,
+          });
+          console.log("[telegram] Webhook re-registered successfully");
+        }
+      } catch (err) {
+        console.error("[telegram] Webhook re-check failed:", (err as Error).message);
+      }
+    }, 10_000);
+
     // Notify admins bot is online
     await notifyAdmins(`koda v${VERSION} is online. [${kodaEnv}]`);
 
@@ -943,7 +959,9 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
         processedMessages.clear();
         sentMessages.clear();
         await notifyAdmins(`koda is updating, give me a sec... [${kodaEnv}]`);
-        await bot.api.deleteWebhook();
+        // Do NOT call deleteWebhook() — during Railway zero-downtime deploys,
+        // the new container sets the webhook first, then the old container shuts down.
+        // Calling deleteWebhook here would wipe the new container's registration.
       },
       async handleWebhook(req: Request): Promise<Response> {
         // Verify secret token if configured
