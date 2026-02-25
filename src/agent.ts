@@ -317,13 +317,25 @@ function makePrepareStep(
   };
 }
 
-/** Shared onStepFinish callback — tracks tool usage. */
+/** Shared onStepFinish callback — tracks tool usage and logs results/errors. */
 function makeOnStepFinish(toolsUsed: string[], state: { stepCount: number }, logPrefix: string) {
-  return async (step: { toolCalls?: Array<{ toolName: string }> }) => {
+  return async (step: { toolCalls?: Array<{ toolName: string; args?: unknown }>; toolResults?: Array<{ toolName: string; result?: unknown }> }) => {
     if (step.toolCalls) {
       for (const call of step.toolCalls) {
         toolsUsed.push(call.toolName);
-        log("agent", "%sstep %d tool=%s", logPrefix, state.stepCount, call.toolName);
+        log("agent", "%sstep %d tool=%s args=%s", logPrefix, state.stepCount, call.toolName,
+          JSON.stringify(call.args ?? {}).slice(0, 500));
+      }
+    }
+    if (step.toolResults) {
+      for (const res of step.toolResults) {
+        const raw = JSON.stringify(res.result ?? "").slice(0, 800);
+        const isError = typeof res.result === "string" && (res.result.includes("Error") || res.result.includes("error"));
+        if (isError) {
+          log("agent", "%sstep %d tool=%s ERROR=%s", logPrefix, state.stepCount, res.toolName, raw);
+        } else {
+          log("agent", "%sstep %d tool=%s result=%s", logPrefix, state.stepCount, res.toolName, raw);
+        }
       }
     }
   };

@@ -1,16 +1,19 @@
 /**
- * Composio integration — thin wrapper around Composio SDK.
+ * Composio integration — wraps Composio v3 API as Vercel AI SDK tools.
  *
- * Manages per-user connections and exposes Vercel AI SDK-compatible tools
- * for Gmail, Calendar, GitHub, and other services.
+ * The SDK's VercelProvider wrapTools has a bug (sends both `text` and `arguments`
+ * in the execute payload, causing 400 errors). We bypass it by:
+ * 1. Using the SDK to discover tool schemas (getRawComposioTools)
+ * 2. Building Vercel AI SDK tools manually with direct v3 API execute calls
  */
 
 import { Composio } from "@composio/core";
-import { VercelProvider } from "@composio/vercel";
+import { z } from "zod";
 import type { ToolSet } from "ai";
 
 export interface ComposioDeps {
   apiKey: string;
+  entityId?: string;
 }
 
 export interface ComposioClient {
@@ -28,14 +31,63 @@ const ESSENTIAL_TOOLS: Record<string, string[]> = {
   googlesheets: ["CREATE_A_GOOGLE", "GET_SPREADSHEET_INFO", "BATCH_GET_SPREADSHEET_VALUES", "APPEND_DIMENSION", "GET_SHEET_NAMES"],
 };
 
+/** Build a Zod schema from Composio's raw inputParameters */
+function buildZodSchema(inputParams: any[]): z.ZodObject<any> {
+  const shape: Record<string, z.ZodTypeAny> = {};
+  if (!Array.isArray(inputParams)) return z.object({});
+
+  for (const param of inputParams) {
+    const name = param.name;
+    if (!name) continue;
+
+    let field: z.ZodTypeAny;
+    switch (param.type) {
+      case "number": case "integer": field = z.number(); break;
+      case "boolean": field = z.boolean(); break;
+      case "array": field = z.array(z.any()); break;
+      default: field = z.string(); break;
+    }
+
+    if (param.description) field = field.describe(param.description);
+    if (param.default !== undefined) field = field.default(param.default);
+    if (!param.required) field = field.optional();
+
+    shape[name] = field;
+  }
+
+  return z.object(shape);
+}
+
 export function createComposioClient(deps: ComposioDeps): ComposioClient {
-  const provider = new VercelProvider();
-  const client = new Composio({ apiKey: deps.apiKey, provider: provider as any });
+  const apiKey = deps.apiKey;
+  const entityId = deps.entityId ?? "default";
+  const client = new Composio({ apiKey });
+
+  /** Execute a tool via Composio v3 REST API directly (bypasses broken SDK wrapper) */
+  async function executeToolDirect(slug: string, args: Record<string, unknown>): Promise<unknown> {
+    const res = await fetch(`https://backend.composio.dev/api/v3/tools/execute/${slug}`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey,
+      },
+      body: JSON.stringify({
+        arguments: args,
+        entity_id: entityId,
+      }),
+      signal: AbortSignal.timeout(30_000),
+    });
+
+    const data = await res.json() as any;
+    if (!res.ok || data.error) {
+      const msg = data.error?.message ?? data.error ?? `HTTP ${res.status}`;
+      throw new Error(`Composio ${slug}: ${msg}`);
+    }
+    return data.data ?? data;
+  }
 
   return {
     async getTools(toolkits: string[]): Promise<ToolSet> {
-      // Fetch each toolkit separately — Composio caps combined requests at 20 tools,
-      // which means some toolkits get zero tools when requested together.
       const allRawTools: any[] = [];
       for (const tk of toolkits) {
         const raw = await (client.tools as any).getRawComposioTools(
@@ -44,7 +96,6 @@ export function createComposioClient(deps: ComposioDeps): ComposioClient {
         );
         if (!raw?.length) continue;
 
-        // Filter to essential tools per toolkit to avoid prompt bloat (76 → ~25)
         const keep = ESSENTIAL_TOOLS[tk];
         if (keep) {
           allRawTools.push(...raw.filter((t: any) => {
@@ -57,13 +108,20 @@ export function createComposioClient(deps: ComposioDeps): ComposioClient {
       }
       if (allRawTools.length === 0) return {};
 
-      const executeFn = (client.tools as any).createExecuteFnForProviders({});
-      const wrapped = provider.wrapTools(allRawTools, executeFn);
+      // Build Vercel AI SDK tools with direct API execution
+      const tools: Record<string, any> = {};
+      for (const rawTool of allRawTools) {
+        const slug = rawTool.slug as string;
+        const description = rawTool.description ?? rawTool.name ?? slug;
+        const parameters = buildZodSchema(rawTool.inputParameters ?? []);
 
-      if (wrapped && typeof wrapped === "object" && !Array.isArray(wrapped)) {
-        return wrapped as ToolSet;
+        tools[slug] = {
+          description,
+          parameters,
+          execute: async (args: any) => executeToolDirect(slug, args as Record<string, unknown>),
+        };
       }
-      return {};
+      return tools as ToolSet;
     },
 
     async getAuthUrl(app: string): Promise<string> {
