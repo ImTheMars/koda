@@ -162,6 +162,17 @@ export class SoulLoader {
 
   getSoul(): SoulDocument { return this.soul; }
 
+  getAckTemplates(): string[] {
+    const acksFile = this.subContents.get("acks.md");
+    if (!acksFile) return [];
+    return acksFile
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.startsWith("- "))
+      .map((line) => line.slice(2).trim())
+      .filter(Boolean);
+  }
+
   generatePrompt(): string | null {
     if (!this.rawContent) return null;
     const parts = [this.rawContent];
@@ -248,17 +259,26 @@ export function registerSoulTools(deps: { soulLoader: SoulLoader }): ToolSet {
   const updateSoul = tool({
     description: "Update a section of Koda's personality by rewriting the soul.md file.",
     inputSchema: z.object({
-      section: z.enum(["coreValues", "boundaries", "protocol", "responseStyle", "security"]),
+      section: z.string().describe("Section name: coreValues, boundaries, protocol, responseStyle, or any custom section"),
       action: z.enum(["add", "remove"]),
       item: z.string().min(5),
       reason: z.string().optional(),
     }),
     execute: async ({ section, action, item }) => {
-      if (section === "security") {
-        return { success: false, error: "Security section is read-only" };
+      if (section === "security" || section === "boundaries") {
+        return { success: false, error: "Security/boundaries section is read-only" };
       }
       const soul = soulLoader.getSoul();
-      const list = soul[section] as string[];
+
+      // Support standard sections and dynamic ones
+      const knownSections: Record<string, string[]> = {
+        coreValues: soul.coreValues,
+        protocol: soul.protocol,
+        responseStyle: soul.responseStyle,
+      };
+
+      const list = knownSections[section];
+      if (!list) return { success: false, error: `Unknown section: ${section}. Available: coreValues, protocol, responseStyle` };
 
       if (action === "add") {
         if (list.some((e) => e.toLowerCase() === item.toLowerCase())) return { success: false, error: "Item already exists" };

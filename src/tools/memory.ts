@@ -10,6 +10,7 @@ import Supermemory from "supermemory";
 import { messages as dbMessages, state as dbState } from "../db.js";
 import { log } from "../log.js";
 import type { Config } from "../config.js";
+import { addToolCost } from "./index.js";
 
 // --- Types ---
 
@@ -27,6 +28,8 @@ export interface MemoryProvider {
   setupEntityContext(userId: string): Promise<void>;
   healthCheck(): Promise<boolean>;
   readonly isDegraded: boolean;
+  /** Delete a memory by searching for matching content. */
+  deleteByContent?(userId: string, query: string): Promise<boolean>;
   /** Optional Supermemory-specific one-time filter prompt setup. */
   setupCloudFilter?(): Promise<void>;
 }
@@ -49,7 +52,87 @@ function isCircuitOpen(): boolean {
 function recordFailure(): void { failures++; lastFailureTime = Date.now(); }
 function recordSuccess(): void { failures = 0; }
 
-function createSupermemoryProvider(apiKey: string): MemoryProvider {
+// --- LLM-based memory extraction ---
+
+interface MemoryFact {
+  content: string;
+  type: "preference" | "personal" | "project" | "decision" | "action" | "opinion";
+  confidence: number;
+}
+
+async function extractMemoryFacts(
+  messages: Array<{ role: string; content: string }>,
+  existingFacts: string[],
+  config: Config,
+): Promise<MemoryFact[]> {
+  try {
+    const lastMessages = messages.slice(-6);
+    const conversation = lastMessages.map((m) => `${m.role}: ${m.content.slice(0, 400)}`).join("\n");
+    const existingStr = existingFacts.slice(0, 20).map((f) => `- ${f}`).join("\n");
+
+    const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${config.openrouter.apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: config.openrouter.fastModel,
+        messages: [{
+          role: "user",
+          content: `Extract important facts from this conversation that are worth remembering long-term. Skip transient context, greetings, and small talk.
+
+Each fact should be a single clear sentence. Types: preference, personal, project, decision, action, opinion.
+
+Already known facts (DO NOT duplicate):
+${existingStr || "(none)"}
+
+Conversation:
+${conversation}
+
+Return JSON array of objects with {content, type, confidence} where confidence is 0.0-1.0. Return [] if nothing worth remembering. Only return the JSON array, nothing else.`,
+        }],
+        max_tokens: 500,
+        temperature: 0.1,
+      }),
+      signal: AbortSignal.timeout(15_000),
+    });
+    if (!res.ok) return [];
+    const data = await res.json();
+    const text = data.choices?.[0]?.message?.content?.trim() ?? "[]";
+    // Parse JSON — handle markdown code blocks
+    const cleaned = text.replace(/^```(?:json)?\n?/i, "").replace(/\n?```$/, "");
+    const facts = JSON.parse(cleaned) as MemoryFact[];
+    addToolCost(0.001);
+    return Array.isArray(facts) ? facts.filter((f) => f.content && f.confidence >= 0.5) : [];
+  } catch (err) {
+    log("memory", "extraction failed: %s", (err as Error).message);
+    return [];
+  }
+}
+
+function isDuplicate(newFact: string, existingFacts: string[]): boolean {
+  const normalized = newFact.toLowerCase().trim();
+  for (const existing of existingFacts) {
+    const norm = existing.toLowerCase().trim();
+    // Exact/near-exact match
+    if (norm === normalized) return true;
+    // Substring containment
+    if (norm.includes(normalized) || normalized.includes(norm)) return true;
+    // Word overlap
+    const newWords = new Set(normalized.split(/\s+/));
+    const existWords = new Set(norm.split(/\s+/));
+    const intersection = [...newWords].filter((w) => existWords.has(w));
+    const union = new Set([...newWords, ...existWords]);
+    if (union.size > 0 && intersection.length / union.size > 0.8) return true;
+  }
+  return false;
+}
+
+// Rate limit: only run extraction every 3rd call per session
+const ingestCallCounts = new Map<string, number>();
+
+function createSupermemoryProvider(apiKey: string, config?: Config): MemoryProvider {
   const client = new Supermemory({ apiKey });
 
   return {
@@ -130,22 +213,96 @@ function createSupermemoryProvider(apiKey: string): MemoryProvider {
 
     async ingestConversation(sessionKey, userId, msgs) {
       if (isCircuitOpen()) { log("memory", "ingest: circuit open, skipping"); return; }
-      const lastUser = [...msgs].reverse().find((m) => m.role === "user");
-      const lastAssistant = [...msgs].reverse().find((m) => m.role === "assistant");
-      if (!lastUser || !lastAssistant) return;
 
-      const summary = `Conversation excerpt:\nUser: ${lastUser.content.slice(0, 300)}\nKoda: ${lastAssistant.content.slice(0, 300)}`;
+      // Rate limit: only extract every 3rd call
+      const count = (ingestCallCounts.get(sessionKey) ?? 0) + 1;
+      ingestCallCounts.set(sessionKey, count);
+
+      if (count % 3 !== 0 || !config) {
+        // Fallback to simple excerpt storage
+        const lastUser = [...msgs].reverse().find((m) => m.role === "user");
+        const lastAssistant = [...msgs].reverse().find((m) => m.role === "assistant");
+        if (!lastUser || !lastAssistant) return;
+        const summary = `Conversation excerpt:\nUser: ${lastUser.content.slice(0, 300)}\nKoda: ${lastAssistant.content.slice(0, 300)}`;
+        try {
+          await client.documents.add({
+            content: summary,
+            containerTag: `user-${userId}`,
+            metadata: { session: sessionKey, type: "conversation" },
+          });
+          recordSuccess();
+          log("memory", "ingest: stored conversation excerpt for session %s", sessionKey);
+        } catch (err) {
+          recordFailure();
+          console.error("[memory] Ingest failed:", err);
+        }
+        return;
+      }
+
+      // Smart extraction: use LLM to extract structured facts
       try {
-        await client.documents.add({
-          content: summary,
+        const existingResults = await client.search.memories({
+          q: "user preferences facts personal info",
           containerTag: `user-${userId}`,
-          metadata: { session: sessionKey, type: "conversation" },
+          limit: 20,
         });
         recordSuccess();
-        log("memory", "ingest: stored conversation excerpt for session %s", sessionKey);
+        const existingFacts = ((existingResults as any).results ?? [])
+          .map((r: any) => r.memory ?? r.chunk ?? r.content ?? "")
+          .filter(Boolean);
+
+        const facts = await extractMemoryFacts(msgs, existingFacts, config);
+        let stored = 0;
+
+        for (const fact of facts) {
+          if (isDuplicate(fact.content, existingFacts)) {
+            log("memory", "ingest: skipping duplicate: %s", fact.content.slice(0, 60));
+            continue;
+          }
+          try {
+            await client.documents.add({
+              content: fact.content,
+              containerTag: `user-${userId}`,
+              metadata: {
+                session: sessionKey,
+                type: fact.type,
+                confidence: String(fact.confidence),
+                extracted: "true",
+              },
+            });
+            existingFacts.push(fact.content);
+            stored++;
+          } catch (err) {
+            recordFailure();
+            console.error("[memory] Fact store failed:", err);
+          }
+        }
+        if (stored > 0) log("memory", "ingest: extracted and stored %d facts for session %s", stored, sessionKey);
       } catch (err) {
         recordFailure();
-        console.error("[memory] Ingest failed:", err);
+        console.error("[memory] Smart ingest failed:", err);
+      }
+    },
+
+    async deleteByContent(userId: string, query: string): Promise<boolean> {
+      if (isCircuitOpen()) return false;
+      try {
+        const results = await client.search.memories({
+          q: query,
+          containerTag: `user-${userId}`,
+          limit: 1,
+        });
+        recordSuccess();
+        const docs = (results as any).results ?? [];
+        if (docs.length === 0) return false;
+        const docId = docs[0].id ?? docs[0].documentId;
+        if (!docId) return false;
+        await (client as any).documents.delete(docId);
+        return true;
+      } catch (err) {
+        recordFailure();
+        console.error("[memory] Delete failed:", err);
+        return false;
       }
     },
 
@@ -212,7 +369,7 @@ export function createMemoryProvider(config: Config): MemoryProvider {
     };
   }
   console.log("[memory] Using Supermemory cloud provider");
-  return createSupermemoryProvider(config.supermemory.apiKey);
+  return createSupermemoryProvider(config.supermemory.apiKey, config);
 }
 
 // ============================================================
@@ -245,5 +402,17 @@ export function registerMemoryTools(deps: { memory: MemoryProvider; getUserId: (
     },
   });
 
-  return { remember, recall };
+  const deleteMemory = tool({
+    description: "Delete a specific memory from long-term storage by searching for it.",
+    inputSchema: z.object({
+      query: z.string().describe("Search query to find the memory to delete"),
+    }),
+    execute: async ({ query }) => {
+      if (!memory.deleteByContent) return { success: false, error: "Delete not supported" };
+      const deleted = await memory.deleteByContent(getUserId(), query);
+      return { success: deleted, message: deleted ? "Memory deleted" : "Memory not found" };
+    },
+  });
+
+  return { remember, recall, deleteMemory };
 }

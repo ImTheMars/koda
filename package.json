@@ -1,6 +1,6 @@
 {
   "name": "koda",
-  "version": "0.12.0",
+  "version": "1.0.0",
   "type": "module",
   "scripts": {
     "start": "bun run src/index.ts",
@@ -12,6 +12,8 @@
   "dependencies": {
     "@ai-sdk/mcp": "^1.0.21",
     "@clack/prompts": "^0.9.1",
+    "@composio/core": "^0.6.3",
+    "@composio/vercel": "^0.6.3",
     "@openrouter/ai-sdk-provider": "^2.1.1",
     "ai": "^6.0.0",
     "chalk": "^5.4.1",
@@ -19,8 +21,8 @@
     "grammy": "^1.39.0",
     "ollama-ai-provider": "^1.2.0",
     "ora": "^8.2.0",
-    "supermemory": "^4.0.0",
     "pdf-parse": "^1.1.1",
+    "supermemory": "^4.0.0",
     "zod": "^4.3.0"
   },
   "engines": {

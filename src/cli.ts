@@ -143,6 +143,102 @@ async function runSetup(): Promise<void> {
   clack.outro(`${chalk.green("setup complete")} — run ${chalk.cyan("koda doctor")} to verify`);
 }
 
+// --- Setup Composio ---
+
+async function runSetupComposio(): Promise<void> {
+  clack.intro(chalk.cyan("koda setup composio"));
+
+  const workspace = getWorkspacePath();
+  const envPath = resolve(workspace, ".env");
+  const existingEnv = readEnvFile(envPath);
+
+  let apiKey = process.env.KODA_COMPOSIO_API_KEY ?? existingEnv.KODA_COMPOSIO_API_KEY ?? "";
+
+  if (!apiKey) {
+    const keyInput = await clack.text({
+      message: "Composio API key (from composio.dev/settings):",
+      validate: (v) => v ? undefined : "Required",
+    });
+    if (clack.isCancel(keyInput)) { clack.outro("cancelled"); return; }
+    apiKey = keyInput as string;
+
+    // Append to .env
+    const spinner = ora("saving API key").start();
+    try {
+      let content = "";
+      try { content = await readFile(envPath, "utf-8"); } catch {}
+      if (!content.endsWith("\n") && content.length > 0) content += "\n";
+      content += `KODA_COMPOSIO_API_KEY=${apiKey}\n`;
+      await writeFile(envPath, content, "utf-8");
+      try { await chmod(envPath, 0o600); } catch {}
+      spinner.succeed("API key saved");
+    } catch (err) {
+      spinner.fail("failed to save key: " + (err as Error).message);
+      return;
+    }
+  } else {
+    console.log(chalk.dim("  using existing Composio API key"));
+  }
+
+  // Import composio module
+  const { createComposioClient } = await import("./composio.js");
+  const composio = createComposioClient({ apiKey });
+
+  // Read owner ID from config
+  let ownerId = "owner";
+  try {
+    const configPath = resolve(workspace, "config.json");
+    const raw = JSON.parse(await readFile(configPath, "utf-8"));
+    ownerId = raw?.owner?.id ?? raw?.telegram?.adminIds?.[0] ?? "owner";
+  } catch {}
+
+  const apps = ["gmail", "googlecalendar", "github"];
+  const labels: Record<string, string> = {
+    gmail: "Gmail",
+    googlecalendar: "Google Calendar",
+    github: "GitHub",
+  };
+
+  for (const app of apps) {
+    const connectApp = await clack.confirm({
+      message: `Connect ${labels[app]}?`,
+    });
+    if (clack.isCancel(connectApp)) { clack.outro("cancelled"); return; }
+    if (!connectApp) continue;
+
+    const already = await composio.isConnected(ownerId, app);
+    if (already) {
+      console.log(chalk.green(`  ${labels[app]} already connected`));
+      continue;
+    }
+
+    const spinner = ora(`generating ${labels[app]} auth URL`).start();
+    try {
+      const url = await composio.getAuthUrl(ownerId, app);
+      spinner.succeed(`${labels[app]} — authorize here:`);
+      console.log(chalk.cyan(`  ${url}`));
+      console.log(chalk.dim("  open the URL above, authorize, then come back here"));
+
+      const waitForAuth = await clack.confirm({
+        message: `Done authorizing ${labels[app]}?`,
+      });
+      if (clack.isCancel(waitForAuth)) continue;
+
+      const checkSpinner = ora("verifying connection").start();
+      const connected = await composio.isConnected(ownerId, app);
+      if (connected) {
+        checkSpinner.succeed(`${labels[app]} connected`);
+      } else {
+        checkSpinner.warn(`${labels[app]} not yet connected — you can retry later`);
+      }
+    } catch (err) {
+      spinner.fail(`${labels[app]} setup failed: ${(err as Error).message}`);
+    }
+  }
+
+  clack.outro(chalk.green("composio setup complete"));
+}
+
 // --- Doctor ---
 
 async function runDoctor(): Promise<void> {
@@ -189,6 +285,28 @@ async function runDoctor(): Promise<void> {
       try { const p = resolve(workspace, "koda.db.test"); await writeFile(p, "", "utf-8"); const { unlink } = await import("fs/promises"); await unlink(p);
         return { status: "ok", detail: "SQLite writable" }; }
       catch { return { status: "fail", detail: "SQLite not writable" }; }
+    }},
+    { label: "Composio", async run() {
+      const key = getEnv("KODA_COMPOSIO_API_KEY");
+      if (!key) return { status: "ok", detail: "Composio not configured (optional)" };
+      try {
+        const { createComposioClient } = await import("./composio.js");
+        const composio = createComposioClient({ apiKey: key });
+        let ownerId = "owner";
+        try {
+          const raw = JSON.parse(await readFile(resolve(workspace, "config.json"), "utf-8"));
+          ownerId = raw?.owner?.id ?? raw?.telegram?.adminIds?.[0] ?? "owner";
+        } catch {}
+        const apps = [];
+        if (await composio.isConnected(ownerId, "gmail")) apps.push("Gmail");
+        if (await composio.isConnected(ownerId, "googlecalendar")) apps.push("Calendar");
+        if (await composio.isConnected(ownerId, "github")) apps.push("GitHub");
+        return apps.length > 0
+          ? { status: "ok", detail: `Composio: ${apps.join(", ")} connected` }
+          : { status: "warn", detail: "Composio key set but no apps connected — run koda setup composio" };
+      } catch (e) {
+        return { status: "warn", detail: `Composio: ${(e as Error).message}` };
+      }
     }},
     { label: "Bun version", async run() {
       const v = typeof Bun !== "undefined" ? Bun.version : null;
@@ -294,26 +412,92 @@ function runVersion(): void {
   console.log(`koda v${VERSION}`);
 }
 
+// --- Config get/set (v0.16) ---
+
+function getNestedValue(obj: Record<string, unknown>, path: string): unknown {
+  const parts = path.split(".");
+  let target: unknown = obj;
+  for (const key of parts) {
+    if (target == null || typeof target !== "object") return undefined;
+    target = (target as Record<string, unknown>)[key];
+  }
+  return target;
+}
+
+function setNestedValue(obj: Record<string, unknown>, path: string, value: unknown): void {
+  const parts = path.split(".");
+  let target = obj;
+  for (let i = 0; i < parts.length - 1; i++) {
+    const key = parts[i]!;
+    if (!target[key] || typeof target[key] !== "object") target[key] = {};
+    target = target[key] as Record<string, unknown>;
+  }
+  target[parts[parts.length - 1]!] = value;
+}
+
+function parseValue(raw: string): unknown {
+  if (raw === "true") return true;
+  if (raw === "false") return false;
+  const num = Number(raw);
+  if (!Number.isNaN(num) && raw.trim() !== "") return num;
+  return raw;
+}
+
+async function runConfigCommand(action: string, args: string[]): Promise<void> {
+  const workspace = getWorkspacePath();
+  const configPath = resolve(workspace, "config.json");
+  let raw: Record<string, unknown>;
+  try {
+    raw = JSON.parse(await readFile(configPath, "utf-8"));
+  } catch {
+    console.error("config.json not found — run koda setup first");
+    return;
+  }
+
+  if (action === "get" && args[0]) {
+    const val = getNestedValue(raw, args[0]);
+    console.log(val === undefined ? "(not set)" : JSON.stringify(val, null, 2));
+    return;
+  }
+
+  if (action === "set" && args[0] && args[1] !== undefined) {
+    const value = parseValue(args.slice(1).join(" "));
+    setNestedValue(raw, args[0], value);
+    await writeFile(configPath, JSON.stringify(raw, null, 2) + "\n", "utf-8");
+    console.log(chalk.green(`set ${args[0]} = ${JSON.stringify(value)}`));
+    return;
+  }
+
+  console.log("usage: koda config get <path> | koda config set <path> <value>");
+  console.log("example: koda config set scheduler.timezone America/New_York");
+}
+
 // --- Router ---
 
-export async function runCli(command: string): Promise<void> {
+export async function runCli(command: string, subcommand?: string): Promise<void> {
   switch (command) {
-    case "setup": await runSetup(); break;
+    case "setup":
+      if (subcommand === "composio") { await runSetupComposio(); break; }
+      await runSetup();
+      break;
     case "doctor": await runDoctor(); break;
     case "upgrade": await runUpgrade(); break;
     case "version": runVersion(); break;
-    default: console.log(`Unknown command: ${command}\nAvailable: setup, doctor, upgrade, version`);
+    case "config":
+      await runConfigCommand(subcommand ?? "", process.argv.slice(4));
+      break;
+    default: console.log(`Unknown command: ${command}\nAvailable: setup, setup composio, doctor, upgrade, version, config`);
   }
 }
 
 if (import.meta.main) {
   const command = process.argv[2];
   if (!command) {
-    console.log("Usage: koda <setup|doctor|upgrade|version>");
+    console.log("Usage: koda <setup|setup composio|doctor|upgrade|version|config>");
     process.exit(1);
   }
 
-  runCli(command).catch((err) => {
+  runCli(command, process.argv[3]).catch((err) => {
     console.error(err instanceof Error ? err.message : String(err));
     process.exit(1);
   });

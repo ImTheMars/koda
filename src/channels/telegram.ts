@@ -333,6 +333,7 @@ export function startTelegram(deps: TelegramDeps): TelegramResult {
       "/deep - force next message to use deep tier\n" +
       "/fast - force next message to use fast tier\n" +
       "/recap - summarize recent conversation\n" +
+      "/memories - list or delete stored memories\n" +
       "/model - view or change models\n\n" +
       "i can also search the web, remember things, run code, set reminders, manage files, generate images, and load skills.\n" +
       "send me voice messages — i'll transcribe and respond.\n" +
@@ -423,6 +424,37 @@ export function startTelegram(deps: TelegramDeps): TelegramResult {
       stopTyping(chatId);
       console.error("[telegram] Recap error:", err);
       await ctx.reply("ran into an issue generating the recap.").catch(() => {});
+    }
+  });
+
+  bot.command("memories", async (ctx) => {
+    const senderId = String(ctx.from?.id);
+    if (!isAllowed(senderId)) return;
+    const chatId = String(ctx.chat.id);
+    const args = ctx.message!.text.replace(/^\/memories\s*/, "").trim();
+
+    startTyping(chatId);
+    try {
+      let prompt: string;
+      if (args.startsWith("delete ")) {
+        const target = args.slice(7).trim();
+        prompt = `Delete the memory matching: "${target}". Use the deleteMemory tool. Confirm what was deleted.`;
+      } else {
+        prompt = "List my 10 most recent memories using the recall tool with a broad query. Number each one clearly.";
+      }
+
+      const result = await deps.streamAgent({
+        content: prompt,
+        senderId, chatId, channel: "telegram",
+        sessionKey: `telegram_${chatId}`,
+        source: "command",
+      });
+      await sendStreamReply(Number(chatId), result.fullStream, () => stopTyping(chatId));
+      await result.finishedPromise.catch(console.error);
+    } catch (err) {
+      stopTyping(chatId);
+      console.error("[telegram] Memories error:", err);
+      await ctx.reply("ran into an issue with memories.").catch(() => {});
     }
   });
 

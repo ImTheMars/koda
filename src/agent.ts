@@ -18,6 +18,9 @@ import { formatUserTime } from "./time.js";
 import { withToolContext, getPendingFiles } from "./tools/index.js";
 import type { UserProfile } from "./tools/memory.js";
 import { log } from "./log.js";
+import { detectFollowup } from "./followup.js";
+import { tasks as dbTasks } from "./db.js";
+import { parseCronNext } from "./time.js";
 
 export interface AgentInput {
   content: string;
@@ -51,6 +54,7 @@ export interface AgentDeps {
   getSkillsSummary: () => Promise<string | null>;
   getProfile: (userId: string, query: string, sessionKey?: string) => Promise<UserProfile>;
   ingestConversation: (sessionKey: string, userId: string, messages: Array<{ role: string; content: string }>) => Promise<void>;
+  getSoulAcks?: () => string[];
 }
 
 const ACK_TEMPLATES = [
@@ -222,6 +226,15 @@ you have the webSearch tool. use it whenever asked about:
 your training data is outdated. for anything time-sensitive — search first, answer second.`);
   }
 
+  if (deps.tier !== "fast") {
+    parts.push(`## Background research
+When a user mentions a topic you don't have strong knowledge about and it would benefit from research, consider spawning a research sub-agent using spawnAgent. Only when:
+- The user asks about something current/factual you're unsure about
+- The user mentions a product, company, or topic you could learn more about
+- The user is making a decision that would benefit from data
+The sub-agent researches while you continue the conversation. Mention that you're looking into it.`);
+  }
+
   if (deps.tier !== "fast" && deps.skillsSummary) {
     parts.push(`# Available Skills\n\nTo use a skill, read its SKILL.md file using the readFile tool.\n\n${deps.skillsSummary}`);
   }
@@ -230,14 +243,16 @@ your training data is outdated. for anything time-sensitive — search first, an
 }
 
 /** Classify input, send ack if warranted, return routing info. */
-function classifyAndAck(input: AgentInput, logPrefix: string): { tier: Tier; skipQuery: boolean } {
+function classifyAndAck(input: AgentInput, logPrefix: string, deps?: AgentDeps): { tier: Tier; skipQuery: boolean } {
   const tier = input.tierOverride ?? classifyTier(input.content);
   const intent = classifyIntent(input.content);
   const willAck = shouldAck({ content: input.content, tier, intent, source: input.source });
   log("agent", "%stier=%s intent=%s ack=%s len=%d%s", logPrefix, tier, intent, willAck, input.content.length, input.tierOverride ? " (override)" : "");
 
   if (input.onAck && willAck) {
-    const ackMsg = ACK_TEMPLATES[Math.abs(Number(Bun.hash(input.chatId))) % ACK_TEMPLATES.length]!;
+    const soulAcks = deps?.getSoulAcks?.() ?? [];
+    const templates = soulAcks.length > 0 ? soulAcks : ACK_TEMPLATES;
+    const ackMsg = templates[Math.abs(Number(Bun.hash(input.chatId))) % templates.length]!;
     input.onAck(ackMsg);
   }
 
@@ -352,6 +367,32 @@ function finalizeResult(
   const allMessages = [...history, { role: "user", content: input.content }, { role: "assistant", content: cleanedForHistory }];
   deps.ingestConversation(input.sessionKey, input.senderId, allMessages).catch(() => {});
 
+  // Follow-up intent detection (user-initiated messages only)
+  if (!input.source || input.source === "user") {
+    try {
+      const followup = detectFollowup(input.content);
+      if (followup) {
+        const runAt = new Date(Date.now() + followup.delayMs);
+        dbTasks.create({
+          id: `followup-${crypto.randomUUID().slice(0, 8)}`,
+          userId: input.senderId,
+          chatId: input.chatId,
+          channel: input.channel,
+          type: "reminder",
+          description: `Follow-up: ${followup.action} (${followup.timeExpression})`,
+          prompt: followup.prompt,
+          cron: null as any,
+          nextRunAt: runAt.toISOString(),
+          enabled: true,
+          oneShot: true,
+        });
+        log("agent", "%sfollowup detected: '%s' in %s → reminder at %s", logPrefix, followup.action.slice(0, 40), followup.timeExpression, runAt.toISOString());
+      }
+    } catch (err) {
+      log("agent", "%sfollowup detection error: %s", logPrefix, (err as Error).message);
+    }
+  }
+
   const pendingFiles = getPendingFiles();
 
   return {
@@ -376,7 +417,7 @@ export function createAgent(deps: AgentDeps) {
     const requestId = input.requestId ?? crypto.randomUUID().slice(0, 8);
     const logPrefix = `[${requestId}] `;
 
-    const { tier, skipQuery } = classifyAndAck(input, logPrefix);
+    const { tier, skipQuery } = classifyAndAck(input, logPrefix, deps);
     const systemPrompt = await buildAgentContext(deps, input, tier, skipQuery);
     const history = dbMessages.getHistory(input.sessionKey, 30);
     const messageList = trimHistory(buildMessages(input, history));
@@ -459,7 +500,7 @@ export function createStreamAgent(deps: AgentDeps) {
     const requestId = input.requestId ?? crypto.randomUUID().slice(0, 8);
     const logPrefix = `[${requestId}] stream `;
 
-    const { tier, skipQuery } = classifyAndAck(input, logPrefix);
+    const { tier, skipQuery } = classifyAndAck(input, logPrefix, deps);
     const systemPrompt = await buildAgentContext(deps, input, tier, skipQuery);
     const history = dbMessages.getHistory(input.sessionKey, 30);
     const messageList = trimHistory(buildMessages(input, history));

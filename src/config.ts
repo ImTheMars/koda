@@ -107,6 +107,9 @@ const ConfigSchema = z.object({
   github: withEmptyDefault(z.object({
     token: z.string().optional(),
   })),
+  composio: withEmptyDefault(z.object({
+    apiKey: z.string().optional(),
+  })),
   workspace: z.string().default("~/.koda"),
 });
 
@@ -147,6 +150,9 @@ function applyEnvOverrides(raw: Record<string, unknown>): Record<string, unknown
     ["KODA_EXA_API_KEY", ["exa", "apiKey"]],
     ["KODA_TELEGRAM_TOKEN", ["telegram", "token"]],
     ["KODA_GITHUB_TOKEN", ["github", "token"]],
+    ["KODA_COMPOSIO_API_KEY", ["composio", "apiKey"]],
+    ["KODA_TELEGRAM_WEBHOOK_URL", ["telegram", "webhookUrl"]],
+    ["KODA_TELEGRAM_WEBHOOK_SECRET", ["telegram", "webhookSecret"]],
   ];
 
   function setNested(obj: Record<string, unknown>, path: string[], value: unknown): void {
@@ -162,6 +168,25 @@ function applyEnvOverrides(raw: Record<string, unknown>): Record<string, unknown
   for (const [envKey, path] of mappings) {
     const value = env[envKey];
     if (value) setNested(raw, path, value);
+  }
+
+  // Comma-separated list env vars for Telegram access control
+  if (env["KODA_TELEGRAM_ALLOW_FROM"]) {
+    const tg = (raw.telegram ?? {}) as Record<string, unknown>;
+    tg.allowFrom = env["KODA_TELEGRAM_ALLOW_FROM"].split(",").map((s) => s.trim()).filter(Boolean);
+    raw.telegram = tg;
+  }
+  if (env["KODA_TELEGRAM_ADMIN_IDS"]) {
+    const tg = (raw.telegram ?? {}) as Record<string, unknown>;
+    tg.adminIds = env["KODA_TELEGRAM_ADMIN_IDS"].split(",").map((s) => s.trim()).filter(Boolean);
+    raw.telegram = tg;
+  }
+
+  // Auto-enable webhook mode when webhook URL is set via env
+  if (env["KODA_TELEGRAM_WEBHOOK_URL"]) {
+    const tg = (raw.telegram ?? {}) as Record<string, unknown>;
+    tg.useWebhook = true;
+    raw.telegram = tg;
   }
 
   const modeEnv = env["KODA_MODE"];

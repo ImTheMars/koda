@@ -13,6 +13,7 @@
 
 import type { SkillLoader } from "./tools/skills.js";
 import type { Config } from "./config.js";
+import type { MemoryProvider } from "./tools/memory.js";
 import { usage as dbUsage, tasks as dbTasks } from "./db.js";
 import { getSpawnLog, killSpawn } from "./tools/subagent.js";
 import { subscribe } from "./events.js";
@@ -22,6 +23,7 @@ export interface DashboardDeps {
   defaultUserId: string;
   config: Config;
   version: string;
+  memoryProvider?: MemoryProvider;
 }
 
 // --- API handlers ---
@@ -93,6 +95,45 @@ export async function handleDashboardRequest(req: Request, deps: DashboardDeps):
   if (url.pathname === "/api/skills") return skillsResponse(deps.skillLoader);
   if (url.pathname === "/api/tasks") return tasksResponse(deps.defaultUserId);
   if (url.pathname === "/api/events") return sseResponse();
+
+  // Memory search + delete
+  if (url.pathname === "/api/memories") {
+    if (req.method === "DELETE" && deps.memoryProvider) {
+      const content = url.searchParams.get("content") ?? "";
+      if (!content) return Response.json({ deleted: false, error: "content param required" }, { status: 400 });
+      const deleted = await deps.memoryProvider.deleteByContent?.(deps.defaultUserId, content) ?? false;
+      return Response.json({ deleted });
+    }
+    if (req.method === "GET" && deps.memoryProvider) {
+      const q = url.searchParams.get("q") ?? "";
+      if (!q) return Response.json({ memories: [] });
+      const memories = await deps.memoryProvider.recall(deps.defaultUserId, q, 20);
+      return Response.json({ memories });
+    }
+    return Response.json({ memories: [], error: "memory not configured" });
+  }
+
+  // Usage CSV export
+  if (url.pathname === "/api/export/usage" && req.method === "GET") {
+    const summary = dbUsage.getSummary(deps.defaultUserId);
+    const now = new Date();
+    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+    const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const todaySummary = dbUsage.getSummary(deps.defaultUserId, today);
+    const monthSummary = dbUsage.getSummary(deps.defaultUserId, monthStart);
+    const csv = [
+      "period,requests,cost,tool_cost,input_tokens,output_tokens",
+      `today,${todaySummary.totalRequests},${todaySummary.totalCost.toFixed(4)},${todaySummary.totalToolCost.toFixed(4)},${todaySummary.totalInputTokens},${todaySummary.totalOutputTokens}`,
+      `this_month,${monthSummary.totalRequests},${monthSummary.totalCost.toFixed(4)},${monthSummary.totalToolCost.toFixed(4)},${monthSummary.totalInputTokens},${monthSummary.totalOutputTokens}`,
+      `all_time,${summary.totalRequests},${summary.totalCost.toFixed(4)},${summary.totalToolCost.toFixed(4)},${summary.totalInputTokens},${summary.totalOutputTokens}`,
+    ].join("\n");
+    return new Response(csv, {
+      headers: {
+        "Content-Type": "text/csv",
+        "Content-Disposition": `attachment; filename="koda-usage-${now.toISOString().slice(0, 10)}.csv"`,
+      },
+    });
+  }
 
   if (url.pathname === "/api/spawns") {
     if (req.method === "DELETE") {
@@ -538,6 +579,20 @@ function buildDashboardHtml(deps: DashboardDeps): string {
       </ul>
     </div>
 
+    <!-- Memory search -->
+    <div class="section">
+      <div class="section-header">
+        <span class="section-title">Memory Search</span>
+      </div>
+      <div style="padding: 14px 20px; display: flex; gap: 8px;">
+        <input type="text" id="memorySearch" placeholder="Search memories..." style="flex:1; background:var(--surface2); border:1px solid var(--border); border-radius:6px; padding:8px 12px; color:var(--text); font-size:13px; outline:none;" />
+        <button onclick="searchMemories()" style="background:var(--accent); border:none; color:#fff; padding:8px 16px; border-radius:6px; cursor:pointer; font-size:12px;">Search</button>
+      </div>
+      <ul class="skills-list" id="memoryResults">
+        <li class="empty">Search to see results</li>
+      </ul>
+    </div>
+
     <!-- Sub-agent activity -->
     <div class="section">
       <div class="section-header">
@@ -547,6 +602,11 @@ function buildDashboardHtml(deps: DashboardDeps): string {
       <ul class="spawns-list" id="spawnsList">
         <li class="empty">Loading...</li>
       </ul>
+    </div>
+
+    <!-- Export -->
+    <div style="text-align:center; padding: 12px;">
+      <a href="/api/export/usage" download style="color:var(--muted); font-size:12px; text-decoration:none; border:1px solid var(--border); padding:6px 14px; border-radius:6px;">Export Usage CSV</a>
     </div>
   </div>
 
@@ -674,8 +734,42 @@ function buildDashboardHtml(deps: DashboardDeps): string {
     }
 
     async function killAgent(sessionKey) {
+      if (!confirm('Kill this sub-agent?')) return;
       await fetch('/api/spawns?session=' + encodeURIComponent(sessionKey), { method: 'DELETE' });
     }
+
+    async function searchMemories() {
+      var q = document.getElementById('memorySearch').value.trim();
+      if (!q) return;
+      var list = document.getElementById('memoryResults');
+      list.innerHTML = '<li class="empty">Searching...</li>';
+      try {
+        var res = await fetch('/api/memories?q=' + encodeURIComponent(q));
+        var data = await res.json();
+        if (!data.memories || !data.memories.length) {
+          list.innerHTML = '<li class="empty">No memories found</li>';
+          return;
+        }
+        list.innerHTML = data.memories.map(function(m, i) {
+          return '<li class="skill-row" style="justify-content:space-between">' +
+            '<div class="skill-body"><div class="skill-desc" style="white-space:normal;color:var(--text)">' + (i+1) + '. ' + esc(m) + '</div></div>' +
+            '<button class="kill-btn" onclick="deleteMemory(this, \'' + esc(m.replace(/'/g, "\\'").slice(0, 100)) + '\')">delete</button>' +
+            '</li>';
+        }).join('');
+      } catch(e) {
+        list.innerHTML = '<li class="empty">Search failed</li>';
+      }
+    }
+
+    async function deleteMemory(btn, content) {
+      if (!confirm('Delete this memory?')) return;
+      await fetch('/api/memories?content=' + encodeURIComponent(content), { method: 'DELETE' });
+      btn.parentElement.remove();
+    }
+
+    document.getElementById('memorySearch').addEventListener('keydown', function(e) {
+      if (e.key === 'Enter') searchMemories();
+    });
 
     function renderSpawns(spawns) {
       var list = document.getElementById('spawnsList');

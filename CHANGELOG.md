@@ -4,6 +4,69 @@ all notable changes to koda.
 
 ---
 
+## 2026-02-24
+### v1.0.0 — Koda 1.0
+
+the 1.0 release. four incremental releases (v0.13–v0.16) shipped as one tag. composio integrations for email/calendar/github, smarter memory, follow-up detection, bootstrap split, structured logging, and polish across the board.
+
+#### v0.13 — Email + Calendar + Daily Briefing (via Composio)
+
+- **composio integration** (`src/composio.ts`) — thin wrapper around Composio SDK. manages per-user OAuth connections and exposes Vercel AI SDK-compatible tools for Gmail, Google Calendar, and GitHub.
+- **composio config** — `composio.apiKey` config section + `KODA_COMPOSIO_API_KEY` env override.
+- **`koda setup composio`** — CLI wizard to set API key + initiate OAuth for Gmail, Calendar, GitHub. opens browser for authorization.
+- **composio doctor check** — `koda doctor` verifies Composio key and connected apps.
+- **oauth callback** — `/oauth/callback` route shows success/fail page after Composio OAuth exchange.
+- **composio tool registration** — Gmail, Calendar, GitHub tools auto-register when connected. tools merge directly into agent's ToolSet.
+- **daily briefing seed task** — recurring 8AM task summarizing calendar, emails, and pending tasks. only seeded when Composio is configured.
+
+#### v0.14 — Memory Intelligence + Proactive
+
+- **smarter memory ingestion** — LLM-powered fact extraction via fast model. extracts structured facts (preference, personal, project, decision, action, opinion) with confidence scores. runs every 3rd ingestion call per session. deduplicates against existing facts using normalization, substring containment, and word overlap.
+- **`deleteMemory` tool** — search-based memory deletion via Supermemory document API.
+- **`/memories` command** — Telegram command to list recent memories or delete specific ones (`/memories delete <query>`).
+- **dashboard memory search** — `GET /api/memories?q=` search endpoint + delete endpoint. search input + results list in dashboard HTML.
+- **follow-up intent detection** (`src/followup.ts`) — pattern-based detection of casual future intents ("I'll do X tomorrow"). creates one-shot reminders automatically. skips explicit "remind me" (handled by schedule tools).
+- **background research prompt** — deep tier system prompt instructs agent to consider spawning research sub-agents for unfamiliar topics.
+
+#### v0.15 — GitHub + Browser + Spotify (via Composio)
+
+- **github tools** — Composio GitHub toolkit auto-registers (create issue, list PRs, comment, check CI). connected via `koda setup composio`.
+- **spotify MCP** — community `@modelcontextprotocol/server-spotify` via config.mcp.servers (docs only).
+- **browser MCP** — Playwright `@modelcontextprotocol/server-playwright` via config.mcp.servers (docs only).
+
+#### v0.16 — Polish
+
+- **bootstrap split** — `src/index.ts` decomposed into `src/boot/config.ts`, `src/boot/providers.ts`, `src/boot/mcp.ts`, `src/boot/server.ts`. each exports a `bootXyz()` function. index.ts orchestrates the sequence.
+- **ack templates from soul** — `soul.d/acks.md` provides custom acknowledgment templates. `SoulLoader.getAckTemplates()` reads them. falls back to built-in templates.
+- **MCP tool namespacing** — when multiple MCP servers are configured, tool names are prefixed with server name (`${server.name}_${toolName}`) to prevent collisions.
+- **failure-triggered MCP reconnect** — replaced 60s polling with on-demand reconnect via `reconnectMcpServer()`. tracks per-server reconnecting state to prevent concurrent attempts.
+- **structured JSON logging** — `LOG_FORMAT=json` env var activates JSON output (`{ts, level, tag, msg}`). added `logInfo()` and `logWarn()` helpers.
+- **`koda config get/set`** — CLI command to read/write config values. dot-path traversal, auto-parses booleans and numbers.
+- **dashboard kill confirmation** — `confirm()` dialog before killing sub-agents.
+- **dashboard usage export** — `GET /api/export/usage` returns CSV download of usage summaries.
+- **flexible soul sections** — `updateSoul` tool accepts arbitrary section names (not just hardcoded enum).
+
+#### dependencies
+
+- **added**: `@composio/core` ^0.6.3, `@composio/vercel` ^0.6.3
+
+#### new files
+
+- `src/composio.ts` — Composio SDK wrapper
+- `src/followup.ts` — follow-up intent detection
+- `src/boot/config.ts` — config boot phase
+- `src/boot/providers.ts` — providers boot phase
+- `src/boot/mcp.ts` — MCP boot phase
+- `src/boot/server.ts` — HTTP server boot phase
+- `config/soul.d/acks.md` — default ack templates
+
+#### config
+
+- **added**: `composio.apiKey`
+- **version**: `0.12.0` → `1.0.0`
+
+---
+
 ## 2026-02-23
 ### v0.12.0 — scheduler hardening, task tracking, delimiter fix, context.md, token trim, request IDs, skills
 

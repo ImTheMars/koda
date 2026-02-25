@@ -20,6 +20,7 @@ import { registerStatusTools } from "./status.js";
 import { registerSandboxTools } from "./sandbox.js";
 import { registerImageTools } from "./image.js";
 import { registerFileTools } from "./files.js";
+import { createComposioClient } from "../composio.js";
 
 interface ToolRuntimeContext {
   userId: string;
@@ -120,6 +121,29 @@ export async function buildTools(deps: {
 
   // File sending
   Object.assign(tools, registerFileTools({ workspace }));
+
+  // Composio integrations (Gmail, Calendar, GitHub)
+  if (config.composio?.apiKey) {
+    try {
+      const composio = createComposioClient({ apiKey: config.composio.apiKey });
+      const ownerId = config.owner.id;
+      const connectedApps: string[] = [];
+
+      if (await composio.isConnected(ownerId, "gmail")) connectedApps.push("GMAIL");
+      if (await composio.isConnected(ownerId, "googlecalendar")) connectedApps.push("GOOGLECALENDAR");
+      if (await composio.isConnected(ownerId, "github")) connectedApps.push("GITHUB");
+
+      if (connectedApps.length > 0) {
+        const composioTools = await composio.getTools(ownerId, connectedApps);
+        Object.assign(tools, composioTools);
+        console.log(`[boot] Composio: ${connectedApps.join(", ")} (${Object.keys(composioTools).length} tools)`);
+      } else {
+        console.log("[boot] Composio: no connected apps — run `koda setup composio`");
+      }
+    } catch (err) {
+      console.warn("[boot] Composio: failed to load tools:", (err as Error).message);
+    }
+  }
 
   return tools;
 }
