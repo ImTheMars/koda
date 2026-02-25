@@ -247,7 +247,7 @@ function classifyAndAck(input: AgentInput, logPrefix: string, deps?: AgentDeps):
   const tier = input.tierOverride ?? classifyTier(input.content);
   const intent = classifyIntent(input.content);
   const willAck = shouldAck({ content: input.content, tier, intent, source: input.source });
-  log("agent", "%stier=%s intent=%s ack=%s len=%d%s", logPrefix, tier, intent, willAck, input.content.length, input.tierOverride ? " (override)" : "");
+  console.log(`[agent] ${logPrefix}tier=${tier} intent=${intent} ack=${willAck}${input.tierOverride ? " (override)" : ""}`);
 
   if (input.onAck && willAck) {
     const soulAcks = deps?.getSoulAcks?.() ?? [];
@@ -308,7 +308,7 @@ function makePrepareStep(
       if (idx < tierOrder.length - 1) {
         state.currentTier = tierOrder[idx + 1]!;
         const newModelId = getModelId(state.currentTier, config);
-        log("agent", "%sescalated tier=%s model=%s", logPrefix, state.currentTier, newModelId);
+        console.log(`[agent] ${logPrefix}ESCALATED tier=${state.currentTier} model=${newModelId} (step ${stepNumber})`);
         const newFallbacks = FAILOVER[state.currentTier] ?? [];
         return { model: provider(newModelId, { models: newFallbacks }) };
       }
@@ -323,8 +323,7 @@ function makeOnStepFinish(toolsUsed: string[], state: { stepCount: number }, log
     if (step.toolCalls) {
       for (const call of step.toolCalls) {
         toolsUsed.push(call.toolName);
-        log("agent", "%sstep %d tool=%s args=%s", logPrefix, state.stepCount, call.toolName,
-          JSON.stringify(call.args ?? {}).slice(0, 500));
+        console.log(`[agent] ${logPrefix}step ${state.stepCount} CALL ${call.toolName} args=${JSON.stringify(call.args ?? {}).slice(0, 500)}`);
       }
     }
     if (step.toolResults) {
@@ -332,9 +331,9 @@ function makeOnStepFinish(toolsUsed: string[], state: { stepCount: number }, log
         const raw = JSON.stringify(res.result ?? "").slice(0, 800);
         const isError = typeof res.result === "string" && (res.result.includes("Error") || res.result.includes("error"));
         if (isError) {
-          log("agent", "%sstep %d tool=%s ERROR=%s", logPrefix, state.stepCount, res.toolName, raw);
+          console.error(`[agent] ${logPrefix}step ${state.stepCount} TOOL_ERROR ${res.toolName}: ${raw}`);
         } else {
-          log("agent", "%sstep %d tool=%s result=%s", logPrefix, state.stepCount, res.toolName, raw);
+          console.log(`[agent] ${logPrefix}step ${state.stepCount} RESULT ${res.toolName} ${raw.slice(0, 300)}`);
         }
       }
     }
@@ -358,7 +357,7 @@ function finalizeResult(
   const cost = calculateCost(modelId, promptTokens, completionTokens);
   const uniqueTools = [...new Set(toolsUsed)];
 
-  log("agent", "%sdone tokens=%d/%d cost=$%s toolCost=$%s tools=[%s]", logPrefix, promptTokens, completionTokens, cost.toFixed(4), toolCost.toFixed(4), uniqueTools.join(","));
+  console.log(`[agent] ${logPrefix}DONE model=${modelId} tokens=${promptTokens}/${completionTokens} cost=$${cost.toFixed(4)} toolCost=$${toolCost.toFixed(4)} tools=[${uniqueTools.join(",")}]`);
 
   dbUsage.track({
     userId: input.senderId,
@@ -450,7 +449,7 @@ export function createAgent(deps: AgentDeps) {
         pendingFiles: [],
       }, async () => {
         const modelId = getModelId(state.currentTier, config);
-        log("agent", "%smodel=%s session=%s", logPrefix, modelId, input.sessionKey);
+        console.log(`[agent] ${logPrefix}model=${modelId} session=${input.sessionKey} history=${messageList.length}msgs`);
         const fallbackIds = FAILOVER[state.currentTier] ?? [];
         const model = provider(modelId, { models: fallbackIds });
 
@@ -521,7 +520,7 @@ export function createStreamAgent(deps: AgentDeps) {
     const state = { currentTier: tier, stepCount: 0 };
 
     const modelId = getModelId(state.currentTier, config);
-    log("agent", "%smodel=%s session=%s", logPrefix, modelId, input.sessionKey);
+    console.log(`[agent] ${logPrefix}model=${modelId} session=${input.sessionKey} history=${messageList.length}msgs`);
     const fallbackIds = FAILOVER[state.currentTier] ?? [];
     const model = provider(modelId, { models: fallbackIds });
 

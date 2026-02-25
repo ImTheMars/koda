@@ -40,6 +40,7 @@ export function bootServer(deps: ServerDeps) {
 
       // Telegram webhook endpoint
       if (url.pathname === "/telegram" && req.method === "POST" && telegram?.handleWebhook) {
+        console.log(`[http] POST /telegram from=${req.headers.get("x-forwarded-for") ?? "?"}`);
         return telegram.handleWebhook(req);
       }
 

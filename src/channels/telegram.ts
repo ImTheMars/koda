@@ -524,16 +524,21 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
   // --- Text messages (streaming) ---
   bot.on("message:text", async (ctx) => {
     const senderId = String(ctx.from?.id);
-    if (!isAllowed(senderId)) return;
+    if (!isAllowed(senderId)) {
+      console.log(`[msg] BLOCKED text from=${senderId} reason=not_allowed`);
+      return;
+    }
     const key = dedupKey(ctx.chat.id, ctx.message.message_id);
-    if (processedMessages.has(key)) { log("telegram", "dedup: text hash collision"); return; }
+    if (processedMessages.has(key)) { console.log(`[msg] DEDUP text from=${senderId}`); return; }
     processedMessages.add(key);
     const chatId = String(ctx.chat.id);
-    log("telegram", "text from=%s chat=%s len=%d", senderId, chatId, ctx.message.text.length);
-    if (isRateLimited(chatId)) { await ctx.reply("slow down! you're sending messages too fast."); return; }
+    const preview = ctx.message.text.slice(0, 100);
+    console.log(`[msg] IN text from=${senderId} chat=${chatId} len=${ctx.message.text.length} "${preview}"`);
+    if (isRateLimited(chatId)) { console.log(`[msg] RATE_LIMITED chat=${chatId}`); await ctx.reply("slow down! you're sending messages too fast."); return; }
 
     const content = enrichContent(ctx.message.text, ctx.message);
     const tierOverride = consumeTierOverride(chatId);
+    const t0 = Date.now();
 
     startTyping(chatId);
     try {
@@ -549,13 +554,18 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
       await sendStreamReply(Number(chatId), streamResult.fullStream, () => stopTyping(chatId));
       const agentResult = await streamResult.finishedPromise.catch((err) => { console.error(err); return null; });
 
+      const elapsed = Date.now() - t0;
+      const replyPreview = (agentResult?.text ?? "").slice(0, 120);
+      console.log(`[msg] OUT text to=${chatId} len=${agentResult?.text?.length ?? 0} tier=${agentResult?.tier ?? "?"} tools=[${agentResult?.toolsUsed?.join(",") ?? ""}] ${elapsed}ms "${replyPreview}"`);
+
       // Send pending files
       if (agentResult?.files?.length) {
+        console.log(`[msg] FILES to=${chatId} count=${agentResult.files.length}`);
         await sendPendingFiles(Number(chatId), agentResult.files);
       }
     } catch (err) {
       stopTyping(chatId);
-      console.error("[telegram] Stream error:", err);
+      console.error(`[msg] ERROR text from=${senderId} chat=${chatId} ${Date.now() - t0}ms:`, err);
       await ctx.reply("ran into an issue, try again?").catch(() => {});
     }
   });
@@ -563,13 +573,13 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
   // --- Photo messages (streaming) ---
   bot.on("message:photo", async (ctx) => {
     const senderId = String(ctx.from?.id);
-    if (!isAllowed(senderId)) return;
+    if (!isAllowed(senderId)) { console.log(`[msg] BLOCKED photo from=${senderId} reason=not_allowed`); return; }
     const key = dedupKey(ctx.chat.id, ctx.message.message_id);
     if (processedMessages.has(key)) return;
     processedMessages.add(key);
     const chatId = String(ctx.chat.id);
-    log("telegram", "photo from=%s chat=%s", senderId, chatId);
-    if (isRateLimited(chatId)) { await ctx.reply("slow down!"); return; }
+    console.log(`[msg] IN photo from=${senderId} chat=${chatId} caption="${(ctx.message.caption ?? "").slice(0, 80)}"`);
+    if (isRateLimited(chatId)) { console.log(`[msg] RATE_LIMITED chat=${chatId}`); await ctx.reply("slow down!"); return; }
 
     let caption = ctx.message.caption ?? "What's in this image?";
 
@@ -601,6 +611,7 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
     }
     const buffer = Buffer.from(await response.arrayBuffer());
 
+    const t0 = Date.now();
     startTyping(chatId);
     try {
       const streamResult = await deps.streamAgent({
@@ -614,12 +625,13 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
       consecutiveErrors = 0;
       await sendStreamReply(Number(chatId), streamResult.fullStream, () => stopTyping(chatId));
       const agentResult = await streamResult.finishedPromise.catch((err) => { console.error(err); return null; });
+      console.log(`[msg] OUT photo to=${chatId} len=${agentResult?.text?.length ?? 0} tier=${agentResult?.tier ?? "?"} ${Date.now() - t0}ms`);
       if (agentResult?.files?.length) {
         await sendPendingFiles(Number(chatId), agentResult.files);
       }
     } catch (err) {
       stopTyping(chatId);
-      console.error("[telegram] Photo stream error:", err);
+      console.error(`[msg] ERROR photo from=${senderId} chat=${chatId} ${Date.now() - t0}ms:`, err);
       await ctx.reply("ran into an issue, try again?").catch(() => {});
     }
   });
@@ -627,13 +639,13 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
   // --- Document/PDF messages ---
   bot.on("message:document", async (ctx) => {
     const senderId = String(ctx.from?.id);
-    if (!isAllowed(senderId)) return;
+    if (!isAllowed(senderId)) { console.log(`[msg] BLOCKED document from=${senderId} reason=not_allowed`); return; }
     const key = dedupKey(ctx.chat.id, ctx.message.message_id);
     if (processedMessages.has(key)) return;
     processedMessages.add(key);
     const chatId = String(ctx.chat.id);
-    log("telegram", "document from=%s chat=%s", senderId, chatId);
-    if (isRateLimited(chatId)) { await ctx.reply("slow down!"); return; }
+    console.log(`[msg] IN document from=${senderId} chat=${chatId} file="${ctx.message.document.file_name ?? "?"}"`);
+    if (isRateLimited(chatId)) { console.log(`[msg] RATE_LIMITED chat=${chatId}`); await ctx.reply("slow down!"); return; }
 
     const doc = ctx.message.document;
     const fileName = doc.file_name ?? "document";
@@ -681,6 +693,7 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
       content = `[replying to: "${ctx.message.reply_to_message.text.slice(0, 500)}"]\n\n${content}`;
     }
 
+    const t0 = Date.now();
     startTyping(chatId);
     try {
       const streamResult = await deps.streamAgent({
@@ -693,12 +706,13 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
       consecutiveErrors = 0;
       await sendStreamReply(Number(chatId), streamResult.fullStream, () => stopTyping(chatId));
       const agentResult = await streamResult.finishedPromise.catch((err) => { console.error(err); return null; });
+      console.log(`[msg] OUT document to=${chatId} len=${agentResult?.text?.length ?? 0} tier=${agentResult?.tier ?? "?"} ${Date.now() - t0}ms`);
       if (agentResult?.files?.length) {
         await sendPendingFiles(Number(chatId), agentResult.files);
       }
     } catch (err) {
       stopTyping(chatId);
-      console.error("[telegram] Document stream error:", err);
+      console.error(`[msg] ERROR document from=${senderId} chat=${chatId} ${Date.now() - t0}ms:`, err);
       await ctx.reply("ran into an issue processing that file.").catch(() => {});
     }
   });
@@ -706,13 +720,13 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
   // --- Voice messages ---
   bot.on("message:voice", async (ctx) => {
     const senderId = String(ctx.from?.id);
-    if (!isAllowed(senderId)) return;
+    if (!isAllowed(senderId)) { console.log(`[msg] BLOCKED voice from=${senderId} reason=not_allowed`); return; }
     const key = dedupKey(ctx.chat.id, ctx.message.message_id);
     if (processedMessages.has(key)) return;
     processedMessages.add(key);
     const chatId = String(ctx.chat.id);
-    log("telegram", "voice from=%s chat=%s", senderId, chatId);
-    if (isRateLimited(chatId)) { await ctx.reply("slow down!"); return; }
+    console.log(`[msg] IN voice from=${senderId} chat=${chatId} duration=${ctx.message.voice.duration}s`);
+    if (isRateLimited(chatId)) { console.log(`[msg] RATE_LIMITED chat=${chatId}`); await ctx.reply("slow down!"); return; }
 
     const voice = ctx.message.voice;
     const file = await ctx.api.getFile(voice.file_id);
@@ -734,9 +748,12 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
       return;
     }
 
+    console.log(`[msg] TRANSCRIBED voice from=${senderId} "${transcription.slice(0, 100)}"`);
+
     let content = `[voice message] ${transcription}`;
     content = enrichContent(content, ctx.message);
     const tierOverride = consumeTierOverride(chatId);
+    const t0 = Date.now();
 
     startTyping(chatId);
     try {
@@ -751,12 +768,13 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
       consecutiveErrors = 0;
       await sendStreamReply(Number(chatId), streamResult.fullStream, () => stopTyping(chatId));
       const agentResult = await streamResult.finishedPromise.catch((err) => { console.error(err); return null; });
+      console.log(`[msg] OUT voice to=${chatId} len=${agentResult?.text?.length ?? 0} tier=${agentResult?.tier ?? "?"} ${Date.now() - t0}ms`);
       if (agentResult?.files?.length) {
         await sendPendingFiles(Number(chatId), agentResult.files);
       }
     } catch (err) {
       stopTyping(chatId);
-      console.error("[telegram] Voice stream error:", err);
+      console.error(`[msg] ERROR voice from=${senderId} chat=${chatId} ${Date.now() - t0}ms:`, err);
       await ctx.reply("ran into an issue, try again?").catch(() => {});
     }
   });
@@ -764,13 +782,13 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
   // --- Video note (circle video) messages ---
   bot.on("message:video_note", async (ctx) => {
     const senderId = String(ctx.from?.id);
-    if (!isAllowed(senderId)) return;
+    if (!isAllowed(senderId)) { console.log(`[msg] BLOCKED video_note from=${senderId} reason=not_allowed`); return; }
     const key = dedupKey(ctx.chat.id, ctx.message.message_id);
     if (processedMessages.has(key)) return;
     processedMessages.add(key);
     const chatId = String(ctx.chat.id);
-    log("telegram", "video_note from=%s chat=%s", senderId, chatId);
-    if (isRateLimited(chatId)) { await ctx.reply("slow down!"); return; }
+    console.log(`[msg] IN video_note from=${senderId} chat=${chatId}`);
+    if (isRateLimited(chatId)) { console.log(`[msg] RATE_LIMITED chat=${chatId}`); await ctx.reply("slow down!"); return; }
 
     const videoNote = ctx.message.video_note;
     const file = await ctx.api.getFile(videoNote.file_id);
@@ -795,6 +813,7 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
     let content = `[voice message] ${transcription}`;
     content = enrichContent(content, ctx.message);
     const tierOverride = consumeTierOverride(chatId);
+    const t0 = Date.now();
 
     startTyping(chatId);
     try {
@@ -809,12 +828,13 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
       consecutiveErrors = 0;
       await sendStreamReply(Number(chatId), streamResult.fullStream, () => stopTyping(chatId));
       const agentResult = await streamResult.finishedPromise.catch((err) => { console.error(err); return null; });
+      console.log(`[msg] OUT video_note to=${chatId} len=${agentResult?.text?.length ?? 0} tier=${agentResult?.tier ?? "?"} ${Date.now() - t0}ms`);
       if (agentResult?.files?.length) {
         await sendPendingFiles(Number(chatId), agentResult.files);
       }
     } catch (err) {
       stopTyping(chatId);
-      console.error("[telegram] Video note stream error:", err);
+      console.error(`[msg] ERROR video_note from=${senderId} chat=${chatId} ${Date.now() - t0}ms:`, err);
       await ctx.reply("ran into an issue, try again?").catch(() => {});
     }
   });
@@ -827,10 +847,11 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
     if (processedMessages.has(key)) return;
     processedMessages.add(key);
     const chatId = String(ctx.editedMessage!.chat.id);
-    log("telegram", "edited text from=%s chat=%s", senderId, chatId);
+    console.log(`[msg] IN edited from=${senderId} chat=${chatId} "${ctx.editedMessage!.text?.slice(0, 80)}"`);
     if (isRateLimited(chatId)) return;
 
     const content = `[edited] ${ctx.editedMessage!.text}`;
+    const t0 = Date.now();
 
     startTyping(chatId);
     try {
@@ -842,10 +863,11 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
 
       consecutiveErrors = 0;
       await sendStreamReply(Number(chatId), streamResult.fullStream, () => stopTyping(chatId));
-      await streamResult.finishedPromise.catch(console.error);
+      const agentResult = await streamResult.finishedPromise.catch((err) => { console.error(err); return null; });
+      console.log(`[msg] OUT edited to=${chatId} len=${agentResult?.text?.length ?? 0} ${Date.now() - t0}ms`);
     } catch (err) {
       stopTyping(chatId);
-      console.error("[telegram] Edited message error:", err);
+      console.error(`[msg] ERROR edited from=${senderId} chat=${chatId} ${Date.now() - t0}ms:`, err);
     }
   });
 
@@ -1004,15 +1026,20 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
         if (config.telegram.webhookSecret) {
           const secretHeader = req.headers.get("x-telegram-bot-api-secret-token");
           if (secretHeader !== config.telegram.webhookSecret) {
+            console.warn(`[webhook] UNAUTHORIZED request (bad secret)`);
             return new Response("Unauthorized", { status: 401 });
           }
         }
         try {
-          const update = await req.json();
+          const update = await req.json() as any;
+          const updateType = Object.keys(update).filter((k: string) => k !== "update_id").join(",") || "unknown";
+          const fromId = update.message?.from?.id ?? update.edited_message?.from?.id ?? "?";
+          const preview = (update.message?.text ?? update.edited_message?.text ?? "").slice(0, 60);
+          console.log(`[webhook] id=${update.update_id} type=${updateType} from=${fromId}${preview ? ` "${preview}"` : ""}`);
           await bot.handleUpdate(update);
           return new Response("ok");
         } catch (err) {
-          console.error("[telegram] Webhook error:", err);
+          console.error("[webhook] ERROR processing update:", err);
           return new Response("error", { status: 500 });
         }
       },
