@@ -126,15 +126,10 @@ export async function buildTools(deps: {
   if (config.composio?.apiKey) {
     try {
       const composio = createComposioClient({ apiKey: config.composio.apiKey });
-      const ownerId = config.owner.id;
-      const connectedApps: string[] = [];
-
-      if (await composio.isConnected(ownerId, "gmail")) connectedApps.push("GMAIL");
-      if (await composio.isConnected(ownerId, "googlecalendar")) connectedApps.push("GOOGLECALENDAR");
-      if (await composio.isConnected(ownerId, "github")) connectedApps.push("GITHUB");
+      const connectedApps = await composio.listConnectedApps();
 
       if (connectedApps.length > 0) {
-        const composioTools = await composio.getTools(ownerId, connectedApps);
+        const composioTools = await composio.getTools(connectedApps);
         Object.assign(tools, composioTools);
         console.log(`[boot] Composio: ${connectedApps.join(", ")} (${Object.keys(composioTools).length} tools)`);
       } else {

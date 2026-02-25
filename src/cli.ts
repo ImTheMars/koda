@@ -206,7 +206,7 @@ async function runSetupComposio(): Promise<void> {
     if (clack.isCancel(connectApp)) { clack.outro("cancelled"); return; }
     if (!connectApp) continue;
 
-    const already = await composio.isConnected(ownerId, app);
+    const already = await composio.isConnected(app);
     if (already) {
       console.log(chalk.green(`  ${labels[app]} already connected`));
       continue;
@@ -214,7 +214,7 @@ async function runSetupComposio(): Promise<void> {
 
     const spinner = ora(`generating ${labels[app]} auth URL`).start();
     try {
-      const url = await composio.getAuthUrl(ownerId, app);
+      const url = await composio.getAuthUrl(app);
       spinner.succeed(`${labels[app]} — authorize here:`);
       console.log(chalk.cyan(`  ${url}`));
       console.log(chalk.dim("  open the URL above, authorize, then come back here"));
@@ -225,7 +225,7 @@ async function runSetupComposio(): Promise<void> {
       if (clack.isCancel(waitForAuth)) continue;
 
       const checkSpinner = ora("verifying connection").start();
-      const connected = await composio.isConnected(ownerId, app);
+      const connected = await composio.isConnected(app);
       if (connected) {
         checkSpinner.succeed(`${labels[app]} connected`);
       } else {
@@ -298,9 +298,9 @@ async function runDoctor(): Promise<void> {
           ownerId = raw?.owner?.id ?? raw?.telegram?.adminIds?.[0] ?? "owner";
         } catch {}
         const apps = [];
-        if (await composio.isConnected(ownerId, "gmail")) apps.push("Gmail");
-        if (await composio.isConnected(ownerId, "googlecalendar")) apps.push("Calendar");
-        if (await composio.isConnected(ownerId, "github")) apps.push("GitHub");
+        if (await composio.isConnected("gmail")) apps.push("Gmail");
+        if (await composio.isConnected("googlecalendar")) apps.push("Calendar");
+        if (await composio.isConnected("github")) apps.push("GitHub");
         return apps.length > 0
           ? { status: "ok", detail: `Composio: ${apps.join(", ")} connected` }
           : { status: "warn", detail: "Composio key set but no apps connected — run koda setup composio" };

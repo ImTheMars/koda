@@ -14,9 +14,10 @@ export interface ComposioDeps {
 }
 
 export interface ComposioClient {
-  getTools(userId: string, toolkits: string[]): Promise<ToolSet>;
-  getAuthUrl(userId: string, app: string): Promise<string>;
-  isConnected(userId: string, app: string): Promise<boolean>;
+  getTools(toolkits: string[]): Promise<ToolSet>;
+  getAuthUrl(app: string): Promise<string>;
+  isConnected(app: string): Promise<boolean>;
+  listConnectedApps(): Promise<string[]>;
 }
 
 export function createComposioClient(deps: ComposioDeps): ComposioClient {
@@ -24,51 +25,59 @@ export function createComposioClient(deps: ComposioDeps): ComposioClient {
   const client = new Composio({ apiKey: deps.apiKey, provider: provider as any });
 
   return {
-    async getTools(userId: string, toolkits: string[]): Promise<ToolSet> {
-      const tools = await (client as any).getTools({
-        apps: toolkits,
-        entityId: userId,
-      });
-      // Composio returns Vercel AI SDK-compatible tools when using VercelProvider
-      const result: ToolSet = {};
-      if (Array.isArray(tools)) {
-        for (const t of tools) {
-          if (t && typeof t === "object") {
-            const name = (t as any).name ?? (t as any).slug ?? `composio_${Object.keys(result).length}`;
-            result[name] = t as any;
-          }
-        }
-      } else if (tools && typeof tools === "object") {
-        Object.assign(result, tools);
+    async getTools(toolkits: string[]): Promise<ToolSet> {
+      // Get raw tools then wrap for Vercel AI SDK
+      const rawTools = await (client.tools as any).getRawComposioTools(
+        { toolkits },
+        {},
+      );
+      if (!rawTools || rawTools.length === 0) return {};
+
+      const executeFn = (client.tools as any).createExecuteFnForProviders({});
+      const wrapped = provider.wrapTools(rawTools, executeFn);
+
+      // wrapTools returns a ToolSet-compatible object
+      if (wrapped && typeof wrapped === "object" && !Array.isArray(wrapped)) {
+        return wrapped as ToolSet;
       }
-      return result;
+      return {};
     },
 
-    async getAuthUrl(userId: string, app: string): Promise<string> {
+    async getAuthUrl(app: string): Promise<string> {
       try {
-        const entity = (client as any).getEntity(userId);
-        const connection = await entity.initiateConnection({ appName: app });
-        return connection.redirectUrl ?? connection.url ?? "";
-      } catch {
-        // Fallback: use connectedAccounts API directly
-        const response = await (client as any).connectedAccounts?.initiateConnection?.({
-          entityId: userId,
+        const result = await (client.connectedAccounts as any).initiate({
           appName: app,
         });
-        return response?.redirectUrl ?? response?.url ?? "";
+        return (result as any).redirectUrl ?? (result as any).url ?? "";
+      } catch {
+        return "";
       }
     },
 
-    async isConnected(userId: string, app: string): Promise<boolean> {
+    async isConnected(app: string): Promise<boolean> {
       try {
-        const entity = (client as any).getEntity(userId);
-        const connections = await entity.getConnections();
-        if (!Array.isArray(connections)) return false;
-        return connections.some(
-          (c: any) => c.appName?.toLowerCase() === app.toLowerCase() && c.status === "ACTIVE",
+        const connections = await client.connectedAccounts.list({});
+        if (!connections?.items) return false;
+        return connections.items.some(
+          (c: any) => c.toolkit?.slug?.toLowerCase() === app.toLowerCase() && c.status === "ACTIVE",
         );
       } catch {
         return false;
+      }
+    },
+
+    async listConnectedApps(): Promise<string[]> {
+      try {
+        const connections = await client.connectedAccounts.list({});
+        if (!connections?.items) return [];
+        return [...new Set(
+          connections.items
+            .filter((c: any) => c.status === "ACTIVE")
+            .map((c: any) => c.toolkit?.slug?.toLowerCase())
+            .filter(Boolean) as string[],
+        )];
+      } catch {
+        return [];
       }
     },
   };
