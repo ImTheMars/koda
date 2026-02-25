@@ -19,8 +19,10 @@ deployed koda to railway with auto-deploy on push. fixed critical webhook issues
 #### added
 
 - **`/debug` command** — admin-only command showing version, env (production/development), mode (webhook/polling), uptime, boot time, memory usage, LLM status, models, usage stats (today/month/all-time), active tasks, platform info.
-- **update notifications** — bot sends "koda is updating, give me a sec..." on shutdown and "koda vX.Y.Z is online. [env]" on startup to all admin IDs.
+- **update notifications** — bot sends "deploying now, switching over..." on shutdown and "koda vX.Y.Z is online. [env]" on startup to all admin IDs. production-only — dev mode with `--watch` no longer spams on every file save.
 - **`KODA_ENV` env var** — differentiates production vs development. auto-detects from webhook mode if not set. shown in `/debug` and notifications.
+- **Composio SDK bypass** — Composio's `VercelProvider.wrapTools` sends both `text` and `arguments` in the execute payload, causing 400 errors. rewrote `src/composio.ts` to use the SDK only for schema discovery, then builds Vercel AI SDK tools manually with direct v3 REST API calls. also added `ESSENTIAL_TOOLS` filter per toolkit to keep tool count manageable (~19 vs 76 raw).
+- **debug logging for tool calls** — `makeOnStepFinish` now logs tool args (500 char cap) and results (800 char cap) with error detection for faster debugging.
 - **env overrides for telegram arrays** — `KODA_TELEGRAM_ALLOW_FROM` and `KODA_TELEGRAM_ADMIN_IDS` now work as comma-separated env vars (needed for Railway).
 - **env overrides for webhook config** — `KODA_TELEGRAM_WEBHOOK_URL` and `KODA_TELEGRAM_WEBHOOK_SECRET` env vars. setting webhook URL auto-enables `useWebhook: true`.
 

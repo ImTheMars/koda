@@ -859,10 +859,6 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
           onStart: async () => {
             console.log("[telegram] Bot is running");
             consecutiveErrors = 0;
-            // Notify admins
-            for (const adminId of config.telegram.adminIds) {
-              bot.api.sendMessage(Number(adminId), `koda v${VERSION} is online.`).catch(() => {});
-            }
           },
         });
         break;
@@ -976,7 +972,10 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
     const durationSuffix = deps.deployDurationMs
       ? ` — deployed in ${Math.round(deps.deployDurationMs / 1000)}s`
       : "";
-    await notifyAdmins(`koda v${VERSION} is online${durationSuffix} [${kodaEnv}]`);
+    // Only notify in production — dev mode with --watch would spam on every file save
+    if (kodaEnv === "production") {
+      await notifyAdmins(`koda v${VERSION} is online. [${kodaEnv}]`);
+    }
 
     return {
       notifyAdmins,
@@ -990,10 +989,12 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
         clearInterval(dedupTimer);
         processedMessages.clear();
         sentMessages.clear();
-        const msg = signal === "SIGTERM"
-          ? `deploying now, switching over... [${kodaEnv}]`
-          : `restarting unexpectedly... [${kodaEnv}]`;
-        await notifyAdmins(msg);
+        if (kodaEnv === "production") {
+          const msg = signal === "SIGTERM"
+            ? `deploying now, switching over... [${kodaEnv}]`
+            : `restarting unexpectedly... [${kodaEnv}]`;
+          await notifyAdmins(msg);
+        }
         // Do NOT call deleteWebhook() — during Railway zero-downtime deploys,
         // the new container sets the webhook first, then the old container shuts down.
         // Calling deleteWebhook here would wipe the new container's registration.
