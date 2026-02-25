@@ -4,6 +4,35 @@ all notable changes to koda.
 
 ---
 
+## 2026-02-25
+### v1.0.1 — Railway deployment, webhook fixes, /debug command
+
+deployed koda to railway with auto-deploy on push. fixed critical webhook issues and added operational tooling.
+
+#### fixed
+
+- **bot.init() in webhook mode** — Grammy requires `bot.init()` before `handleUpdate()`. webhook mode was crashing on every incoming message because init was never called.
+- **deploy race condition** — during Railway zero-downtime deploys, the old container's `stop()` called `deleteWebhook()`, wiping the new container's webhook registration. removed `deleteWebhook()` from stop handler.
+- **webhook re-registration** — added 10-second delayed re-check after boot that verifies the webhook URL is still set via `getWebhookInfo()` and re-registers if cleared by a deploy race.
+- **webhook retry on boot** — `setWebhook` now retries up to 5 times with 3s delay and verifies via `getWebhookInfo` that Telegram actually stored the URL.
+
+#### added
+
+- **`/debug` command** — admin-only command showing version, env (production/development), mode (webhook/polling), uptime, boot time, memory usage, LLM status, models, usage stats (today/month/all-time), active tasks, platform info.
+- **update notifications** — bot sends "koda is updating, give me a sec..." on shutdown and "koda vX.Y.Z is online. [env]" on startup to all admin IDs.
+- **`KODA_ENV` env var** — differentiates production vs development. auto-detects from webhook mode if not set. shown in `/debug` and notifications.
+- **env overrides for telegram arrays** — `KODA_TELEGRAM_ALLOW_FROM` and `KODA_TELEGRAM_ADMIN_IDS` now work as comma-separated env vars (needed for Railway).
+- **env overrides for webhook config** — `KODA_TELEGRAM_WEBHOOK_URL` and `KODA_TELEGRAM_WEBHOOK_SECRET` env vars. setting webhook URL auto-enables `useWebhook: true`.
+
+#### deployment
+
+- **Railway project**: `koda-production.up.railway.app`
+- **auto-deploy**: connected to `ImTheMars/koda` GitHub repo, deploys on push to master
+- **health check**: `/health` endpoint with version and uptime
+- **webhook endpoint**: `/telegram` with secret token verification
+
+---
+
 ## 2026-02-24
 ### v1.0.0 — Koda 1.0
 
