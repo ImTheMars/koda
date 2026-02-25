@@ -32,6 +32,7 @@ export interface TelegramResult {
   stop: () => Promise<void>;
   sendDirect: (chatId: string, text: string) => Promise<void>;
   handleWebhook?: (req: Request) => Promise<Response>;
+  notifyAdmins: (text: string) => Promise<void>;
 }
 
 /** Transcribe audio via OpenRouter (Gemini Flash with native audio support). */
@@ -73,7 +74,7 @@ const SEGMENT_DELAY_MS = 400;
 const MAX_DOCUMENT_SIZE = 20 * 1024 * 1024; // 20MB
 const MAX_DOCUMENT_TEXT = 30_000; // chars
 
-export function startTelegram(deps: TelegramDeps): TelegramResult {
+export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult> {
   const { config } = deps;
   const token = config.telegram.token!;
   const bot = new Bot(token);
@@ -844,17 +845,76 @@ export function startTelegram(deps: TelegramDeps): TelegramResult {
     }
   };
 
+  // --- Environment detection ---
+  const kodaEnv = process.env.KODA_ENV ?? (config.telegram.useWebhook ? "production" : "development");
+  const isAdmin = (userId: string) => config.telegram.adminIds.includes(userId);
+  const bootTime = new Date();
+
+  // --- Notify admins helper ---
+  const notifyAdmins = async (text: string) => {
+    for (const adminId of config.telegram.adminIds) {
+      await bot.api.sendMessage(Number(adminId), text).catch(() => {});
+    }
+  };
+
+  // --- /debug command (admin-only) ---
+  bot.command("debug", async (ctx) => {
+    const senderId = String(ctx.from?.id);
+    if (!isAdmin(senderId)) { await ctx.reply("admin only."); return; }
+
+    const uptimeSecs = Math.floor(process.uptime());
+    const uptimeStr = uptimeSecs < 3600
+      ? `${Math.floor(uptimeSecs / 60)}m ${uptimeSecs % 60}s`
+      : `${Math.floor(uptimeSecs / 3600)}h ${Math.floor((uptimeSecs % 3600) / 60)}m`;
+    const mem = process.memoryUsage();
+    const heapMb = (mem.heapUsed / 1024 / 1024).toFixed(1);
+    const rssMb = (mem.rss / 1024 / 1024).toFixed(1);
+    const now = new Date();
+    const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+    const todayUsage = dbUsage.getSummary(senderId, todayStart);
+    const monthUsage = dbUsage.getSummary(senderId, monthStart);
+    const allUsage = dbUsage.getSummary(senderId);
+    const allTasks = dbTasks.getReady(new Date("2099-01-01").toISOString());
+    const llmStatus = isLlmCircuitOpen() ? "DEGRADED" : "healthy";
+
+    let msg = `--- koda debug ---\n`;
+    msg += `version: v${VERSION}\n`;
+    msg += `env: ${kodaEnv}\n`;
+    msg += `mode: ${config.telegram.useWebhook ? "webhook" : "polling"}\n`;
+    msg += `uptime: ${uptimeStr}\n`;
+    msg += `booted: ${bootTime.toISOString()}\n`;
+    msg += `heap: ${heapMb}MB / rss: ${rssMb}MB\n`;
+    msg += `llm: ${llmStatus}\n`;
+    msg += `models:\n  fast: ${config.openrouter.fastModel}\n  deep: ${config.openrouter.deepModel}\n  image: ${config.openrouter.imageModel}\n`;
+    msg += `---\n`;
+    msg += `today: ${todayUsage.totalRequests} req, $${todayUsage.totalCost.toFixed(4)}\n`;
+    msg += `month: ${monthUsage.totalRequests} req, $${monthUsage.totalCost.toFixed(4)}\n`;
+    msg += `all-time: ${allUsage.totalRequests} req, $${allUsage.totalCost.toFixed(4)}\n`;
+    msg += `tasks: ${allTasks.length} active\n`;
+    msg += `node: ${process.version}\n`;
+    msg += `platform: ${process.platform}/${process.arch}`;
+
+    await ctx.reply(msg);
+  });
+
+  // --- Initialize bot (required before handleUpdate in webhook mode) ---
+  await bot.init();
+  console.log(`[telegram] Bot initialized: @${bot.botInfo.username}`);
+
   // --- Webhook or polling ---
   if (config.telegram.useWebhook && config.telegram.webhookUrl) {
     // Webhook mode — don't start polling
-    (async () => {
-      await bot.api.setWebhook(config.telegram.webhookUrl!, {
-        secret_token: config.telegram.webhookSecret,
-      });
-      console.log("[telegram] Webhook set:", config.telegram.webhookUrl);
-    })().catch((err) => console.error("[telegram] Failed to set webhook:", err));
+    await bot.api.setWebhook(config.telegram.webhookUrl!, {
+      secret_token: config.telegram.webhookSecret,
+    });
+    console.log("[telegram] Webhook set:", config.telegram.webhookUrl);
+
+    // Notify admins bot is online
+    await notifyAdmins(`koda v${VERSION} is online. [${kodaEnv}]`);
 
     return {
+      notifyAdmins,
       async sendDirect(chatId: string, text: string) {
         const id = Number(chatId);
         if (!Number.isFinite(id)) throw new Error("Invalid chat id");
@@ -865,10 +925,7 @@ export function startTelegram(deps: TelegramDeps): TelegramResult {
         clearInterval(dedupTimer);
         processedMessages.clear();
         sentMessages.clear();
-        // Notify admins of shutdown
-        for (const adminId of config.telegram.adminIds) {
-          await bot.api.sendMessage(Number(adminId), "koda is shutting down.").catch(() => {});
-        }
+        await notifyAdmins(`koda is updating, give me a sec... [${kodaEnv}]`);
         await bot.api.deleteWebhook();
       },
       async handleWebhook(req: Request): Promise<Response> {
@@ -895,6 +952,7 @@ export function startTelegram(deps: TelegramDeps): TelegramResult {
   startWithRetry();
 
   return {
+    notifyAdmins,
     async sendDirect(chatId: string, text: string) {
       const id = Number(chatId);
       if (!Number.isFinite(id)) throw new Error("Invalid chat id");
@@ -905,10 +963,7 @@ export function startTelegram(deps: TelegramDeps): TelegramResult {
       clearInterval(dedupTimer);
       processedMessages.clear();
       sentMessages.clear();
-      // Notify admins of shutdown
-      for (const adminId of config.telegram.adminIds) {
-        await bot.api.sendMessage(Number(adminId), "koda is shutting down.").catch(() => {});
-      }
+      await notifyAdmins(`koda is updating, give me a sec... [${kodaEnv}]`);
       await bot.stop();
     },
   };

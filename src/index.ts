@@ -170,7 +170,7 @@ let repl: { stop: () => void } | null = null;
 const routedStreamAgent = makeNamedStreamAgent(streamAgentFn);
 
 if (config.mode !== "cli-only" && config.telegram.token) {
-  telegram = startTelegram({ streamAgent: routedStreamAgent, config });
+  telegram = await startTelegram({ streamAgent: routedStreamAgent, config });
   console.log(`[boot] Channel: telegram enabled${config.telegram.useWebhook ? " (webhook)" : " (polling)"}`);
 }
 
