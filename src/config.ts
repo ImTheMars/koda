@@ -10,6 +10,7 @@ import { homedir } from "os";
 import { statSync } from "fs";
 import { loadEnvFromFiles } from "./env.js";
 import { validateTimezone } from "./time.js";
+import { logWarn } from "./log.js";
 
 let resolvedConfigPath: string | null = null;
 
@@ -25,6 +26,8 @@ const ConfigSchema = z.object({
     fastModel: z.string().default("google/gemini-3-flash-preview"),
     deepModel: z.string().default("anthropic/claude-sonnet-4.6"),
     imageModel: z.string().default("google/gemini-3-pro-image-preview"),
+    failovers: z.record(z.string(), z.array(z.string())).optional(),
+    pricing: z.record(z.string(), z.object({ input: z.number(), output: z.number() })).optional(),
   }),
   supermemory: withEmptyDefault(z.object({
     apiKey: z.string().optional(),
@@ -37,6 +40,8 @@ const ConfigSchema = z.object({
     useWebhook: z.boolean().default(false),
     webhookUrl: z.string().optional(),
     webhookSecret: z.string().optional(),
+    rateLimitMax: z.number().min(1).default(10),
+    rateLimitWindowMs: z.number().min(1000).default(60_000),
   })),
   cli: withEmptyDefault(z.object({
     userId: z.string().default("owner"),
@@ -47,6 +52,12 @@ const ConfigSchema = z.object({
     maxSteps: z.number().min(1).max(100).default(30),
     maxTokens: z.number().min(1).max(32768).default(8192),
     temperature: z.number().min(0).max(2).default(0.7),
+    circuitBreakerThreshold: z.number().min(1).default(3),
+    circuitBreakerResetMs: z.number().min(10_000).default(120_000),
+    historyTokenBudget: z.number().min(500).default(6000),
+    charsPerToken: z.number().min(1).default(4),
+    escalationStep: z.number().min(1).default(5),
+    toolArgLogMaxChars: z.number().min(50).default(500),
   })),
   timeouts: withEmptyDefault(z.object({
     llm: z.number().min(5000).default(120_000),
@@ -93,6 +104,11 @@ const ConfigSchema = z.object({
     scheduler: z.boolean().default(true),
     debug: z.boolean().default(false),
     autoBackup: z.boolean().default(true),
+    messageRetentionDays: z.number().min(1).default(90),
+    skillDiscoveryCron: z.string().default("sun 09:00"),
+    dailyBriefingCron: z.string().default("08:00"),
+    backupIntervalHours: z.number().min(1).default(24),
+    gcIntervalHours: z.number().min(1).default(1),
   })),
   subagent: withEmptyDefault(z.object({
     timeoutMs: z.number().min(10_000).default(90_000),
@@ -110,6 +126,14 @@ const ConfigSchema = z.object({
   composio: withEmptyDefault(z.object({
     apiKey: z.string().optional(),
   })),
+  sandbox: withEmptyDefault(z.object({
+    memory: z.string().default("512m"),
+    cpus: z.string().default("0.5"),
+    timeoutMs: z.number().min(1000).max(120_000).default(30_000),
+    image: z.string().default("alpine:latest"),
+    maxStdout: z.number().default(50_000),
+    maxStderr: z.number().default(10_000),
+  })),
   workspace: z.string().default("~/.koda"),
 });
 
@@ -126,7 +150,7 @@ function checkEnvPermissions(): void {
       const stats = statSync(envPath);
       const mode = stats.mode & 0o777;
       if (mode & 0o044) {
-        console.warn(`\x1b[33m[security] WARNING: ${envPath} is readable by others (mode ${mode.toString(8)}). Run: chmod 600 ${envPath}\x1b[0m`);
+        logWarn("security", `${envPath} is readable by others (mode ${mode.toString(8)}). Run: chmod 600 ${envPath}`);
       }
     } catch {}
   }
@@ -221,7 +245,7 @@ export async function loadConfig(configPath?: string): Promise<Config> {
         resolvedConfigPath = p;
         break;
       } catch {
-        console.warn(`\x1b[33m[config] WARNING: Malformed config file at ${p}, skipping\x1b[0m`);
+        logWarn("config", `Malformed config file at ${p}, skipping`);
       }
     }
   }
@@ -272,6 +296,12 @@ export async function persistConfig(config: Config): Promise<void> {
     maxSteps: config.agent.maxSteps,
     maxTokens: config.agent.maxTokens,
     temperature: config.agent.temperature,
+    circuitBreakerThreshold: config.agent.circuitBreakerThreshold,
+    circuitBreakerResetMs: config.agent.circuitBreakerResetMs,
+    historyTokenBudget: config.agent.historyTokenBudget,
+    charsPerToken: config.agent.charsPerToken,
+    escalationStep: config.agent.escalationStep,
+    toolArgLogMaxChars: config.agent.toolArgLogMaxChars,
   };
   serializable.exa = { numResults: config.exa.numResults };
   serializable.timeouts = config.timeouts;
@@ -281,11 +311,17 @@ export async function persistConfig(config: Config): Promise<void> {
     scheduler: config.features.scheduler,
     debug: config.features.debug,
     autoBackup: config.features.autoBackup,
+    messageRetentionDays: config.features.messageRetentionDays,
+    skillDiscoveryCron: config.features.skillDiscoveryCron,
+    dailyBriefingCron: config.features.dailyBriefingCron,
+    backupIntervalHours: config.features.backupIntervalHours,
+    gcIntervalHours: config.features.gcIntervalHours,
   };
   serializable.subagent = {
     timeoutMs: config.subagent.timeoutMs,
     maxSteps: config.subagent.maxSteps,
   };
+  serializable.sandbox = config.sandbox;
   serializable.workspace = config.workspace;
 
   await Bun.write(configPath, JSON.stringify(serializable, null, 2) + "\n");

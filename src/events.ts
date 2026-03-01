@@ -5,6 +5,8 @@
  * forwards them to connected browser clients — zero polling, zero latency.
  */
 
+import { logError } from "./log.js";
+
 export type KodaEventName = "spawn" | "subagent_update" | "heartbeat";
 
 type Listener = (name: KodaEventName, data: unknown) => void;
@@ -20,7 +22,9 @@ export function subscribe(fn: Listener): () => void {
 /** Broadcast an event to all active SSE connections. */
 export function emit(name: KodaEventName, data: unknown = {}): void {
   for (const fn of listeners) {
-    try { fn(name, data); } catch {}
+    try { fn(name, data); } catch (err) {
+      logError("events", `listener error on ${name}`, err);
+    }
   }
 }
 

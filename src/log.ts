@@ -30,3 +30,10 @@ export const logWarn = (tag: string, msg: string) => {
   if (jsonMode) { jsonLog("warn", tag, msg); return; }
   console.warn(`[${tag}] ${msg}`);
 };
+
+export const logError = (tag: string, msg: string, error?: unknown) => {
+  const errStr = error instanceof Error ? error.message : error ? String(error) : "";
+  const full = errStr ? `${msg}: ${errStr}` : msg;
+  if (jsonMode) { jsonLog("error", tag, full); return; }
+  console.error(`[${tag}] ${full}`);
+};

@@ -29,8 +29,6 @@ export function registerImageTools(deps: {
           messages: [
             { role: "user", content: `Generate an image: ${prompt}` },
           ],
-          // For models that support image generation via chat completions
-          ...(deps.model.includes("dall-e") ? {} : {}),
         }),
         signal: AbortSignal.timeout(90_000),
       });
@@ -40,7 +38,10 @@ export function registerImageTools(deps: {
         return { error: `Image generation failed: ${response.status} ${text.slice(0, 200)}` };
       }
 
-      const data = await response.json() as any;
+      const data = await response.json() as {
+        choices?: Array<{ message?: { content?: unknown } }>;
+        usage?: { prompt_tokens?: number; completion_tokens?: number };
+      };
 
       // Extract image URL from response — different models return it differently
       let imageUrl: string | null = null;

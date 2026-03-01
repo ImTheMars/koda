@@ -10,6 +10,39 @@
 import { Composio } from "@composio/core";
 import { z } from "zod";
 import type { ToolSet } from "ai";
+import { logError } from "./log.js";
+
+// --- Composio SDK response types ---
+
+interface ComposioToolParam {
+  name?: string;
+  type?: string;
+  description?: string;
+  required?: boolean;
+  default?: unknown;
+}
+
+interface ComposioRawTool {
+  slug: string;
+  name?: string;
+  description?: string;
+  inputParameters?: ComposioToolParam[];
+}
+
+interface ComposioExecResponse {
+  data?: unknown;
+  error?: { message?: string } | string;
+}
+
+interface ComposioConnection {
+  status?: string;
+  toolkit?: { slug?: string };
+}
+
+interface ComposioInitiateResult {
+  redirectUrl?: string;
+  url?: string;
+}
 
 export interface ComposioDeps {
   apiKey: string;
@@ -32,7 +65,7 @@ const ESSENTIAL_TOOLS: Record<string, string[]> = {
 };
 
 /** Build a Zod schema from Composio's raw inputParameters */
-function buildZodSchema(inputParams: any[]): z.ZodObject<any> {
+function buildZodSchema(inputParams: ComposioToolParam[]): z.ZodObject<Record<string, z.ZodTypeAny>> {
   const shape: Record<string, z.ZodTypeAny> = {};
   if (!Array.isArray(inputParams)) return z.object({});
 
@@ -44,7 +77,7 @@ function buildZodSchema(inputParams: any[]): z.ZodObject<any> {
     switch (param.type) {
       case "number": case "integer": field = z.number(); break;
       case "boolean": field = z.boolean(); break;
-      case "array": field = z.array(z.any()); break;
+      case "array": field = z.array(z.unknown()); break;
       default: field = z.string(); break;
     }
 
@@ -78,9 +111,10 @@ export function createComposioClient(deps: ComposioDeps): ComposioClient {
       signal: AbortSignal.timeout(30_000),
     });
 
-    const data = await res.json() as any;
+    const data = (await res.json()) as ComposioExecResponse;
     if (!res.ok || data.error) {
-      const msg = data.error?.message ?? data.error ?? `HTTP ${res.status}`;
+      const errObj = data.error;
+      const msg = typeof errObj === "object" ? errObj?.message ?? `HTTP ${res.status}` : errObj ?? `HTTP ${res.status}`;
       throw new Error(`Composio ${slug}: ${msg}`);
     }
     return data.data ?? data;
@@ -88,9 +122,9 @@ export function createComposioClient(deps: ComposioDeps): ComposioClient {
 
   return {
     async getTools(toolkits: string[]): Promise<ToolSet> {
-      const allRawTools: any[] = [];
+      const allRawTools: ComposioRawTool[] = [];
       for (const tk of toolkits) {
-        const raw = await (client.tools as any).getRawComposioTools(
+        const raw = await (client.tools as { getRawComposioTools(opts: Record<string, unknown>, extra: Record<string, unknown>): Promise<ComposioRawTool[]> }).getRawComposioTools(
           { toolkits: [tk] },
           {},
         );
@@ -98,7 +132,7 @@ export function createComposioClient(deps: ComposioDeps): ComposioClient {
 
         const keep = ESSENTIAL_TOOLS[tk];
         if (keep) {
-          allRawTools.push(...raw.filter((t: any) => {
+          allRawTools.push(...raw.filter((t) => {
             const slug = (t.slug ?? t.name ?? "").toUpperCase();
             return keep.some((k) => slug.includes(k));
           }));
@@ -109,28 +143,29 @@ export function createComposioClient(deps: ComposioDeps): ComposioClient {
       if (allRawTools.length === 0) return {};
 
       // Build Vercel AI SDK tools with direct API execution
-      const tools: Record<string, any> = {};
+      const tools: Record<string, { description: string; parameters: z.ZodObject<Record<string, z.ZodTypeAny>>; execute: (args: Record<string, unknown>) => Promise<unknown> }> = {};
       for (const rawTool of allRawTools) {
-        const slug = rawTool.slug as string;
+        const slug = rawTool.slug;
         const description = rawTool.description ?? rawTool.name ?? slug;
         const parameters = buildZodSchema(rawTool.inputParameters ?? []);
 
         tools[slug] = {
           description,
           parameters,
-          execute: async (args: any) => executeToolDirect(slug, args as Record<string, unknown>),
+          execute: async (args: Record<string, unknown>) => executeToolDirect(slug, args),
         };
       }
-      return tools as ToolSet;
+      return tools as unknown as ToolSet;
     },
 
     async getAuthUrl(app: string): Promise<string> {
       try {
-        const result = await (client.connectedAccounts as any).initiate({
+        const result = await (client.connectedAccounts as unknown as { initiate(opts: { appName: string }): Promise<ComposioInitiateResult> }).initiate({
           appName: app,
         });
-        return (result as any).redirectUrl ?? (result as any).url ?? "";
-      } catch {
+        return result.redirectUrl ?? result.url ?? "";
+      } catch (err) {
+        logError("composio", "getAuthUrl failed", err);
         return "";
       }
     },
@@ -139,8 +174,8 @@ export function createComposioClient(deps: ComposioDeps): ComposioClient {
       try {
         const connections = await client.connectedAccounts.list({});
         if (!connections?.items) return false;
-        return connections.items.some(
-          (c: any) => c.toolkit?.slug?.toLowerCase() === app.toLowerCase() && c.status === "ACTIVE",
+        return (connections.items as ComposioConnection[]).some(
+          (c) => c.toolkit?.slug?.toLowerCase() === app.toLowerCase() && c.status === "ACTIVE",
         );
       } catch {
         return false;
@@ -152,10 +187,10 @@ export function createComposioClient(deps: ComposioDeps): ComposioClient {
         const connections = await client.connectedAccounts.list({});
         if (!connections?.items) return [];
         return [...new Set(
-          connections.items
-            .filter((c: any) => c.status === "ACTIVE")
-            .map((c: any) => c.toolkit?.slug?.toLowerCase())
-            .filter(Boolean) as string[],
+          (connections.items as ComposioConnection[])
+            .filter((c) => c.status === "ACTIVE")
+            .map((c) => c.toolkit?.slug?.toLowerCase())
+            .filter((s): s is string => Boolean(s)),
         )];
       } catch {
         return [];

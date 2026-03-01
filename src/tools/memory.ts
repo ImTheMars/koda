@@ -8,9 +8,32 @@ import { tool, type ToolSet } from "ai";
 import { z } from "zod";
 import Supermemory from "supermemory";
 import { messages as dbMessages, state as dbState } from "../db.js";
-import { log } from "../log.js";
+import { log, logWarn, logError } from "../log.js";
 import type { Config } from "../config.js";
 import { addToolCost } from "./index.js";
+
+// --- Supermemory SDK response types ---
+
+interface SmSearchResult {
+  results?: Array<{ memory?: string; chunk?: string; content?: string; id?: string; documentId?: string }>;
+}
+
+interface SmAddResult {
+  id?: string;
+}
+
+interface SmClient {
+  documents: {
+    add(opts: { content: string; containerTag: string; metadata?: Record<string, string> }): Promise<SmAddResult>;
+    delete?(id: string): Promise<unknown>;
+  };
+  search: {
+    memories(opts: { q: string; containerTag?: string; limit?: number }): Promise<SmSearchResult>;
+  };
+  settings?: {
+    update(opts: Record<string, unknown>): Promise<unknown>;
+  };
+}
 
 // --- Types ---
 
@@ -150,7 +173,7 @@ function bumpIngestCount(sessionKey: string): number {
 }
 
 function createSupermemoryProvider(apiKey: string, config?: Config): MemoryProvider {
-  const client = new Supermemory({ apiKey });
+  const client = new Supermemory({ apiKey }) as unknown as SmClient;
 
   return {
     get isDegraded() { return isCircuitOpen(); },
@@ -165,10 +188,10 @@ function createSupermemoryProvider(apiKey: string, config?: Config): MemoryProvi
           metadata: { user_id: userId, ...(tags?.length ? { tags: tags.join(",") } : {}) },
         });
         recordSuccess();
-        return { id: (result as any).id ?? "ok" };
+        return { id: result.id ?? "ok" };
       } catch (err) {
         recordFailure();
-        console.error("[memory] Store failed:", err);
+        logError("memory", "store failed", err);
         return { id: "unavailable" };
       }
     },
@@ -186,12 +209,12 @@ function createSupermemoryProvider(apiKey: string, config?: Config): MemoryProvi
       try {
         const response = await client.search.memories({ q: query, containerTag: `user-${userId}`, limit });
         recordSuccess();
-        const results = (response as any).results ?? [];
+        const results = response.results ?? [];
         log("memory", "recall: %d results", results.length);
-        return results.map((r: any) => r.memory ?? r.chunk ?? r.content ?? "").filter(Boolean);
+        return results.map((r) => r.memory ?? r.chunk ?? r.content ?? "").filter(Boolean);
       } catch (err) {
         recordFailure();
-        console.error("[memory] Recall failed:", err);
+        logError("memory", "recall failed", err);
         return [];
       }
     },
@@ -213,8 +236,8 @@ function createSupermemoryProvider(apiKey: string, config?: Config): MemoryProvi
         ]);
         recordSuccess();
 
-        const toStrings = (res: any) =>
-          ((res?.results ?? []) as any[]).map((r: any) => r.memory ?? r.chunk ?? r.content ?? "").filter(Boolean);
+        const toStrings = (res: SmSearchResult | null) =>
+          (res?.results ?? []).map((r) => r.memory ?? r.chunk ?? r.content ?? "").filter(Boolean);
 
         const staticFacts = toStrings(staticRes);
         const queryMemories = dynamicRes ? toStrings(dynamicRes) : [];
@@ -223,7 +246,7 @@ function createSupermemoryProvider(apiKey: string, config?: Config): MemoryProvi
         return { static: staticFacts, dynamic: [], memories: queryMemories };
       } catch (err) {
         recordFailure();
-        console.error("[memory] Profile fetch failed:", err);
+        logError("memory", "profile fetch failed", err);
         return { static: [], dynamic: [], memories: [] };
       }
     },
@@ -250,7 +273,7 @@ function createSupermemoryProvider(apiKey: string, config?: Config): MemoryProvi
           log("memory", "ingest: stored conversation excerpt for session %s", sessionKey);
         } catch (err) {
           recordFailure();
-          console.error("[memory] Ingest failed:", err);
+          logError("memory", "ingest failed", err);
         }
         return;
       }
@@ -263,8 +286,8 @@ function createSupermemoryProvider(apiKey: string, config?: Config): MemoryProvi
           limit: 20,
         });
         recordSuccess();
-        const existingFacts = ((existingResults as any).results ?? [])
-          .map((r: any) => r.memory ?? r.chunk ?? r.content ?? "")
+        const existingFacts = (existingResults.results ?? [])
+          .map((r) => r.memory ?? r.chunk ?? r.content ?? "")
           .filter(Boolean);
 
         const facts = await extractMemoryFacts(msgs, existingFacts, config);
@@ -290,13 +313,13 @@ function createSupermemoryProvider(apiKey: string, config?: Config): MemoryProvi
             stored++;
           } catch (err) {
             recordFailure();
-            console.error("[memory] Fact store failed:", err);
+            logError("memory", "fact store failed", err);
           }
         }
         if (stored > 0) log("memory", "ingest: extracted and stored %d facts for session %s", stored, sessionKey);
       } catch (err) {
         recordFailure();
-        console.error("[memory] Smart ingest failed:", err);
+        logError("memory", "smart ingest failed", err);
       }
     },
 
@@ -309,15 +332,15 @@ function createSupermemoryProvider(apiKey: string, config?: Config): MemoryProvi
           limit: 1,
         });
         recordSuccess();
-        const docs = (results as any).results ?? [];
+        const docs = results.results ?? [];
         if (docs.length === 0) return false;
-        const docId = docs[0].id ?? docs[0].documentId;
+        const docId = docs[0]?.id ?? docs[0]?.documentId;
         if (!docId) return false;
-        await (client as any).documents.delete(docId);
+        await client.documents.delete?.(docId);
         return true;
       } catch (err) {
         recordFailure();
-        console.error("[memory] Delete failed:", err);
+        logError("memory", "delete failed", err);
         return false;
       }
     },
@@ -343,7 +366,7 @@ function createSupermemoryProvider(apiKey: string, config?: Config): MemoryProvi
       const FILTER_KEY = "supermemory_filter_set_v1";
       if (dbState.get(FILTER_KEY)) return;
       try {
-        await (client as any).settings.update({
+        await client.settings?.update({
           shouldLLMFilter: true,
           filterPrompt: `Personal AI assistant called Koda. Prioritize:
 - User preferences and habits (response style, tools, languages, workflows)
@@ -359,9 +382,9 @@ Skip:
 - Duplicate information already captured`,
         });
         dbState.set(FILTER_KEY, true);
-        console.log("[boot] Supermemory filter prompt configured");
+        log("boot", "Supermemory filter prompt configured");
       } catch (err) {
-        console.warn("[boot] Supermemory filter setup skipped:", (err as Error).message);
+        logWarn("boot", `Supermemory filter setup skipped: ${(err as Error).message}`);
       }
     },
   };
@@ -373,7 +396,7 @@ Skip:
 
 export function createMemoryProvider(config: Config): MemoryProvider {
   if (!config.supermemory?.apiKey) {
-    console.warn("[memory] No Supermemory API key — memory disabled");
+    logError("memory", "no Supermemory API key — memory disabled");
     return {
       get isDegraded() { return true; },
       async store() { return { id: "unavailable" }; },
@@ -384,7 +407,7 @@ export function createMemoryProvider(config: Config): MemoryProvider {
       async healthCheck() { return false; },
     };
   }
-  console.log("[memory] Using Supermemory cloud provider");
+  log("memory", "using Supermemory cloud provider");
   return createSupermemoryProvider(config.supermemory.apiKey, config);
 }
 

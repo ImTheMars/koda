@@ -7,40 +7,10 @@
 
 import { tool, type ToolSet } from "ai";
 import { z } from "zod";
-import { existsSync, realpathSync, lstatSync } from "fs";
-import { resolve, normalize, relative, isAbsolute, basename } from "path";
+import { existsSync, lstatSync } from "fs";
+import { basename } from "path";
 import { addPendingFile } from "./index.js";
-
-const BLOCKED_PATTERNS = [
-  /(^|[\\/])\.env(\..+)?$/i,
-  /credentials/i,
-  /secrets?/i,
-  /(^|[\\/])node_modules([\\/]|$)/i,
-  /[\\/]\.git[\\/]config$/i,
-  /(^|[\\/])\.ssh([\\/]|$)/i,
-  /(^|[\\/])\.aws([\\/]|$)/i,
-  /id_rsa/i, /id_ed25519/i, /\.pem$/i, /\.key$/i,
-];
-
-function validatePath(filePath: string, workspace: string): string {
-  if (filePath.includes("\0")) throw new Error("Access denied: invalid path");
-
-  const normalized = normalize(filePath);
-  const wsResolved = realpathSync(resolve(workspace));
-  const resolved = isAbsolute(normalized) ? resolve(normalized) : resolve(wsResolved, normalized);
-
-  let checkPath = resolved;
-  try { checkPath = realpathSync(resolved); } catch {}
-
-  const rel = relative(wsResolved, checkPath);
-  if (rel.startsWith("..") || isAbsolute(rel)) throw new Error("Access denied: path is outside workspace");
-
-  for (const pattern of BLOCKED_PATTERNS) {
-    if (pattern.test(checkPath)) throw new Error("Access denied: sensitive file");
-  }
-
-  return resolved;
-}
+import { safePath } from "../security.js";
 
 export function registerFileTools(deps: { workspace: string }): ToolSet {
   const sendFile = tool({
@@ -50,7 +20,7 @@ export function registerFileTools(deps: { workspace: string }): ToolSet {
       caption: z.string().optional().describe("Optional caption for the file"),
     }),
     execute: async ({ path, caption }) => {
-      const resolved = validatePath(path, deps.workspace);
+      const resolved = safePath(path, deps.workspace, "read");
 
       if (!existsSync(resolved)) {
         return { error: `File not found: ${path}` };

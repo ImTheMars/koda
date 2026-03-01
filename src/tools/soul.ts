@@ -8,6 +8,7 @@ import { watch, type FSWatcher } from "fs";
 import { readdir, mkdir } from "fs/promises";
 import { join, dirname } from "path";
 import { VERSION } from "../version.js";
+import { logError } from "../log.js";
 
 export interface SoulDocument {
   identity: { name: string; version: string };
@@ -76,11 +77,11 @@ export class SoulLoader {
           try {
             const content = await Bun.file(join(this.soulDir, f)).text();
             this.subContents.set(f, content);
-          } catch {}
+          } catch { /* sub-file unreadable — skip */ }
         }
-      } catch {}
+      } catch { /* soul.d directory listing failed — non-critical */ }
     } catch (err) {
-      console.error("[soul] Loading error:", err);
+      logError("soul", "Loading error", err);
       this.soul = DEFAULT_SOUL;
     }
   }
@@ -151,8 +152,8 @@ export class SoulLoader {
   }
 
   private startWatcher(): void {
-    try { this.watcher = watch(this.soulPath, () => this.scheduleReload()); } catch {}
-    try { this.dirWatcher = watch(this.soulDir, { recursive: false }, () => this.scheduleReload()); } catch {}
+    try { this.watcher = watch(this.soulPath, () => this.scheduleReload()); } catch { /* soul.md watch unavailable */ }
+    try { this.dirWatcher = watch(this.soulDir, { recursive: false }, () => this.scheduleReload()); } catch { /* soul.d watch unavailable */ }
   }
 
   private scheduleReload(): void {

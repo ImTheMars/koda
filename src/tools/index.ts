@@ -8,6 +8,7 @@
 import type { ToolSet } from "ai";
 import { AsyncLocalStorage } from "async_hooks";
 import type { Config } from "../config.js";
+import { log, logWarn } from "../log.js";
 import type { MemoryProvider } from "./memory.js";
 import type { SkillLoader } from "./skills.js";
 import { registerMemoryTools } from "./memory.js";
@@ -44,7 +45,7 @@ export function withToolContext<T>(ctx: ToolRuntimeContext, fn: () => Promise<T>
   return toolContextStore.run(ctx, fn);
 }
 
-function getToolContext(): ToolRuntimeContext {
+export function getToolContext(): ToolRuntimeContext {
   return toolContextStore.getStore() ?? DEFAULT_CONTEXT;
 }
 
@@ -131,12 +132,12 @@ export async function buildTools(deps: {
       if (connectedApps.length > 0) {
         const composioTools = await composio.getTools(connectedApps);
         Object.assign(tools, composioTools);
-        console.log(`[boot] Composio: ${connectedApps.join(", ")} (${Object.keys(composioTools).length} tools)`);
+        log("boot", `Composio: ${connectedApps.join(", ")} (${Object.keys(composioTools).length} tools)`);
       } else {
-        console.log("[boot] Composio: no connected apps — run `koda setup composio`");
+        log("boot", "Composio: no connected apps — run `koda setup composio`");
       }
     } catch (err) {
-      console.warn("[boot] Composio: failed to load tools:", (err as Error).message);
+      logWarn("boot", `Composio: failed to load tools: ${(err as Error).message}`);
     }
   }
 

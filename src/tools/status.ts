@@ -8,6 +8,7 @@ import { tasks as dbTasks, usage as dbUsage } from "../db.js";
 import type { MemoryProvider } from "./memory.js";
 import { isLlmCircuitOpen } from "../agent.js";
 import { VERSION } from "../version.js";
+import { getToolContext } from "./index.js";
 
 export function registerStatusTools(deps: { memory: MemoryProvider }): ToolSet {
   const { memory } = deps;
@@ -29,10 +30,11 @@ export function registerStatusTools(deps: { memory: MemoryProvider }): ToolSet {
 
       const now = new Date();
       const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-      const todayUsage = dbUsage.getSummary("owner", todayStart);
+      const ctx = getToolContext();
+      const todayUsage = dbUsage.getSummary(ctx.userId, todayStart);
 
-      // Find next scheduled task
-      const allReady = dbTasks.getReady(new Date("2099-01-01").toISOString());
+      // Get all enabled tasks (use far-future date to get everything)
+      const allReady = dbTasks.getReady(new Date(Date.now() + 365 * 24 * 3_600_000).toISOString());
       const nextTask = allReady.length > 0 ? allReady[0] : null;
 
       return {

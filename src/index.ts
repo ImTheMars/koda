@@ -15,6 +15,7 @@ import { startProactive } from "./proactive.js";
 import { buildTools } from "./tools/index.js";
 import { registerSubAgentTools, getNamedSession } from "./tools/subagent.js";
 
+import { log, logWarn } from "./log.js";
 import { bootConfig } from "./boot/config.js";
 import { bootProviders } from "./boot/providers.js";
 import { bootMcp, reconnectMcpServer, type McpEntry } from "./boot/mcp.js";
@@ -35,11 +36,11 @@ const config = await bootConfig();
 // --- Boot phase 2: Database ---
 const dbPath = resolve(config.workspace, "koda.db");
 initDb(dbPath);
-const cleanedMessages = dbMessages.cleanup(90);
+const cleanedMessages = dbMessages.cleanup(config.features.messageRetentionDays);
 if (cleanedMessages > 0) {
-  console.log(`[boot] Cleaned ${cleanedMessages} messages older than 90 days`);
+  log("boot", `Cleaned ${cleanedMessages} messages older than ${config.features.messageRetentionDays} days`);
 }
-console.log("[boot] Database initialized");
+log("boot", "Database initialized");
 
 // --- Boot phase 3: Providers ---
 const { memoryProvider, soulLoader, skillLoader, contextWatcher, contextDirWatcher, contextReloadTimeout, getContextContent } = await bootProviders(config);
@@ -50,7 +51,7 @@ const tools = await buildTools({ config, memoryProvider, skillLoader, workspace:
 // --- Boot phase 5: MCP ---
 const mcpClients = await bootMcp(config, tools);
 
-console.log(`[boot] Tools: ${Object.keys(tools).join(", ")}`);
+log("boot", `Tools: ${Object.keys(tools).join(", ")}`);
 
 // --- Agent ---
 const agentDeps: AgentDeps = {
@@ -65,7 +66,9 @@ const agentDeps: AgentDeps = {
 };
 
 // Setup entity context for owner on first boot
-memoryProvider.setupEntityContext(config.owner.id).catch(() => {});
+memoryProvider.setupEntityContext(config.owner.id).catch((err) => {
+  logWarn("boot", `Entity context setup failed: ${(err as Error).message}`);
+});
 
 const runAgent = createAgent(agentDeps);
 const streamAgentFn = createStreamAgent(agentDeps);
@@ -86,7 +89,7 @@ Object.assign(tools, registerSubAgentTools({
     const ownerId = config.telegram.adminIds[0] ?? config.owner.id;
     const channel = config.telegram.token ? "telegram" : "cli";
     const chatId = ownerId;
-    const cron = "sun 09:00";
+    const cron = config.features.skillDiscoveryCron;
     const nextRun = parseCronNext(cron, new Date(), config.scheduler.timezone);
     dbTasks.create({
       id: "builtin-skill-discovery",
@@ -103,10 +106,8 @@ Object.assign(tools, registerSubAgentTools({
       oneShot: false,
     });
     dbState.set(SEED_KEY, true);
-    console.log(`[boot] Seeded weekly skill discovery (next: ${nextRun.toISOString()})`);
-  } catch {
-    // Already exists or DB not ready — safe to skip
-  }
+    log("boot", `Seeded weekly skill discovery (next: ${nextRun.toISOString()})`);
+  } catch { /* already exists or DB not ready — safe to skip */ }
 })();
 
 // --- Seed daily briefing (requires Composio Gmail + Calendar) ---
@@ -118,7 +119,7 @@ Object.assign(tools, registerSubAgentTools({
     const ownerId = config.telegram.adminIds[0] ?? config.owner.id;
     const channel = config.telegram.token ? "telegram" : "cli";
     const chatId = ownerId;
-    const cron = "08:00";
+    const cron = config.features.dailyBriefingCron;
     const nextRun = parseCronNext(cron, new Date(), config.scheduler.timezone);
     dbTasks.create({
       id: "builtin-daily-briefing",
@@ -136,8 +137,8 @@ Object.assign(tools, registerSubAgentTools({
       oneShot: false,
     });
     dbState.set(BRIEFING_KEY, true);
-    console.log(`[boot] Seeded daily briefing (next: ${nextRun.toISOString()})`);
-  } catch {}
+    log("boot", `Seeded daily briefing (next: ${nextRun.toISOString()})`);
+  } catch { /* already exists or DB not ready — safe to skip */ }
 })();
 
 // --- Named agent routing wrapper ---
@@ -184,7 +185,7 @@ if (config.mode !== "cli-only" && config.telegram.token) {
   }
 
   telegram = await startTelegram({ streamAgent: routedStreamAgent, config, deployDurationMs });
-  console.log(`[boot] Channel: telegram enabled${config.telegram.useWebhook ? " (webhook)" : " (polling)"}`);
+  log("boot", `Channel: telegram enabled${config.telegram.useWebhook ? " (webhook)" : " (polling)"}`);
 }
 
 // --- Railway build monitor ---
@@ -203,7 +204,7 @@ if (config.mode === "cli-only") {
     chatId: config.cli.chatId,
     prompt: config.cli.prompt,
   });
-  console.log("[boot] Channel: cli enabled");
+  log("boot", "Channel: cli enabled");
 }
 
 // --- Proactive ---
@@ -216,21 +217,21 @@ if (config.features.scheduler) {
     runAgent,
     sendDirect: async (channel, chatId, text) => {
       if (channel === "cli") {
-        console.log(`[reminder] ${text}`);
+        log("reminder", text);
         return;
       }
       if (channel === "telegram" && telegram) {
         await telegram.sendDirect(chatId, text);
         return;
       }
-      console.warn(`[proactive] no direct sender for channel: ${channel}`);
+      logWarn("proactive", `no direct sender for channel: ${channel}`);
     },
     config,
     defaultUserId: defaultOwner,
     defaultChatId: defaultOwner,
     defaultChannel,
   });
-  console.log("[boot] Proactive: started");
+  log("boot", "Proactive: started");
 }
 
 // --- Database backup ---
@@ -240,30 +241,30 @@ if (config.features.autoBackup) {
   await mkdir(backupDir, { recursive: true });
   try {
     const path = backupDatabase(backupDir);
-    console.log(`[backup] Database backed up to ${path}`);
+    log("backup", `Database backed up to ${path}`);
   } catch (err) {
-    console.warn("[backup] Boot backup failed:", (err as Error).message);
+    logWarn("backup", `Boot backup failed: ${(err as Error).message}`);
   }
   backupTimer = setInterval(() => {
     try {
       const path = backupDatabase(backupDir);
-      console.log(`[backup] Database backed up to ${path}`);
+      log("backup", `Database backed up to ${path}`);
     } catch (err) {
-      console.warn("[backup] Failed:", (err as Error).message);
+      logWarn("backup", `Failed: ${(err as Error).message}`);
     }
-  }, 24 * 60 * 60 * 1000);
+  }, config.features.backupIntervalHours * 3_600_000);
 }
 
 // --- Hourly RAM auto-clean ---
 const hourlyCleanTimer = setInterval(() => {
   try {
-    const cleaned = dbMessages.cleanup(90);
+    const cleaned = dbMessages.cleanup(config.features.messageRetentionDays);
     vacuumDb();
-    if (cleaned > 0) console.log(`[gc] Cleaned ${cleaned} messages + vacuumed SQLite`);
+    if (cleaned > 0) log("gc", `Cleaned ${cleaned} messages + vacuumed SQLite`);
   } catch (err) {
-    console.warn("[gc] Hourly clean failed:", (err as Error).message);
+    logWarn("gc", `Periodic clean failed: ${(err as Error).message}`);
   }
-}, 60 * 60 * 1000);
+}, config.features.gcIntervalHours * 3_600_000);
 
 // --- Boot phase 6: HTTP Server ---
 const dashOwner = config.telegram.adminIds[0] ?? config.owner.id;
@@ -277,7 +278,7 @@ const server = bootServer({
 
 // --- Graceful shutdown ---
 const shutdown = async (signal: "SIGTERM" | "SIGINT") => {
-  console.log(`\n[${signal}] Shutting down...`);
+  log("shutdown", signal);
   if (backupTimer) clearInterval(backupTimer);
   clearInterval(hourlyCleanTimer);
   railwayMonitor?.stop();
@@ -296,7 +297,7 @@ const shutdown = async (signal: "SIGTERM" | "SIGINT") => {
   contextDirWatcher?.close();
   if (contextReloadTimeout) clearTimeout(contextReloadTimeout);
   for (const mcp of mcpClients) {
-    try { await mcp.client.close(); } catch {}
+    try { await mcp.client.close(); } catch { /* shutdown cleanup — ignore */ }
   }
   closeDb();
   server.stop();

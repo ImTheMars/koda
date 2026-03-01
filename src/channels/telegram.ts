@@ -11,8 +11,7 @@ import { messages as dbMessages, usage as dbUsage, tasks as dbTasks } from "../d
 import type { StreamAgentResult } from "../agent.js";
 import { isLlmCircuitOpen, splitOnDelimiter } from "../agent.js";
 import { VERSION } from "../version.js";
-import { log } from "../log.js";
-import { readFileSync } from "fs";
+import { log, logWarn, logError } from "../log.js";
 import { basename } from "path";
 
 export interface TelegramDeps {
@@ -71,7 +70,8 @@ async function transcribeAudio(audioBuffer: Buffer, config: Config): Promise<str
 /** Safety timeout: auto-stop typing after 2 minutes */
 const TYPING_TIMEOUT_MS = 120_000;
 const DEDUP_CLEANUP_MS = 5 * 60_000;
-const RATE_LIMIT = { maxRequests: 10, windowMs: 60_000 };
+// Rate limit defaults — overridden by config in startTelegram
+let RATE_LIMIT = { maxRequests: 10, windowMs: 60_000 };
 const SEGMENT_DELAY_MS = 400;
 const MAX_DOCUMENT_SIZE = 20 * 1024 * 1024; // 20MB
 const MAX_DOCUMENT_TEXT = 30_000; // chars
@@ -80,6 +80,10 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
   const { config } = deps;
   const token = config.telegram.token!;
   const bot = new Bot(token);
+  RATE_LIMIT = {
+    maxRequests: config.telegram.rateLimitMax ?? 10,
+    windowMs: config.telegram.rateLimitWindowMs ?? 60_000,
+  };
   const allowFrom = new Set(config.telegram.allowFrom);
   const processedMessages = new Set<string>();
   const sentMessages = new Set<string>();
@@ -244,13 +248,14 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
   const sendPendingFiles = async (chatId: number, files: Array<{ path: string; caption?: string }>) => {
     for (const file of files) {
       try {
-        const buffer = readFileSync(file.path);
+        const data = await Bun.file(file.path).arrayBuffer();
+        const buffer = Buffer.from(data);
         const filename = basename(file.path);
         await bot.api.sendDocument(chatId, new InputFile(buffer, filename), {
           caption: file.caption,
         });
       } catch (err) {
-        console.error(`[telegram] Failed to send file ${file.path}:`, err);
+        logError("telegram", `Failed to send file ${file.path}`, err);
       }
     }
   };
@@ -265,7 +270,11 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
   };
 
   // --- Build content with forwarded/reply metadata ---
-  const enrichContent = (text: string, message: any): string => {
+  const enrichContent = (text: string, message: {
+    forward_from?: { first_name?: string };
+    forward_from_chat?: { title?: string };
+    reply_to_message?: { text?: string };
+  }): string => {
     let content = text;
 
     // Forwarded message metadata (apply first)
@@ -285,6 +294,14 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
     return content;
   };
 
+  // Lazy singleton for pdf-parse to avoid repeated dynamic imports
+  let pdfParseFn: ((buf: Buffer) => Promise<{ text: string }>) | null = null;
+  const getPdfParse = async (): Promise<(buf: Buffer) => Promise<{ text: string }>> => {
+    // @ts-ignore — pdf-parse has no type declarations
+    if (!pdfParseFn) pdfParseFn = (await import("pdf-parse")).default;
+    return pdfParseFn!;
+  };
+
   // --- Extract text from a document ---
   const extractDocumentText = async (buffer: Buffer, mimeType: string, fileName: string): Promise<string | null> => {
     const textTypes = [
@@ -294,12 +311,16 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
     const textExtensions = [".txt", ".md", ".csv", ".json", ".html", ".xml", ".yml", ".yaml", ".toml", ".ini", ".cfg", ".log"];
 
     if (mimeType === "application/pdf") {
+      if (buffer.length > MAX_DOCUMENT_SIZE) {
+        logWarn("telegram", `PDF too large: ${(buffer.length / 1024 / 1024).toFixed(1)}MB (max ${MAX_DOCUMENT_SIZE / 1024 / 1024}MB)`);
+        return null;
+      }
       try {
-        const pdfParse = (await import("pdf-parse")).default;
+        const pdfParse = await getPdfParse();
         const result = await pdfParse(buffer);
         return result.text;
       } catch (err) {
-        console.error("[telegram] PDF parse error:", err);
+        logError("telegram", "PDF parse error", err);
         return null;
       }
     }
@@ -317,23 +338,23 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
   bot.catch(async (err) => {
     const e = err.error;
     if (e instanceof GrammyError) {
-      console.error(`[telegram] API error ${e.error_code}: ${e.description}`);
+      logError("telegram", `API error ${e.error_code}: ${e.description}`);
     } else if (e instanceof HttpError) {
-      console.error("[telegram] Network error:", e.message);
+      logError("telegram", "Network error", e);
       consecutiveErrors++;
       if (consecutiveErrors > 5) {
-        console.error("[telegram] Too many network errors, restarting bot...");
+        logError("telegram", "Too many network errors, restarting bot...");
         consecutiveErrors = 0;
-        try { await bot.stop(); } catch {}
+        try { await bot.stop(); } catch { /* shutdown may fail if already disconnected */ }
         startWithRetry();
       }
     } else {
-      console.error("[telegram] Unknown error:", e ?? err);
+      logError("telegram", "Unknown error", e ?? err);
       consecutiveErrors++;
       if (consecutiveErrors > 5) {
-        console.error("[telegram] Too many errors, restarting bot...");
+        logError("telegram", "Too many errors, restarting bot...");
         consecutiveErrors = 0;
-        try { await bot.stop(); } catch {}
+        try { await bot.stop(); } catch { /* shutdown may fail if already disconnected */ }
         startWithRetry();
       }
     }
@@ -345,10 +366,19 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
     await ctx.reply("hey. send me a message to get started.");
   });
 
+  const pendingClears = new Set<string>();
   bot.command("clear", async (ctx) => {
     if (!isAllowed(String(ctx.from?.id))) return;
-    dbMessages.clear(`telegram_${ctx.chat.id}`);
-    await ctx.reply("Conversation cleared.");
+    const chatId = String(ctx.chat.id);
+    if (pendingClears.has(chatId)) {
+      pendingClears.delete(chatId);
+      dbMessages.clear(`telegram_${chatId}`);
+      await ctx.reply("Conversation cleared.");
+    } else {
+      pendingClears.add(chatId);
+      setTimeout(() => pendingClears.delete(chatId), 30_000);
+      await ctx.reply("Clear conversation history? Send /clear again to confirm.");
+    }
   });
 
   bot.command("help", async (ctx) => {
@@ -449,10 +479,10 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
         source: "command",
       });
       await sendStreamReply(Number(chatId), result.fullStream, () => stopTyping(chatId));
-      await result.finishedPromise.catch(console.error);
+      await result.finishedPromise.catch((err) => logError("telegram", "agent promise failed", err));
     } catch (err) {
       stopTyping(chatId);
-      console.error("[telegram] Recap error:", err);
+      logError("telegram", "Recap error", err);
       await ctx.reply("ran into an issue generating the recap.").catch(() => {});
     }
   });
@@ -480,10 +510,10 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
         source: "command",
       });
       await sendStreamReply(Number(chatId), result.fullStream, () => stopTyping(chatId));
-      await result.finishedPromise.catch(console.error);
+      await result.finishedPromise.catch((err) => logError("telegram", "agent promise failed", err));
     } catch (err) {
       stopTyping(chatId);
-      console.error("[telegram] Memories error:", err);
+      logError("telegram", "Memories error", err);
       await ctx.reply("ran into an issue with memories.").catch(() => {});
     }
   });
@@ -525,16 +555,16 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
   bot.on("message:text", async (ctx) => {
     const senderId = String(ctx.from?.id);
     if (!isAllowed(senderId)) {
-      console.log(`[msg] BLOCKED text from=${senderId} reason=not_allowed`);
+      log("msg", `BLOCKED text from=${senderId} reason=not_allowed`);
       return;
     }
     const key = dedupKey(ctx.chat.id, ctx.message.message_id);
-    if (processedMessages.has(key)) { console.log(`[msg] DEDUP text from=${senderId}`); return; }
+    if (processedMessages.has(key)) { log("msg", `DEDUP text from=${senderId}`); return; }
     processedMessages.add(key);
     const chatId = String(ctx.chat.id);
     const preview = ctx.message.text.slice(0, 100);
-    console.log(`[msg] IN text from=${senderId} chat=${chatId} len=${ctx.message.text.length} "${preview}"`);
-    if (isRateLimited(chatId)) { console.log(`[msg] RATE_LIMITED chat=${chatId}`); await ctx.reply("slow down! you're sending messages too fast."); return; }
+    log("msg", `IN text from=${senderId} chat=${chatId} len=${ctx.message.text.length} "${preview}"`);
+    if (isRateLimited(chatId)) { log("msg", `RATE_LIMITED chat=${chatId}`); await ctx.reply("slow down! you're sending messages too fast."); return; }
 
     const content = enrichContent(ctx.message.text, ctx.message);
     const tierOverride = consumeTierOverride(chatId);
@@ -552,20 +582,20 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
 
       consecutiveErrors = 0;
       await sendStreamReply(Number(chatId), streamResult.fullStream, () => stopTyping(chatId));
-      const agentResult = await streamResult.finishedPromise.catch((err) => { console.error(err); return null; });
+      const agentResult = await streamResult.finishedPromise.catch((err) => { logError("telegram", "agent promise failed", err); return null; });
 
       const elapsed = Date.now() - t0;
       const replyPreview = (agentResult?.text ?? "").slice(0, 120);
-      console.log(`[msg] OUT text to=${chatId} len=${agentResult?.text?.length ?? 0} tier=${agentResult?.tier ?? "?"} tools=[${agentResult?.toolsUsed?.join(",") ?? ""}] ${elapsed}ms "${replyPreview}"`);
+      log("msg", `OUT text to=${chatId} len=${agentResult?.text?.length ?? 0} tier=${agentResult?.tier ?? "?"} tools=[${agentResult?.toolsUsed?.join(",") ?? ""}] ${elapsed}ms "${replyPreview}"`);
 
       // Send pending files
       if (agentResult?.files?.length) {
-        console.log(`[msg] FILES to=${chatId} count=${agentResult.files.length}`);
+        log("msg", `FILES to=${chatId} count=${agentResult.files.length}`);
         await sendPendingFiles(Number(chatId), agentResult.files);
       }
     } catch (err) {
       stopTyping(chatId);
-      console.error(`[msg] ERROR text from=${senderId} chat=${chatId} ${Date.now() - t0}ms:`, err);
+      logError("msg", `text from=${senderId} chat=${chatId} ${Date.now() - t0}ms`, err);
       await ctx.reply("ran into an issue, try again?").catch(() => {});
     }
   });
@@ -573,13 +603,13 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
   // --- Photo messages (streaming) ---
   bot.on("message:photo", async (ctx) => {
     const senderId = String(ctx.from?.id);
-    if (!isAllowed(senderId)) { console.log(`[msg] BLOCKED photo from=${senderId} reason=not_allowed`); return; }
+    if (!isAllowed(senderId)) { log("msg", `BLOCKED photo from=${senderId} reason=not_allowed`); return; }
     const key = dedupKey(ctx.chat.id, ctx.message.message_id);
     if (processedMessages.has(key)) return;
     processedMessages.add(key);
     const chatId = String(ctx.chat.id);
-    console.log(`[msg] IN photo from=${senderId} chat=${chatId} caption="${(ctx.message.caption ?? "").slice(0, 80)}"`);
-    if (isRateLimited(chatId)) { console.log(`[msg] RATE_LIMITED chat=${chatId}`); await ctx.reply("slow down!"); return; }
+    log("msg", `IN photo from=${senderId} chat=${chatId} caption="${(ctx.message.caption ?? "").slice(0, 80)}"`);
+    if (isRateLimited(chatId)) { log("msg", `RATE_LIMITED chat=${chatId}`); await ctx.reply("slow down!"); return; }
 
     let caption = ctx.message.caption ?? "What's in this image?";
 
@@ -624,14 +654,14 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
 
       consecutiveErrors = 0;
       await sendStreamReply(Number(chatId), streamResult.fullStream, () => stopTyping(chatId));
-      const agentResult = await streamResult.finishedPromise.catch((err) => { console.error(err); return null; });
-      console.log(`[msg] OUT photo to=${chatId} len=${agentResult?.text?.length ?? 0} tier=${agentResult?.tier ?? "?"} ${Date.now() - t0}ms`);
+      const agentResult = await streamResult.finishedPromise.catch((err) => { logError("telegram", "agent promise failed", err); return null; });
+      log("msg", `OUT photo to=${chatId} len=${agentResult?.text?.length ?? 0} tier=${agentResult?.tier ?? "?"} ${Date.now() - t0}ms`);
       if (agentResult?.files?.length) {
         await sendPendingFiles(Number(chatId), agentResult.files);
       }
     } catch (err) {
       stopTyping(chatId);
-      console.error(`[msg] ERROR photo from=${senderId} chat=${chatId} ${Date.now() - t0}ms:`, err);
+      logError("msg", `photo from=${senderId} chat=${chatId} ${Date.now() - t0}ms`, err);
       await ctx.reply("ran into an issue, try again?").catch(() => {});
     }
   });
@@ -639,13 +669,13 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
   // --- Document/PDF messages ---
   bot.on("message:document", async (ctx) => {
     const senderId = String(ctx.from?.id);
-    if (!isAllowed(senderId)) { console.log(`[msg] BLOCKED document from=${senderId} reason=not_allowed`); return; }
+    if (!isAllowed(senderId)) { log("msg", `BLOCKED document from=${senderId} reason=not_allowed`); return; }
     const key = dedupKey(ctx.chat.id, ctx.message.message_id);
     if (processedMessages.has(key)) return;
     processedMessages.add(key);
     const chatId = String(ctx.chat.id);
-    console.log(`[msg] IN document from=${senderId} chat=${chatId} file="${ctx.message.document.file_name ?? "?"}"`);
-    if (isRateLimited(chatId)) { console.log(`[msg] RATE_LIMITED chat=${chatId}`); await ctx.reply("slow down!"); return; }
+    log("msg", `IN document from=${senderId} chat=${chatId} file="${ctx.message.document.file_name ?? "?"}"`);
+    if (isRateLimited(chatId)) { log("msg", `RATE_LIMITED chat=${chatId}`); await ctx.reply("slow down!"); return; }
 
     const doc = ctx.message.document;
     const fileName = doc.file_name ?? "document";
@@ -705,14 +735,14 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
 
       consecutiveErrors = 0;
       await sendStreamReply(Number(chatId), streamResult.fullStream, () => stopTyping(chatId));
-      const agentResult = await streamResult.finishedPromise.catch((err) => { console.error(err); return null; });
-      console.log(`[msg] OUT document to=${chatId} len=${agentResult?.text?.length ?? 0} tier=${agentResult?.tier ?? "?"} ${Date.now() - t0}ms`);
+      const agentResult = await streamResult.finishedPromise.catch((err) => { logError("telegram", "agent promise failed", err); return null; });
+      log("msg", `OUT document to=${chatId} len=${agentResult?.text?.length ?? 0} tier=${agentResult?.tier ?? "?"} ${Date.now() - t0}ms`);
       if (agentResult?.files?.length) {
         await sendPendingFiles(Number(chatId), agentResult.files);
       }
     } catch (err) {
       stopTyping(chatId);
-      console.error(`[msg] ERROR document from=${senderId} chat=${chatId} ${Date.now() - t0}ms:`, err);
+      logError("msg", `document from=${senderId} chat=${chatId} ${Date.now() - t0}ms`, err);
       await ctx.reply("ran into an issue processing that file.").catch(() => {});
     }
   });
@@ -720,13 +750,13 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
   // --- Voice messages ---
   bot.on("message:voice", async (ctx) => {
     const senderId = String(ctx.from?.id);
-    if (!isAllowed(senderId)) { console.log(`[msg] BLOCKED voice from=${senderId} reason=not_allowed`); return; }
+    if (!isAllowed(senderId)) { log("msg", `BLOCKED voice from=${senderId} reason=not_allowed`); return; }
     const key = dedupKey(ctx.chat.id, ctx.message.message_id);
     if (processedMessages.has(key)) return;
     processedMessages.add(key);
     const chatId = String(ctx.chat.id);
-    console.log(`[msg] IN voice from=${senderId} chat=${chatId} duration=${ctx.message.voice.duration}s`);
-    if (isRateLimited(chatId)) { console.log(`[msg] RATE_LIMITED chat=${chatId}`); await ctx.reply("slow down!"); return; }
+    log("msg", `IN voice from=${senderId} chat=${chatId} duration=${ctx.message.voice.duration}s`);
+    if (isRateLimited(chatId)) { log("msg", `RATE_LIMITED chat=${chatId}`); await ctx.reply("slow down!"); return; }
 
     const voice = ctx.message.voice;
     const file = await ctx.api.getFile(voice.file_id);
@@ -748,7 +778,7 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
       return;
     }
 
-    console.log(`[msg] TRANSCRIBED voice from=${senderId} "${transcription.slice(0, 100)}"`);
+    log("msg", `TRANSCRIBED voice from=${senderId} "${transcription.slice(0, 100)}"`);
 
     let content = `[voice message] ${transcription}`;
     content = enrichContent(content, ctx.message);
@@ -767,14 +797,14 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
 
       consecutiveErrors = 0;
       await sendStreamReply(Number(chatId), streamResult.fullStream, () => stopTyping(chatId));
-      const agentResult = await streamResult.finishedPromise.catch((err) => { console.error(err); return null; });
-      console.log(`[msg] OUT voice to=${chatId} len=${agentResult?.text?.length ?? 0} tier=${agentResult?.tier ?? "?"} ${Date.now() - t0}ms`);
+      const agentResult = await streamResult.finishedPromise.catch((err) => { logError("telegram", "agent promise failed", err); return null; });
+      log("msg", `OUT voice to=${chatId} len=${agentResult?.text?.length ?? 0} tier=${agentResult?.tier ?? "?"} ${Date.now() - t0}ms`);
       if (agentResult?.files?.length) {
         await sendPendingFiles(Number(chatId), agentResult.files);
       }
     } catch (err) {
       stopTyping(chatId);
-      console.error(`[msg] ERROR voice from=${senderId} chat=${chatId} ${Date.now() - t0}ms:`, err);
+      logError("msg", `voice from=${senderId} chat=${chatId} ${Date.now() - t0}ms`, err);
       await ctx.reply("ran into an issue, try again?").catch(() => {});
     }
   });
@@ -782,13 +812,13 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
   // --- Video note (circle video) messages ---
   bot.on("message:video_note", async (ctx) => {
     const senderId = String(ctx.from?.id);
-    if (!isAllowed(senderId)) { console.log(`[msg] BLOCKED video_note from=${senderId} reason=not_allowed`); return; }
+    if (!isAllowed(senderId)) { log("msg", `BLOCKED video_note from=${senderId} reason=not_allowed`); return; }
     const key = dedupKey(ctx.chat.id, ctx.message.message_id);
     if (processedMessages.has(key)) return;
     processedMessages.add(key);
     const chatId = String(ctx.chat.id);
-    console.log(`[msg] IN video_note from=${senderId} chat=${chatId}`);
-    if (isRateLimited(chatId)) { console.log(`[msg] RATE_LIMITED chat=${chatId}`); await ctx.reply("slow down!"); return; }
+    log("msg", `IN video_note from=${senderId} chat=${chatId}`);
+    if (isRateLimited(chatId)) { log("msg", `RATE_LIMITED chat=${chatId}`); await ctx.reply("slow down!"); return; }
 
     const videoNote = ctx.message.video_note;
     const file = await ctx.api.getFile(videoNote.file_id);
@@ -827,14 +857,14 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
 
       consecutiveErrors = 0;
       await sendStreamReply(Number(chatId), streamResult.fullStream, () => stopTyping(chatId));
-      const agentResult = await streamResult.finishedPromise.catch((err) => { console.error(err); return null; });
-      console.log(`[msg] OUT video_note to=${chatId} len=${agentResult?.text?.length ?? 0} tier=${agentResult?.tier ?? "?"} ${Date.now() - t0}ms`);
+      const agentResult = await streamResult.finishedPromise.catch((err) => { logError("telegram", "agent promise failed", err); return null; });
+      log("msg", `OUT video_note to=${chatId} len=${agentResult?.text?.length ?? 0} tier=${agentResult?.tier ?? "?"} ${Date.now() - t0}ms`);
       if (agentResult?.files?.length) {
         await sendPendingFiles(Number(chatId), agentResult.files);
       }
     } catch (err) {
       stopTyping(chatId);
-      console.error(`[msg] ERROR video_note from=${senderId} chat=${chatId} ${Date.now() - t0}ms:`, err);
+      logError("msg", `video_note from=${senderId} chat=${chatId} ${Date.now() - t0}ms`, err);
       await ctx.reply("ran into an issue, try again?").catch(() => {});
     }
   });
@@ -847,7 +877,7 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
     if (processedMessages.has(key)) return;
     processedMessages.add(key);
     const chatId = String(ctx.editedMessage!.chat.id);
-    console.log(`[msg] IN edited from=${senderId} chat=${chatId} "${ctx.editedMessage!.text?.slice(0, 80)}"`);
+    log("msg", `IN edited from=${senderId} chat=${chatId} "${ctx.editedMessage!.text?.slice(0, 80)}"`);
     if (isRateLimited(chatId)) return;
 
     const content = `[edited] ${ctx.editedMessage!.text}`;
@@ -863,11 +893,11 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
 
       consecutiveErrors = 0;
       await sendStreamReply(Number(chatId), streamResult.fullStream, () => stopTyping(chatId));
-      const agentResult = await streamResult.finishedPromise.catch((err) => { console.error(err); return null; });
-      console.log(`[msg] OUT edited to=${chatId} len=${agentResult?.text?.length ?? 0} ${Date.now() - t0}ms`);
+      const agentResult = await streamResult.finishedPromise.catch((err) => { logError("telegram", "agent promise failed", err); return null; });
+      log("msg", `OUT edited to=${chatId} len=${agentResult?.text?.length ?? 0} ${Date.now() - t0}ms`);
     } catch (err) {
       stopTyping(chatId);
-      console.error(`[msg] ERROR edited from=${senderId} chat=${chatId} ${Date.now() - t0}ms:`, err);
+      logError("msg", `edited from=${senderId} chat=${chatId} ${Date.now() - t0}ms`, err);
     }
   });
 
@@ -879,13 +909,13 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
       try {
         await bot.start({
           onStart: async () => {
-            console.log("[telegram] Bot is running");
+            log("telegram", "Bot is running");
             consecutiveErrors = 0;
           },
         });
         break;
       } catch (err) {
-        console.error(`[telegram] Connection failed, retrying in ${delay / 1000}s...`, err);
+        logError("telegram", `Connection failed, retrying in ${delay / 1000}s`, err);
         await new Promise((r) => setTimeout(r, delay + Math.random() * 1000));
         delay = Math.min(delay * 2, maxDelay);
       }
@@ -947,7 +977,7 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
 
   // --- Initialize bot (required before handleUpdate in webhook mode) ---
   await bot.init();
-  console.log(`[telegram] Bot initialized: @${bot.botInfo.username}`);
+  log("telegram", `Bot initialized: @${bot.botInfo.username}`);
 
   // --- Webhook or polling ---
   if (config.telegram.useWebhook && config.telegram.webhookUrl) {
@@ -961,16 +991,16 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
           // Verify it actually took
           const info = await bot.api.getWebhookInfo();
           if (info.url === config.telegram.webhookUrl) {
-            console.log("[telegram] Webhook set:", config.telegram.webhookUrl);
+            log("telegram", `Webhook set: ${config.telegram.webhookUrl}`);
             return;
           }
-          console.warn(`[telegram] Webhook URL mismatch after set (got "${info.url}"), retrying...`);
+          logWarn("telegram", `Webhook URL mismatch after set (got "${info.url}"), retrying...`);
         } catch (err) {
-          console.warn(`[telegram] setWebhook attempt ${i + 1}/${retries} failed:`, (err as Error).message);
+          logWarn("telegram", `setWebhook attempt ${i + 1}/${retries} failed: ${(err as Error).message}`);
         }
         if (i < retries - 1) await new Promise((r) => setTimeout(r, delay));
       }
-      console.error("[telegram] Failed to set webhook after all retries!");
+      logError("telegram", "Failed to set webhook after all retries!");
     };
     await setWebhookWithRetry();
 
@@ -979,14 +1009,14 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
       try {
         const info = await bot.api.getWebhookInfo();
         if (info.url !== config.telegram.webhookUrl) {
-          console.warn("[telegram] Webhook was cleared (deploy race), re-registering...");
+          logWarn("telegram", "Webhook was cleared (deploy race), re-registering...");
           await bot.api.setWebhook(config.telegram.webhookUrl!, {
             secret_token: config.telegram.webhookSecret,
           });
-          console.log("[telegram] Webhook re-registered successfully");
+          log("telegram", "Webhook re-registered successfully");
         }
       } catch (err) {
-        console.error("[telegram] Webhook re-check failed:", (err as Error).message);
+        logError("telegram", "Webhook re-check failed", err);
       }
     }, 10_000);
 
@@ -1026,20 +1056,23 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
         if (config.telegram.webhookSecret) {
           const secretHeader = req.headers.get("x-telegram-bot-api-secret-token");
           if (secretHeader !== config.telegram.webhookSecret) {
-            console.warn(`[webhook] UNAUTHORIZED request (bad secret)`);
+            logWarn("webhook", "UNAUTHORIZED request (bad secret)");
             return new Response("Unauthorized", { status: 401 });
           }
         }
         try {
-          const update = await req.json() as any;
-          const updateType = Object.keys(update).filter((k: string) => k !== "update_id").join(",") || "unknown";
-          const fromId = update.message?.from?.id ?? update.edited_message?.from?.id ?? "?";
-          const preview = (update.message?.text ?? update.edited_message?.text ?? "").slice(0, 60);
-          console.log(`[webhook] id=${update.update_id} type=${updateType} from=${fromId}${preview ? ` "${preview}"` : ""}`);
+          const update = await req.json() as Parameters<typeof bot.handleUpdate>[0];
+          const raw = update as unknown as Record<string, unknown>;
+          const updateType = Object.keys(raw).filter((k) => k !== "update_id").join(",") || "unknown";
+          const msg = raw.message as { from?: { id: number }; text?: string } | undefined;
+          const editMsg = raw.edited_message as { from?: { id: number }; text?: string } | undefined;
+          const fromId = msg?.from?.id ?? editMsg?.from?.id ?? "?";
+          const preview = (msg?.text ?? editMsg?.text ?? "").slice(0, 60);
+          log("webhook", `id=${update.update_id} type=${updateType} from=${fromId}${preview ? ` "${preview}"` : ""}`);
           await bot.handleUpdate(update);
           return new Response("ok");
         } catch (err) {
-          console.error("[webhook] ERROR processing update:", err);
+          logError("webhook", "processing update failed", err);
           return new Response("error", { status: 500 });
         }
       },

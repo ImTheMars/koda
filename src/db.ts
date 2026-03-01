@@ -6,6 +6,7 @@
  */
 
 import { Database } from "bun:sqlite";
+import { log } from "./log.js";
 import { copyFileSync, readdirSync, unlinkSync } from "fs";
 import { resolve, basename } from "path";
 
@@ -107,7 +108,7 @@ function runMigrations(database: Database): void {
     database.run(
       "INSERT OR REPLACE INTO state (key, value, updated_at) VALUES ('schema_version', '1', datetime('now'))",
     );
-    console.log("[db] Migrated to schema version 1");
+    log("db", "Migrated to schema version 1");
   }
 
   if (currentVersion < 2) {
@@ -128,7 +129,7 @@ function runMigrations(database: Database): void {
     database.run(
       "INSERT OR REPLACE INTO state (key, value, updated_at) VALUES ('schema_version', '2', datetime('now'))",
     );
-    console.log("[db] Migrated to schema version 2");
+    log("db", "Migrated to schema version 2");
   }
 
   if (currentVersion < 3) {
@@ -136,19 +137,19 @@ function runMigrations(database: Database): void {
     try {
       database.exec("ALTER TABLE usage ADD COLUMN tool_cost REAL NOT NULL DEFAULT 0");
     } catch {
-      // Column already exists — safe to ignore
+      // Column already exists (duplicate table) — safe to ignore
     }
     database.run(
       "INSERT OR REPLACE INTO state (key, value, updated_at) VALUES ('schema_version', '3', datetime('now'))",
     );
-    console.log("[db] Migrated to schema version 3");
+    log("db", "Migrated to schema version 3");
   }
 
   if (currentVersion < 4) {
-    try { database.exec("ALTER TABLE tasks ADD COLUMN last_status TEXT DEFAULT NULL"); } catch {}
-    try { database.exec("ALTER TABLE tasks ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0"); } catch {}
+    try { database.exec("ALTER TABLE tasks ADD COLUMN last_status TEXT DEFAULT NULL"); } catch { /* column already exists */ }
+    try { database.exec("ALTER TABLE tasks ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0"); } catch { /* column already exists */ }
     database.run("INSERT OR REPLACE INTO state (key, value, updated_at) VALUES ('schema_version', '4', datetime('now'))");
-    console.log("[db] Migrated to schema version 4");
+    log("db", "Migrated to schema version 4");
   }
 }
 
@@ -248,9 +249,15 @@ export const tasks = {
     nextRunAt: string; oneShot: boolean; lastRunAt: string | null;
     lastStatus: string | null; consecutiveFailures: number;
   }> {
+    type TaskRow = {
+      id: string; userId: string; chatId: string; channel: string;
+      type: string; description: string; prompt: string | null; cron: string | null;
+      nextRunAt: string; oneShot: number; lastRunAt: string | null;
+      lastStatus: string | null; consecutiveFailures: number;
+    };
     return (getDb()
       .query("SELECT id, user_id as userId, chat_id as chatId, channel, type, description, prompt, cron, next_run_at as nextRunAt, one_shot as oneShot, last_run_at as lastRunAt, last_status as lastStatus, consecutive_failures as consecutiveFailures FROM tasks WHERE enabled = 1 AND next_run_at <= ? ORDER BY next_run_at ASC")
-      .all(now) as Array<any>).map((r) => ({ ...r, oneShot: r.oneShot === 1 }));
+      .all(now) as TaskRow[]).map((r) => ({ ...r, oneShot: r.oneShot === 1 }));
   },
 
   advance(id: string, nextRunAt: string): void {
@@ -276,7 +283,11 @@ export const tasks = {
   }> {
     return getDb()
       .query("SELECT id, type, description, cron, next_run_at as nextRunAt, last_run_at as lastRunAt, last_status as lastStatus, consecutive_failures as consecutiveFailures FROM tasks WHERE user_id = ? AND enabled = 1 ORDER BY next_run_at")
-      .all(userId) as any[];
+      .all(userId) as Array<{
+        id: string; type: string; description: string; cron: string | null;
+        nextRunAt: string; lastRunAt: string | null;
+        lastStatus: string | null; consecutiveFailures: number;
+      }>;
   },
 };
 
@@ -393,7 +404,7 @@ export function backupDatabase(backupDir: string, maxBackups = 7): string {
       const oldest = files.shift()!;
       unlinkSync(resolve(backupDir, oldest));
     }
-  } catch {}
+  } catch { /* backup dir may not exist yet — safe to skip */ }
 
   return backupPath;
 }

@@ -10,6 +10,7 @@ import { createMemoryProvider, type MemoryProvider } from "../tools/memory.js";
 import { SoulLoader } from "../tools/soul.js";
 import { SkillLoader } from "../tools/skills.js";
 import { initOllama } from "../agent.js";
+import { log, logWarn } from "../log.js";
 
 export interface ProviderResult {
   memoryProvider: MemoryProvider;
@@ -27,7 +28,7 @@ export async function bootProviders(config: Config): Promise<ProviderResult> {
 
   const soulLoader = new SoulLoader(config.soul.path, config.soul.dir);
   await soulLoader.initialize();
-  console.log(`[boot] Soul: ${soulLoader.getSoul().identity.name}`);
+  log("boot", `Soul: ${soulLoader.getSoul().identity.name}`);
 
   // CONTEXT.md
   let contextContent: string | null = null;
@@ -42,7 +43,7 @@ export async function bootProviders(config: Config): Promise<ProviderResult> {
   }
 
   await loadContext();
-  if (contextContent !== null) console.log(`[boot] CONTEXT.md loaded (${(contextContent as string).length} chars)`);
+  if (contextContent !== null) log("boot", `CONTEXT.md loaded (${(contextContent as string).length} chars)`);
 
   let contextWatcher: FSWatcher | null = null;
   let contextDirWatcher: FSWatcher | null = null;
@@ -52,23 +53,23 @@ export async function bootProviders(config: Config): Promise<ProviderResult> {
     if (contextReloadTimeout) clearTimeout(contextReloadTimeout);
     contextReloadTimeout = setTimeout(() => {
       loadContext().then(() => {
-        if (contextContent) console.log("[context] CONTEXT.md reloaded");
+        if (contextContent) log("context", "CONTEXT.md reloaded");
       });
     }, 300);
   }
 
-  try { contextWatcher = watch(contextPath, () => scheduleContextReload()); } catch {}
+  try { contextWatcher = watch(contextPath, () => scheduleContextReload()); } catch { /* file may not exist yet */ }
   try { contextDirWatcher = watch(config.workspace, { recursive: false }, (_, filename) => {
     if (filename === "CONTEXT.md") scheduleContextReload();
-  }); } catch {}
+  }); } catch { /* workspace dir watch may not be supported */ }
 
   const skillLoader = new SkillLoader(config.workspace);
   const skills = await skillLoader.listSkills();
-  console.log(`[boot] Skills: ${skills.length} loaded`);
+  log("boot", `Skills: ${skills.length} loaded`);
 
   // Cloud memory filter
   memoryProvider.setupCloudFilter?.().catch((err: Error) =>
-    console.warn("[boot] Cloud filter setup skipped:", err.message),
+    logWarn("boot", `Cloud filter setup skipped: ${err.message}`),
   );
 
   // Ollama detection
@@ -77,12 +78,12 @@ export async function bootProviders(config: Config): Promise<ProviderResult> {
       const res = await fetch(`${config.ollama.baseUrl}/api/tags`, { signal: AbortSignal.timeout(1500) });
       if (res.ok) {
         initOllama(config.ollama.baseUrl);
-        console.log(`[boot] Ollama: enabled (${config.ollama.model}) at ${config.ollama.baseUrl}`);
+        log("boot", `Ollama: enabled (${config.ollama.model}) at ${config.ollama.baseUrl}`);
       } else {
-        console.log("[boot] Ollama: configured but not reachable — using OpenRouter only");
+        log("boot", "Ollama: configured but not reachable — using OpenRouter only");
       }
     } catch {
-      console.log("[boot] Ollama: not reachable — using OpenRouter only");
+      log("boot", "Ollama: not reachable — using OpenRouter only");
     }
   }
 

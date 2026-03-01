@@ -19,9 +19,18 @@ import { z } from "zod";
 import { createAgent, type AgentDeps } from "../agent.js";
 import { subagents as dbSubagents, type SpawnRow } from "../db.js";
 import { emit } from "../events.js";
+import { log } from "../log.js";
+
+interface StructuredSubagentResult {
+  summary: string;
+  data?: Record<string, unknown>;
+  sources?: Array<{ title?: string; url: string }>;
+  confidence?: "low" | "medium" | "high";
+  notes?: string[];
+}
 
 /** Structured results stored by sub-agents that call returnResult. */
-const structuredResults = new Map<string, { summary: string; data?: Record<string, unknown> }>();
+const structuredResults = new Map<string, StructuredSubagentResult>();
 
 // Tools that sub-agents are never allowed to use, regardless of allowlist.
 const ALWAYS_BLOCKED = new Set([
@@ -130,7 +139,7 @@ export function registerSubAgentTools(deps: {
       const startedAt = new Date().toISOString();
       const startMs = Date.now();
 
-      console.log(`[spawn] → ${name}  ×${maxSteps} steps  [${Object.keys(subTools).join(", ")}]`);
+      log("spawn", `→ ${name}  ×${maxSteps} steps  [${Object.keys(subTools).join(", ")}]`);
 
       // Persist spawn record immediately
       dbSubagents.upsert({ sessionKey, name, startedAt });
@@ -150,20 +159,26 @@ export function registerSubAgentTools(deps: {
         }),
         execute: async ({ message }) => {
           emit("subagent_update", { sessionKey, name, message, ts: new Date().toISOString() });
-          console.log(`[spawn:${name}] ${message}`);
+          log("spawn", `${name}: ${message}`);
           return { sent: true };
         },
       });
 
       // returnResult: forces structured output so the main agent gets clean, parseable data
       const returnResultTool = tool({
-        description: "Submit your final structured result. ALWAYS call this when you have finished your task instead of just returning text.",
+        description: "Submit your final structured result. ALWAYS call this when you have finished your task instead of just returning text. For factual/current research, include sources and confidence.",
         inputSchema: z.object({
           summary: z.string().describe("Concise prose summary of findings (1-3 sentences)"),
           data: z.record(z.string(), z.unknown()).describe("Optional structured data: tables, lists, counts, URLs, etc.").optional(),
+          sources: z.array(z.object({
+            url: z.string().url(),
+            title: z.string().optional(),
+          })).max(20).optional().describe("Source URLs used for factual claims"),
+          confidence: z.enum(["low", "medium", "high"]).optional().describe("Confidence in the findings"),
+          notes: z.array(z.string()).max(20).optional().describe("Caveats, uncertainties, or follow-up notes"),
         }),
-        execute: async ({ summary, data }) => {
-          structuredResults.set(sessionKey, { summary, data });
+        execute: async ({ summary, data, sources, confidence, notes }) => {
+          structuredResults.set(sessionKey, { summary, data, sources, confidence, notes });
           return { stored: true };
         },
       });
@@ -181,8 +196,10 @@ export function registerSubAgentTools(deps: {
           if (context) lines.push(``, `## Context from parent`, context);
           lines.push(``, `## Rules`,
             `- Use streamUpdate after each major step to show progress.`,
-            `- When DONE, call returnResult({ summary, data }) with your findings.`,
+            `- When DONE, call returnResult({ summary, data, sources, confidence, notes }) with your findings.`,
             `- Do NOT use the <|msg|> delimiter.`,
+            `- For factual/current research: include sources (URLs) and avoid exact numbers unless they come from sources.`,
+            `- If you run out of time, return partial findings with caveats instead of guessing.`,
             `- Be thorough but concise. If stuck, return what you have so far.`,
           );
           return lines.join("\n");
@@ -195,8 +212,12 @@ export function registerSubAgentTools(deps: {
       structuredResults.delete(sessionKey); // clear any stale result from prior run
 
       const effectiveTimeout = customTimeout ?? timeoutMs;
+      let timeoutHandle: ReturnType<typeof setTimeout> | null = null;
       const timeoutPromise = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error(`timeout after ${effectiveTimeout / 1000}s`)), effectiveTimeout),
+        timeoutHandle = setTimeout(() => {
+          try { ac.abort(); } catch {}
+          reject(new Error(`timeout after ${effectiveTimeout / 1000}s`));
+        }, effectiveTimeout),
       );
 
       try {
@@ -220,7 +241,7 @@ export function registerSubAgentTools(deps: {
         const wasKilled = !abortMap.has(sessionKey); // killed externally clears the map entry
         const status = wasKilled ? "killed" : "done";
 
-        console.log(`[spawn] ✓ ${name}  ${uniqueTools.join(", ")}  $${result.usage.cost.toFixed(4)}`);
+        log("spawn", `done ${name}  ${uniqueTools.join(", ")}  $${result.usage.cost.toFixed(4)}`);
 
         dbSubagents.markCompleted(sessionKey, { status, toolsUsed: uniqueTools, cost: result.usage.cost, durationMs });
         abortMap.delete(sessionKey);
@@ -237,6 +258,7 @@ export function registerSubAgentTools(deps: {
 
         return {
           success: true,
+          status,
           name,
           sessionKey,
           result: structured?.summary ?? result.text,
@@ -249,10 +271,15 @@ export function registerSubAgentTools(deps: {
         const msg = err instanceof Error ? err.message : "Sub-agent failed";
         const durationMs = Date.now() - startMs;
         const isTimeout = msg.startsWith("timeout");
+        if (isTimeout) {
+          try { ac.abort(); } catch {}
+        }
         const wasKilled = !abortMap.has(sessionKey);
         const status = isTimeout ? "timeout" : wasKilled ? "killed" : "error";
+        const structured = structuredResults.get(sessionKey) ?? null;
+        structuredResults.delete(sessionKey);
 
-        console.log(`[spawn] ✗ ${name}  ${msg}`);
+        log("spawn", `fail ${name}  ${msg}`);
 
         dbSubagents.markCompleted(sessionKey, { status, toolsUsed: [], cost: 0, durationMs });
         abortMap.delete(sessionKey);
@@ -264,7 +291,19 @@ export function registerSubAgentTools(deps: {
         };
         emit("spawn", finalEntry);
 
-        return { success: false, name, sessionKey, error: msg, result: "", toolsUsed: [], cost: 0 };
+        return {
+          success: false,
+          status,
+          name,
+          sessionKey,
+          error: msg,
+          result: structured?.summary ?? "",
+          structured,
+          toolsUsed: [],
+          cost: 0,
+        };
+      } finally {
+        if (timeoutHandle) clearTimeout(timeoutHandle);
       }
     },
   });

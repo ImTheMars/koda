@@ -5,25 +5,28 @@
 import { createMCPClient } from "@ai-sdk/mcp";
 import type { ToolSet } from "ai";
 import type { Config } from "../config.js";
+import { log, logWarn, logError } from "../log.js";
 
 type McpServerConfig = Config["mcp"]["servers"][number];
 
-function buildMcpTransport(server: McpServerConfig) {
+type McpTransport = Parameters<typeof createMCPClient>[0]["transport"];
+
+function buildMcpTransport(server: McpServerConfig): McpTransport {
   if (server.transport === "stdio") {
-    return { type: "stdio" as const, command: server.command, args: server.args, env: server.env };
+    return { type: "stdio" as const, command: server.command, args: server.args, env: server.env } as unknown as McpTransport;
   }
-  return { type: server.transport, url: server.url, ...(server.headers ? { headers: server.headers } : {}) };
+  return { type: server.transport, url: server.url, ...(server.headers ? { headers: server.headers } : {}) } as McpTransport;
 }
 
 async function connectMcpServer(server: McpServerConfig, toolSet: ToolSet, namespace: boolean) {
-  const client = await createMCPClient({ transport: buildMcpTransport(server) as any });
+  const client = await createMCPClient({ transport: buildMcpTransport(server) });
   const rawTools = await client.tools();
 
   // Namespace tool names to prevent collisions
   const namespacedTools: ToolSet = {};
   for (const [name, tool] of Object.entries(rawTools)) {
     const key = namespace ? `${server.name}_${name}` : name;
-    namespacedTools[key] = tool as any;
+    namespacedTools[key] = tool as ToolSet[string];
   }
 
   Object.assign(toolSet, namespacedTools);
@@ -46,9 +49,9 @@ export async function bootMcp(config: Config, tools: ToolSet): Promise<McpEntry[
     try {
       const { client, toolKeys } = await connectMcpServer(server, tools, shouldNamespace);
       mcpClients.push({ name: server.name, server, client, reconnecting: false, lastSuccess: Date.now() });
-      console.log(`[boot] MCP: ${server.name} (${toolKeys.length} tools${shouldNamespace ? ", namespaced" : ""})`);
+      log("boot", `MCP: ${server.name} (${toolKeys.length} tools${shouldNamespace ? ", namespaced" : ""})`);
     } catch (err) {
-      console.warn(`[boot] MCP: ${server.name} failed to connect:`, (err as Error).message);
+      logWarn("boot", `MCP: ${server.name} failed to connect: ${(err as Error).message}`);
     }
   }
 
@@ -62,8 +65,8 @@ export async function bootMcp(config: Config, tools: ToolSet): Promise<McpEntry[
 export async function reconnectMcpServer(entry: McpEntry, tools: ToolSet, namespace: boolean): Promise<boolean> {
   if (entry.reconnecting) return false;
   entry.reconnecting = true;
-  console.warn(`[mcp] ${entry.name} unreachable — reconnecting...`);
-  try { await entry.client.close(); } catch {}
+  logWarn("mcp", `${entry.name} unreachable — reconnecting...`);
+  try { await entry.client.close(); } catch { /* close may fail if already disconnected */ }
 
   await new Promise((r) => setTimeout(r, 2000));
 
@@ -72,11 +75,11 @@ export async function reconnectMcpServer(entry: McpEntry, tools: ToolSet, namesp
     entry.client = client;
     entry.lastSuccess = Date.now();
     entry.reconnecting = false;
-    console.log(`[mcp] ${entry.name} reconnected (${toolKeys.length} tools)`);
+    log("mcp", `${entry.name} reconnected (${toolKeys.length} tools)`);
     return true;
   } catch (err) {
     entry.reconnecting = false;
-    console.warn(`[mcp] ${entry.name} reconnect failed:`, (err as Error).message);
+    logError("mcp", `${entry.name} reconnect failed`, err);
     return false;
   }
 }

@@ -7,7 +7,7 @@
 import type { Config } from "./config.js";
 import { tasks as dbTasks, messages as dbMessages } from "./db.js";
 import { parseCronNext } from "./time.js";
-import { log } from "./log.js";
+import { log, logError } from "./log.js";
 
 const NEAR_TERM_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes
 const GRACE_WINDOW_MS = 30 * 60 * 1000;  // skip one-shots older than 30 min
@@ -28,7 +28,7 @@ export function scheduleNudge(at: Date): void {
   const fn = _checkTasksFn;
   const timer = setTimeout(() => {
     _pendingTimers.delete(timer);
-    fn().catch(console.error);
+    fn().catch((err) => logError("proactive", "nudge check failed", err));
   }, delayMs);
   _pendingTimers.add(timer);
 }
@@ -102,7 +102,7 @@ export function startProactive(deps: ProactiveDeps): { stop: () => void } {
         })
           .then(() => { dbTasks.markResult(task.id, "ok"); })
           .catch((err) => {
-            console.error("[proactive] Agent error:", err);
+            logError("proactive", "Agent error", err);
             dbTasks.markResult(task.id, "error");
             if ((task.consecutiveFailures ?? 0) + 1 >= 3) {
               dbTasks.disable(task.id);
@@ -129,8 +129,8 @@ export function startProactive(deps: ProactiveDeps): { stop: () => void } {
     if (config.features.scheduler) await catchUp();
   })();
 
-  const bootTimer = setTimeout(() => tick().catch(console.error), BOOT_DELAY_MS);
-  const timer = setInterval(() => tick().catch(console.error), config.proactive.tickIntervalMs);
+  const bootTimer = setTimeout(() => tick().catch((err) => logError("proactive", "tick failed", err)), BOOT_DELAY_MS);
+  const timer = setInterval(() => tick().catch((err) => logError("proactive", "tick failed", err)), config.proactive.tickIntervalMs);
 
   return {
     stop: () => {

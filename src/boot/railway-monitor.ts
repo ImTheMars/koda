@@ -99,11 +99,11 @@ export function startRailwayMonitor(callbacks: RailwayMonitorCallbacks): { stop(
   const env = process.env.KODA_ENV ?? "production";
 
   if (!token || !serviceId || !currentDeploymentId) {
-    console.log("[railway-monitor] skipping (not Railway env)");
+    log("railway-monitor", "skipping (not Railway env)");
     return { stop() {} };
   }
 
-  console.log(`[railway-monitor] started (current deployment: ${currentDeploymentId.slice(0, 8)}...)`);
+  log("railway-monitor", `started (current deployment: ${currentDeploymentId.slice(0, 8)}...)`);
 
   // Track which deployment IDs we've already notified about to avoid repeat messages
   const notifiedBuildIds = new Set<string>([currentDeploymentId]);
@@ -124,7 +124,7 @@ export function startRailwayMonitor(callbacks: RailwayMonitorCallbacks): { stop(
           notifiedBuildIds.add(dep.id);
           const ctx = gitContext();
           const msg = `new build incoming${ctx} [${env}]`;
-          console.log(`[railway-monitor] ${msg}`);
+          log("railway-monitor", msg);
           callbacks.onBuildDetected(msg);
         }
 
@@ -135,7 +135,7 @@ export function startRailwayMonitor(callbacks: RailwayMonitorCallbacks): { stop(
           notifiedFailIds.add(dep.id);
           const ctx = gitContext();
           const msg = `build failed${ctx} [${env}]`;
-          console.log(`[railway-monitor] ${msg}`);
+          log("railway-monitor", msg);
           callbacks.onBuildFailed(msg);
         }
       }
@@ -149,7 +149,7 @@ export function startRailwayMonitor(callbacks: RailwayMonitorCallbacks): { stop(
   return {
     stop() {
       clearInterval(timer);
-      console.log("[railway-monitor] stopped");
+      log("railway-monitor", "stopped");
     },
   };
 }

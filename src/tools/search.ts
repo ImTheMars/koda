@@ -42,7 +42,7 @@ export function registerSearchTools(deps: {
             index: i + 1,
             title: r.title,
             url: r.url,
-            highlights: (r as any).highlights ?? [],
+            highlights: (r as unknown as { highlights?: string[] }).highlights ?? [],
             citation: `[${r.title}](${r.url})`,
           })),
           resultCount: result.results.length,
@@ -69,7 +69,7 @@ export function registerSearchTools(deps: {
           results: result.results.map((r) => ({
             url: r.url,
             title: r.title,
-            content: (r as any).text ?? "",
+            content: (r as unknown as { text?: string }).text ?? "",
           })),
         };
       } catch (err) {

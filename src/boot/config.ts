@@ -4,12 +4,12 @@
 
 import { mkdir } from "fs/promises";
 import { loadConfig, type Config } from "../config.js";
-import { enableDebug } from "../log.js";
+import { enableDebug, log } from "../log.js";
 
 export async function bootConfig(): Promise<Config> {
   const config = await loadConfig();
   if (config.features.debug) enableDebug();
-  console.log(`[boot] Config loaded (mode: ${config.mode}, workspace: ${config.workspace})`);
+  log("boot", `Config loaded (mode: ${config.mode}, workspace: ${config.workspace})`);
   await mkdir(config.workspace, { recursive: true });
   return config;
 }

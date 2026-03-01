@@ -8,6 +8,7 @@ import type { SkillLoader } from "../tools/skills.js";
 import type { MemoryProvider } from "../tools/memory.js";
 import { handleDashboardRequest } from "../dashboard.js";
 import { VERSION } from "../version.js";
+import { log } from "../log.js";
 
 export interface ServerDeps {
   config: Config;
@@ -40,7 +41,7 @@ export function bootServer(deps: ServerDeps) {
 
       // Telegram webhook endpoint
       if (url.pathname === "/telegram" && req.method === "POST" && telegram?.handleWebhook) {
-        console.log(`[http] POST /telegram from=${req.headers.get("x-forwarded-for") ?? "?"}`);
+        log("http", `POST /telegram from=${req.headers.get("x-forwarded-for") ?? "?"}`);
         return telegram.handleWebhook(req);
       }
 
@@ -57,8 +58,8 @@ export function bootServer(deps: ServerDeps) {
     },
   });
 
-  console.log(`[boot] Health server on :${server.port}/health`);
-  console.log(`[boot] Dashboard on :${server.port}/`);
+  log("boot", `Health server on :${server.port}/health`);
+  log("boot", `Dashboard on :${server.port}/`);
 
   return server;
 }
