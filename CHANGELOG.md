@@ -4,6 +4,21 @@ all notable changes to koda.
 
 ---
 
+## 2026-03-02
+### sendMessageDraft streaming (grammy)
+
+switched telegram streaming to native Bot API drafts via Grammy's typed `sendMessageDraft` support for smoother incremental replies and fewer edit-loop limits.
+
+#### changed
+
+- **native draft streaming** (`src/channels/telegram.ts`) — streaming responses now update a message draft with `sendMessageDraft(chat_id, draft_id, text)` using the incoming Telegram `message_id` as `draft_id`.
+- **topic-safe streaming** (`src/channels/telegram.ts`) — `message_thread_id` is forwarded for drafts and fallback sends so forum-topic replies stay in the same thread.
+- **delimiter-aware draft rendering** (`src/channels/telegram.ts`) — internal `<|msg|>` separators are rendered as paragraph breaks while streaming, including protection against partially streamed delimiters.
+- **automatic fallback** (`src/channels/telegram.ts`) — if draft updates are unavailable, streaming gracefully falls back to segmented `sendMessage` delivery.
+- **dependency update** (`package.json`) — upgraded `grammy` from `^1.39.0` to `^1.41.1`.
+
+---
+
 ## 2026-02-25
 ### v1.0.1 — Railway deployment, webhook fixes, /debug command
 

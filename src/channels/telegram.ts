@@ -1,7 +1,7 @@
 /**
  * Telegram channel — Grammy bot with streaming text, photo, document, and webhook support.
  *
- * Uses streamAgent for text/photo/document messages so segments send as they complete.
+ * Uses streamAgent + sendMessageDraft for smooth token-by-token replies.
  */
 
 import { Bot, GrammyError, HttpError, InputFile } from "grammy";
@@ -9,7 +9,7 @@ import type { Config, Tier } from "../config.js";
 import { persistConfig } from "../config.js";
 import { messages as dbMessages, usage as dbUsage, tasks as dbTasks } from "../db.js";
 import type { StreamAgentResult } from "../agent.js";
-import { isLlmCircuitOpen, splitOnDelimiter } from "../agent.js";
+import { isLlmCircuitOpen, MESSAGE_DELIMITER, splitOnDelimiter } from "../agent.js";
 import { VERSION } from "../version.js";
 import { log, logWarn, logError } from "../log.js";
 import { basename } from "path";
@@ -192,7 +192,7 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
     return chunks;
   };
 
-  const sendSegment = async (chatId: number, text: string) => {
+  const sendSegment = async (chatId: number, text: string, threadId?: number) => {
     const outgoingKey = `${chatId}:${Bun.hash(text)}`;
     if (sentMessages.has(outgoingKey)) {
       log("telegram", "dedup: skipping duplicate outgoing message");
@@ -203,42 +203,90 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
     // Detect image URLs from generation APIs and send as photos
     const imageUrlMatch = text.match(/https:\/\/[^\s"'<>]+\.(png|jpg|jpeg|webp)/i);
     if (imageUrlMatch) {
-      await bot.api.sendPhoto(chatId, imageUrlMatch[0]).catch(() => {});
+      await bot.api.sendPhoto(chatId, imageUrlMatch[0], {
+        ...(threadId !== undefined ? { message_thread_id: threadId } : {}),
+      }).catch(() => {});
     }
 
     for (const chunk of chunkMessage(text)) {
-      await bot.api.sendMessage(chatId, markdownToTelegramHtml(chunk), { parse_mode: "HTML" });
+      await bot.api.sendMessage(chatId, markdownToTelegramHtml(chunk), {
+        parse_mode: "HTML",
+        ...(threadId !== undefined ? { message_thread_id: threadId } : {}),
+      });
     }
   };
 
-  const sendReply = async (chatId: number, text: string) => {
+  const sendReply = async (chatId: number, text: string, threadId?: number) => {
     const segments = splitOnDelimiter(text);
     for (let i = 0; i < segments.length; i++) {
-      await sendSegment(chatId, segments[i]!);
+      await sendSegment(chatId, segments[i]!, threadId);
       if (i < segments.length - 1) await new Promise((r) => setTimeout(r, SEGMENT_DELAY_MS + Math.random() * 200));
     }
   };
 
-  const sendStreamReply = async (chatId: number, stream: AsyncIterable<string>, onStop: () => void) => {
-    let buffer = "";
+  const stripPartialDelimiterTail = (text: string): string => {
+    for (let len = MESSAGE_DELIMITER.length - 1; len > 0; len--) {
+      if (text.endsWith(MESSAGE_DELIMITER.slice(0, len))) {
+        return text.slice(0, -len);
+      }
+    }
+    return text;
+  };
+
+  const sendStreamReply = async (input: {
+    chatId: number;
+    draftId: number;
+    threadId?: number;
+    stream: AsyncIterable<string>;
+    onStop: () => void;
+  }) => {
+    const { chatId, draftId, threadId, stream, onStop } = input;
+    let raw = "";
+    let draftAvailable = true;
+    let hasDraftUpdates = false;
+    let lastRenderedRaw = "";
+    let lastSentHtml = "";
+    const draftOptions = {
+      parse_mode: "HTML" as const,
+      ...(threadId !== undefined ? { message_thread_id: threadId } : {}),
+    };
+
     try {
       for await (const chunk of stream) {
-        buffer += chunk;
-        // Track whether we're inside a code block — don't split there
-        const fenceCount = (buffer.match(/```/g) || []).length;
-        const inCodeBlock = fenceCount % 2 !== 0;
-        if (inCodeBlock) continue;
-        const segments = splitOnDelimiter(buffer);
-        if (segments.length > 1) {
-          for (let i = 0; i < segments.length - 1; i++) {
-            await sendSegment(chatId, segments[i]!);
-            await new Promise((r) => setTimeout(r, SEGMENT_DELAY_MS + Math.random() * 200));
-          }
-          buffer = segments[segments.length - 1] ?? "";
+        raw += chunk;
+        if (!draftAvailable) continue;
+
+        const visibleRaw = stripPartialDelimiterTail(raw);
+        const draftText = visibleRaw.replaceAll(MESSAGE_DELIMITER, "\n\n");
+        if (!draftText) continue;
+
+        const draftHtml = markdownToTelegramHtml(draftText);
+        if (!draftHtml || draftHtml === lastSentHtml) continue;
+
+        try {
+          await bot.api.sendMessageDraft(chatId, draftId, draftHtml, draftOptions);
+          hasDraftUpdates = true;
+          lastRenderedRaw = visibleRaw;
+          lastSentHtml = draftHtml;
+        } catch (err) {
+          draftAvailable = false;
+          logWarn("telegram", `sendMessageDraft failed, falling back: ${(err as Error).message}`);
         }
       }
-      const remaining = buffer.trim();
-      if (remaining) await sendSegment(chatId, remaining);
+
+      if (draftAvailable) {
+        const finalDraftText = raw.replaceAll(MESSAGE_DELIMITER, "\n\n").trim();
+        if (finalDraftText) {
+          const finalDraftHtml = markdownToTelegramHtml(finalDraftText);
+          if (finalDraftHtml && finalDraftHtml !== lastSentHtml) {
+            await bot.api.sendMessageDraft(chatId, draftId, finalDraftHtml, draftOptions);
+          }
+        }
+      } else {
+        const remainingRaw = raw.slice(lastRenderedRaw.length).trim();
+        const fallbackText = remainingRaw || (!hasDraftUpdates ? raw.trim() : "");
+        if (fallbackText) await sendReply(chatId, fallbackText, threadId);
+      }
     } finally {
       onStop();
     }
@@ -478,7 +526,13 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
         sessionKey: `telegram_${chatId}`,
         source: "command",
       });
-      await sendStreamReply(Number(chatId), result.fullStream, () => stopTyping(chatId));
+      await sendStreamReply({
+        chatId: Number(chatId),
+        draftId: ctx.message!.message_id,
+        threadId: ctx.message!.message_thread_id,
+        stream: result.fullStream,
+        onStop: () => stopTyping(chatId),
+      });
       await result.finishedPromise.catch((err) => logError("telegram", "agent promise failed", err));
     } catch (err) {
       stopTyping(chatId);
@@ -509,7 +563,13 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
         sessionKey: `telegram_${chatId}`,
         source: "command",
       });
-      await sendStreamReply(Number(chatId), result.fullStream, () => stopTyping(chatId));
+      await sendStreamReply({
+        chatId: Number(chatId),
+        draftId: ctx.message!.message_id,
+        threadId: ctx.message!.message_thread_id,
+        stream: result.fullStream,
+        onStop: () => stopTyping(chatId),
+      });
       await result.finishedPromise.catch((err) => logError("telegram", "agent promise failed", err));
     } catch (err) {
       stopTyping(chatId);
@@ -581,7 +641,13 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
       });
 
       consecutiveErrors = 0;
-      await sendStreamReply(Number(chatId), streamResult.fullStream, () => stopTyping(chatId));
+      await sendStreamReply({
+        chatId: Number(chatId),
+        draftId: ctx.message.message_id,
+        threadId: ctx.message.message_thread_id,
+        stream: streamResult.fullStream,
+        onStop: () => stopTyping(chatId),
+      });
       const agentResult = await streamResult.finishedPromise.catch((err) => { logError("telegram", "agent promise failed", err); return null; });
 
       const elapsed = Date.now() - t0;
@@ -653,7 +719,13 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
       });
 
       consecutiveErrors = 0;
-      await sendStreamReply(Number(chatId), streamResult.fullStream, () => stopTyping(chatId));
+      await sendStreamReply({
+        chatId: Number(chatId),
+        draftId: ctx.message.message_id,
+        threadId: ctx.message.message_thread_id,
+        stream: streamResult.fullStream,
+        onStop: () => stopTyping(chatId),
+      });
       const agentResult = await streamResult.finishedPromise.catch((err) => { logError("telegram", "agent promise failed", err); return null; });
       log("msg", `OUT photo to=${chatId} len=${agentResult?.text?.length ?? 0} tier=${agentResult?.tier ?? "?"} ${Date.now() - t0}ms`);
       if (agentResult?.files?.length) {
@@ -734,7 +806,13 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
       });
 
       consecutiveErrors = 0;
-      await sendStreamReply(Number(chatId), streamResult.fullStream, () => stopTyping(chatId));
+      await sendStreamReply({
+        chatId: Number(chatId),
+        draftId: ctx.message.message_id,
+        threadId: ctx.message.message_thread_id,
+        stream: streamResult.fullStream,
+        onStop: () => stopTyping(chatId),
+      });
       const agentResult = await streamResult.finishedPromise.catch((err) => { logError("telegram", "agent promise failed", err); return null; });
       log("msg", `OUT document to=${chatId} len=${agentResult?.text?.length ?? 0} tier=${agentResult?.tier ?? "?"} ${Date.now() - t0}ms`);
       if (agentResult?.files?.length) {
@@ -796,7 +874,13 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
       });
 
       consecutiveErrors = 0;
-      await sendStreamReply(Number(chatId), streamResult.fullStream, () => stopTyping(chatId));
+      await sendStreamReply({
+        chatId: Number(chatId),
+        draftId: ctx.message.message_id,
+        threadId: ctx.message.message_thread_id,
+        stream: streamResult.fullStream,
+        onStop: () => stopTyping(chatId),
+      });
       const agentResult = await streamResult.finishedPromise.catch((err) => { logError("telegram", "agent promise failed", err); return null; });
       log("msg", `OUT voice to=${chatId} len=${agentResult?.text?.length ?? 0} tier=${agentResult?.tier ?? "?"} ${Date.now() - t0}ms`);
       if (agentResult?.files?.length) {
@@ -856,7 +940,13 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
       });
 
       consecutiveErrors = 0;
-      await sendStreamReply(Number(chatId), streamResult.fullStream, () => stopTyping(chatId));
+      await sendStreamReply({
+        chatId: Number(chatId),
+        draftId: ctx.message.message_id,
+        threadId: ctx.message.message_thread_id,
+        stream: streamResult.fullStream,
+        onStop: () => stopTyping(chatId),
+      });
       const agentResult = await streamResult.finishedPromise.catch((err) => { logError("telegram", "agent promise failed", err); return null; });
       log("msg", `OUT video_note to=${chatId} len=${agentResult?.text?.length ?? 0} tier=${agentResult?.tier ?? "?"} ${Date.now() - t0}ms`);
       if (agentResult?.files?.length) {
@@ -892,7 +982,13 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
       });
 
       consecutiveErrors = 0;
-      await sendStreamReply(Number(chatId), streamResult.fullStream, () => stopTyping(chatId));
+      await sendStreamReply({
+        chatId: Number(chatId),
+        draftId: ctx.editedMessage!.message_id,
+        threadId: ctx.editedMessage!.message_thread_id,
+        stream: streamResult.fullStream,
+        onStop: () => stopTyping(chatId),
+      });
       const agentResult = await streamResult.finishedPromise.catch((err) => { logError("telegram", "agent promise failed", err); return null; });
       log("msg", `OUT edited to=${chatId} len=${agentResult?.text?.length ?? 0} ${Date.now() - t0}ms`);
     } catch (err) {
