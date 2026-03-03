@@ -1,7 +1,7 @@
 /**
  * Telegram channel — Grammy bot with streaming text, photo, document, and webhook support.
  *
- * Uses streamAgent + sendMessageDraft for smooth token-by-token replies.
+ * Uses streamAgent for text/photo/document messages so segments send as they complete.
  */
 
 import { Bot, GrammyError, HttpError, InputFile } from "grammy";
@@ -9,7 +9,7 @@ import type { Config, Tier } from "../config.js";
 import { persistConfig } from "../config.js";
 import { messages as dbMessages, usage as dbUsage, tasks as dbTasks } from "../db.js";
 import type { StreamAgentResult } from "../agent.js";
-import { isLlmCircuitOpen, MESSAGE_DELIMITER, splitOnDelimiter } from "../agent.js";
+import { isLlmCircuitOpen, splitOnDelimiter } from "../agent.js";
 import { VERSION } from "../version.js";
 import { log, logWarn, logError } from "../log.js";
 import { basename } from "path";
@@ -193,7 +193,7 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
   };
 
   const sendSegment = async (chatId: number, text: string, threadId?: number) => {
-    const outgoingKey = `${chatId}:${Bun.hash(text)}`;
+    const outgoingKey = `${chatId}:${threadId ?? "main"}:${Bun.hash(text)}`;
     if (sentMessages.has(outgoingKey)) {
       log("telegram", "dedup: skipping duplicate outgoing message");
       return;
@@ -224,66 +224,33 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
     }
   };
 
-  const stripPartialDelimiterTail = (text: string): string => {
-    for (let len = MESSAGE_DELIMITER.length - 1; len > 0; len--) {
-      if (text.endsWith(MESSAGE_DELIMITER.slice(0, len))) {
-        return text.slice(0, -len);
-      }
-    }
-    return text;
-  };
-
   const sendStreamReply = async (input: {
     chatId: number;
-    draftId: number;
     threadId?: number;
     stream: AsyncIterable<string>;
     onStop: () => void;
   }) => {
-    const { chatId, draftId, threadId, stream, onStop } = input;
-    let raw = "";
-    let draftAvailable = true;
-    let lastSentHtml = "";
-    const draftOptions = {
-      parse_mode: "HTML" as const,
-      ...(threadId !== undefined ? { message_thread_id: threadId } : {}),
-    };
+    const { chatId, threadId, stream, onStop } = input;
+    let buffer = "";
 
     try {
       for await (const chunk of stream) {
-        raw += chunk;
-        if (!draftAvailable) continue;
-
-        const visibleRaw = stripPartialDelimiterTail(raw);
-        const draftText = visibleRaw.replaceAll(MESSAGE_DELIMITER, "\n\n");
-        if (!draftText) continue;
-
-        const draftHtml = markdownToTelegramHtml(draftText);
-        if (!draftHtml || draftHtml === lastSentHtml) continue;
-
-        try {
-          await bot.api.sendMessageDraft(chatId, draftId, draftHtml, draftOptions);
-          lastSentHtml = draftHtml;
-        } catch (err) {
-          draftAvailable = false;
-          logWarn("telegram", `sendMessageDraft failed, falling back: ${(err as Error).message}`);
-        }
-      }
-
-      if (draftAvailable) {
-        const finalDraftText = raw.replaceAll(MESSAGE_DELIMITER, "\n\n").trim();
-        if (finalDraftText) {
-          const finalDraftHtml = markdownToTelegramHtml(finalDraftText);
-          if (finalDraftHtml && finalDraftHtml !== lastSentHtml) {
-            await bot.api.sendMessageDraft(chatId, draftId, finalDraftHtml, draftOptions);
+        buffer += chunk;
+        // Track whether we're inside a code block — don't split there
+        const fenceCount = (buffer.match(/```/g) || []).length;
+        const inCodeBlock = fenceCount % 2 !== 0;
+        if (inCodeBlock) continue;
+        const segments = splitOnDelimiter(buffer);
+        if (segments.length > 1) {
+          for (let i = 0; i < segments.length - 1; i++) {
+            await sendSegment(chatId, segments[i]!, threadId);
+            await new Promise((r) => setTimeout(r, SEGMENT_DELAY_MS + Math.random() * 200));
           }
+          buffer = segments[segments.length - 1] ?? "";
         }
       }
-
-      // Always persist the finished assistant response as normal message(s).
-      // Draft updates are transient UI and can disappear on the next turn.
-      const finalText = raw.trim();
-      if (finalText) await sendReply(chatId, finalText, threadId);
+      const remaining = buffer.trim();
+      if (remaining) await sendSegment(chatId, remaining, threadId);
     } finally {
       onStop();
     }
@@ -525,7 +492,6 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
       });
       await sendStreamReply({
         chatId: Number(chatId),
-        draftId: ctx.message!.message_id,
         threadId: ctx.message!.message_thread_id,
         stream: result.fullStream,
         onStop: () => stopTyping(chatId),
@@ -562,7 +528,6 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
       });
       await sendStreamReply({
         chatId: Number(chatId),
-        draftId: ctx.message!.message_id,
         threadId: ctx.message!.message_thread_id,
         stream: result.fullStream,
         onStop: () => stopTyping(chatId),
@@ -640,7 +605,6 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
       consecutiveErrors = 0;
       await sendStreamReply({
         chatId: Number(chatId),
-        draftId: ctx.message.message_id,
         threadId: ctx.message.message_thread_id,
         stream: streamResult.fullStream,
         onStop: () => stopTyping(chatId),
@@ -718,7 +682,6 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
       consecutiveErrors = 0;
       await sendStreamReply({
         chatId: Number(chatId),
-        draftId: ctx.message.message_id,
         threadId: ctx.message.message_thread_id,
         stream: streamResult.fullStream,
         onStop: () => stopTyping(chatId),
@@ -805,7 +768,6 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
       consecutiveErrors = 0;
       await sendStreamReply({
         chatId: Number(chatId),
-        draftId: ctx.message.message_id,
         threadId: ctx.message.message_thread_id,
         stream: streamResult.fullStream,
         onStop: () => stopTyping(chatId),
@@ -873,7 +835,6 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
       consecutiveErrors = 0;
       await sendStreamReply({
         chatId: Number(chatId),
-        draftId: ctx.message.message_id,
         threadId: ctx.message.message_thread_id,
         stream: streamResult.fullStream,
         onStop: () => stopTyping(chatId),
@@ -939,7 +900,6 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
       consecutiveErrors = 0;
       await sendStreamReply({
         chatId: Number(chatId),
-        draftId: ctx.message.message_id,
         threadId: ctx.message.message_thread_id,
         stream: streamResult.fullStream,
         onStop: () => stopTyping(chatId),
@@ -981,7 +941,6 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
       consecutiveErrors = 0;
       await sendStreamReply({
         chatId: Number(chatId),
-        draftId: ctx.editedMessage!.message_id,
         threadId: ctx.editedMessage!.message_thread_id,
         stream: streamResult.fullStream,
         onStop: () => stopTyping(chatId),
