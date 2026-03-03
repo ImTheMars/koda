@@ -243,8 +243,6 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
     const { chatId, draftId, threadId, stream, onStop } = input;
     let raw = "";
     let draftAvailable = true;
-    let hasDraftUpdates = false;
-    let lastRenderedRaw = "";
     let lastSentHtml = "";
     const draftOptions = {
       parse_mode: "HTML" as const,
@@ -265,8 +263,6 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
 
         try {
           await bot.api.sendMessageDraft(chatId, draftId, draftHtml, draftOptions);
-          hasDraftUpdates = true;
-          lastRenderedRaw = visibleRaw;
           lastSentHtml = draftHtml;
         } catch (err) {
           draftAvailable = false;
@@ -282,11 +278,12 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
             await bot.api.sendMessageDraft(chatId, draftId, finalDraftHtml, draftOptions);
           }
         }
-      } else {
-        const remainingRaw = raw.slice(lastRenderedRaw.length).trim();
-        const fallbackText = remainingRaw || (!hasDraftUpdates ? raw.trim() : "");
-        if (fallbackText) await sendReply(chatId, fallbackText, threadId);
       }
+
+      // Always persist the finished assistant response as normal message(s).
+      // Draft updates are transient UI and can disappear on the next turn.
+      const finalText = raw.trim();
+      if (finalText) await sendReply(chatId, finalText, threadId);
     } finally {
       onStop();
     }
