@@ -7,7 +7,7 @@
 import { Bot, GrammyError, HttpError, InputFile } from "grammy";
 import type { Config, Tier } from "../config.js";
 import { persistConfig } from "../config.js";
-import { messages as dbMessages, usage as dbUsage, tasks as dbTasks } from "../db.js";
+import { messages as dbMessages, usage as dbUsage, tasks as dbTasks, userProfiles, chatMembers } from "../db.js";
 import type { StreamAgentResult } from "../agent.js";
 import { isLlmCircuitOpen, splitOnDelimiter } from "../agent.js";
 import { VERSION } from "../version.js";
@@ -23,6 +23,8 @@ export interface TelegramDeps {
     onAck?: (text: string) => void;
     onTypingStart?: () => void;
     onTypingStop?: () => void;
+    senderDisplayName?: string;
+    chatType?: "private" | "group";
   }) => Promise<StreamAgentResult>;
   config: Config;
   /** If provided, startup message includes "deployed in Xs" */
@@ -75,6 +77,18 @@ let RATE_LIMIT = { maxRequests: 10, windowMs: 60_000 };
 const SEGMENT_DELAY_MS = 400;
 const MAX_DOCUMENT_SIZE = 20 * 1024 * 1024; // 20MB
 const MAX_DOCUMENT_TEXT = 30_000; // chars
+
+/** Check if a chat is a group or supergroup. */
+function isGroupChat(chatType: string): boolean {
+  return chatType === "group" || chatType === "supergroup";
+}
+
+/** Get display name for a Telegram user. */
+function getDisplayName(from: { first_name?: string; last_name?: string; username?: string } | undefined): string {
+  if (!from) return "Unknown";
+  const parts = [from.first_name, from.last_name].filter(Boolean);
+  return parts.join(" ") || from.username || "Unknown";
+}
 
 export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult> {
   const { config } = deps;
@@ -380,7 +394,9 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
 
   const pendingClears = new Set<string>();
   bot.command("clear", async (ctx) => {
-    if (!isAllowed(String(ctx.from?.id))) return;
+    const senderId = String(ctx.from?.id);
+    if (!isAllowed(senderId)) return;
+    if (isGroupChat(ctx.chat.type) && !(await requireAdmin(ctx, senderId))) return;
     const chatId = String(ctx.chat.id);
     if (pendingClears.has(chatId)) {
       pendingClears.delete(chatId);
@@ -396,8 +412,7 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
   bot.command("help", async (ctx) => {
     const senderId = String(ctx.from?.id);
     if (!isAllowed(senderId)) return;
-    await ctx.reply(
-      "commands:\n" +
+    const helpText = "commands:\n" +
       "/help - this message\n" +
       "/clear - reset conversation\n" +
       "/usage - see token usage and costs\n" +
@@ -406,11 +421,17 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
       "/fast - force next message to use fast tier\n" +
       "/recap - summarize recent conversation\n" +
       "/memories - list or delete stored memories\n" +
-      "/model - view or change models\n\n" +
+      "/model - view or change models (quick set: /model <id>)\n" +
+      "/adduser <id> - add a user (admin)\n" +
+      "/removeuser <id> - remove a user (admin)\n\n" +
       "i can also search the web, remember things, run code, set reminders, manage files, generate images, and load skills.\n" +
       "send me voice messages — i'll transcribe and respond.\n" +
-      "send me PDFs and text files — i'll read them. reply to messages for context.",
-    );
+      "send me PDFs and text files — i'll read them. reply to messages for context.";
+    if (isGroupChat(ctx.chat.type)) {
+      await ctx.reply(helpText + "\n\nin groups, mention me (@" + (bot.botInfo?.username ?? "koda") + ") or reply to my messages to get a response.");
+    } else {
+      await ctx.reply(helpText);
+    }
   });
 
   bot.command("usage", async (ctx) => {
@@ -543,33 +564,120 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
   bot.command("model", async (ctx) => {
     const senderId = String(ctx.from?.id);
     if (!isAllowed(senderId)) return;
-    const args = ctx.message!.text.replace(/^\/model\s*/, "").trim();
+    if (isGroupChat(ctx.chat.type) && !(await requireAdmin(ctx, senderId))) return;
 
-    if (!args) {
+    const verifyChatModel = async (modelId: string): Promise<string | null> => {
+      try {
+        const res = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${config.openrouter.apiKey}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            model: modelId,
+            messages: [{ role: "user", content: "Reply with OK only." }],
+            max_tokens: 4,
+            temperature: 0,
+          }),
+          signal: AbortSignal.timeout(15_000),
+        });
+
+        if (!res.ok) return `warning: OpenRouter validation returned ${res.status}; model was saved anyway.`;
+
+        const data = await res.json() as { model?: string };
+        const resolvedModel = typeof data.model === "string" ? data.model : null;
+        if (resolvedModel && resolvedModel !== modelId) {
+          const isAliasMatch = resolvedModel.startsWith(`${modelId}-`) || modelId.startsWith(`${resolvedModel}-`);
+          if (isAliasMatch) {
+            return `note: OpenRouter resolved alias to ${resolvedModel}.`;
+          }
+          return `warning: OpenRouter responded with ${resolvedModel}; saved ${modelId} anyway.`;
+        }
+
+        return null;
+      } catch (err) {
+        return `warning: model validation unavailable (${(err as Error).message}); model was saved anyway.`;
+      }
+    };
+
+    const usageText =
+      "usage:\n" +
+      "/model - show current models\n" +
+      "/model <model-id> - set primary chat model (fast + deep)\n" +
+      "/model fast <model-id>\n" +
+      "/model deep <model-id>\n" +
+      "/model image <model-id>\n" +
+      "/model all <model-id> - set fast + deep\n" +
+      "/model primary <model-id> - same as all";
+
+    const showCurrentModels = async () => {
       await ctx.reply(
-        `models:\nfast: ${config.openrouter.fastModel}\ndeep: ${config.openrouter.deepModel}\nimage: ${config.openrouter.imageModel}\n\nchange: /model fast <id> or /model deep <id> or /model image <id>`,
+        `models:\nfast: ${config.openrouter.fastModel}\ndeep: ${config.openrouter.deepModel}\nimage: ${config.openrouter.imageModel}\n\n${usageText}`,
       );
+    };
+
+    const isLikelyModelId = (value: string) => /^[^\s/]+\/[^\s]+$/.test(value);
+
+    const args = ctx.message!.text.replace(/^\/model\s*/, "").trim();
+    if (!args || args === "show" || args === "list") {
+      await showCurrentModels();
       return;
     }
 
-    const [tier, ...modelParts] = args.split(/\s+/);
-    const modelId = modelParts.join(" ");
+    let target: "fast" | "deep" | "image" | "all";
+    let modelId: string;
+    const parts = args.split(/\s+/).filter(Boolean);
 
-    if ((tier === "fast" || tier === "deep" || tier === "image") && modelId) {
-      if (tier === "image") {
-        config.openrouter.imageModel = modelId;
-      } else {
-        config.openrouter[`${tier}Model`] = modelId;
-      }
-      try {
-        await persistConfig(config);
-        await ctx.reply(`${tier} model changed to ${modelId}`);
-      } catch (err) {
-        // Config change takes effect in memory even if persist fails
-        await ctx.reply(`${tier} model changed to ${modelId} (config save failed: ${(err as Error).message})`);
-      }
+    if (parts.length === 1 && isLikelyModelId(parts[0]!)) {
+      // Quick path: /model <id> updates primary chat model (fast + deep).
+      target = "all";
+      modelId = parts[0]!;
     } else {
-      await ctx.reply("usage: /model fast <model-id> or /model deep <model-id> or /model image <model-id>");
+      const [targetArg, ...modelParts] = parts;
+      const normalizedTarget = (targetArg ?? "").toLowerCase();
+      modelId = modelParts.join(" ").trim();
+
+      if (normalizedTarget === "primary" || normalizedTarget === "chat") {
+        target = "all";
+      } else if (normalizedTarget === "fast" || normalizedTarget === "deep" || normalizedTarget === "image" || normalizedTarget === "all") {
+        target = normalizedTarget;
+      } else {
+        await ctx.reply(usageText);
+        return;
+      }
+    }
+
+    if (!isLikelyModelId(modelId)) {
+      await ctx.reply("invalid model id. expected something like provider/model-name");
+      return;
+    }
+
+    const verificationNote = target !== "image" ? await verifyChatModel(modelId) : null;
+
+    if (target === "all") {
+      config.openrouter.fastModel = modelId;
+      config.openrouter.deepModel = modelId;
+    } else if (target === "image") {
+      config.openrouter.imageModel = modelId;
+    } else if (target === "fast") {
+      config.openrouter.fastModel = modelId;
+    } else {
+      config.openrouter.deepModel = modelId;
+    }
+
+    const successText = target === "all"
+      ? `fast and deep models changed to ${modelId}`
+      : target === "fast"
+      ? `fast model changed to ${modelId}`
+      : `${target} model changed to ${modelId}`;
+
+    try {
+      await persistConfig(config);
+      await ctx.reply(verificationNote ? `${successText}\n${verificationNote}` : successText);
+    } catch (err) {
+      // Config change takes effect in memory even if persist fails
+      await ctx.reply(`${successText} (config save failed: ${(err as Error).message})${verificationNote ? `\n${verificationNote}` : ""}`);
     }
   });
 
@@ -584,11 +692,29 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
     if (processedMessages.has(key)) { log("msg", `DEDUP text from=${senderId}`); return; }
     processedMessages.add(key);
     const chatId = String(ctx.chat.id);
+    const displayName = getDisplayName(ctx.from);
+    const inGroup = isGroupChat(ctx.chat.type);
     const preview = ctx.message.text.slice(0, 100);
-    log("msg", `IN text from=${senderId} chat=${chatId} len=${ctx.message.text.length} "${preview}"`);
+    log("msg", `IN text from=${senderId} chat=${chatId}${inGroup ? " (group)" : ""} len=${ctx.message.text.length} "${preview}"`);
+
+    // Track user presence
+    trackUserPresence(senderId, chatId, ctx.from, ctx.chat.type);
+
+    // Group passive listening: store but don't respond unless addressed
+    if (inGroup && config.group.passiveListening && !shouldRespondInGroup(ctx.message)) {
+      const attributed = `[${displayName}]: ${ctx.message.text}`;
+      dbMessages.append(`telegram_${chatId}`, "user", attributed);
+      log("msg", `PASSIVE text from=${senderId} chat=${chatId}`);
+      return;
+    }
+
     if (isRateLimited(chatId)) { log("msg", `RATE_LIMITED chat=${chatId}`); await ctx.reply("slow down! you're sending messages too fast."); return; }
 
-    const content = enrichContent(ctx.message.text, ctx.message);
+    let content = enrichContent(ctx.message.text, ctx.message);
+    // In group chats, prefix with sender name for context
+    if (inGroup) {
+      content = `[${displayName}]: ${content}`;
+    }
     const tierOverride = consumeTierOverride(chatId);
     const t0 = Date.now();
 
@@ -599,6 +725,8 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
         senderId, chatId, channel: "telegram",
         sessionKey: `telegram_${chatId}`,
         tierOverride,
+        senderDisplayName: displayName,
+        chatType: inGroup ? "group" : "private",
         onAck: (text) => ctx.reply(text).catch(() => {}),
       });
 
@@ -635,10 +763,23 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
     if (processedMessages.has(key)) return;
     processedMessages.add(key);
     const chatId = String(ctx.chat.id);
+    const displayName = getDisplayName(ctx.from);
+    const inGroup = isGroupChat(ctx.chat.type);
     log("msg", `IN photo from=${senderId} chat=${chatId} caption="${(ctx.message.caption ?? "").slice(0, 80)}"`);
+
+    trackUserPresence(senderId, chatId, ctx.from, ctx.chat.type);
+
+    // Group passive listening for photos
+    if (inGroup && config.group.passiveListening && !shouldRespondInGroup(ctx.message as Parameters<typeof shouldRespondInGroup>[0])) {
+      dbMessages.append(`telegram_${chatId}`, "user", `[${displayName}]: [photo] ${ctx.message.caption ?? ""}`);
+      log("msg", `PASSIVE photo from=${senderId} chat=${chatId}`);
+      return;
+    }
+
     if (isRateLimited(chatId)) { log("msg", `RATE_LIMITED chat=${chatId}`); await ctx.reply("slow down!"); return; }
 
     let caption = ctx.message.caption ?? "What's in this image?";
+    if (inGroup) caption = `[${displayName}]: ${caption}`;
 
     // Reply context for photos
     if (ctx.message.reply_to_message?.text) {
@@ -676,6 +817,8 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
         attachments: [{ type: "image", mimeType: "image/jpeg", data: buffer.toString("base64") }],
         senderId, chatId, channel: "telegram",
         sessionKey: `telegram_${chatId}`,
+        senderDisplayName: displayName,
+        chatType: inGroup ? "group" : "private",
         onAck: (text) => ctx.reply(text).catch(() => {}),
       });
 
@@ -706,7 +849,19 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
     if (processedMessages.has(key)) return;
     processedMessages.add(key);
     const chatId = String(ctx.chat.id);
+    const displayName = getDisplayName(ctx.from);
+    const inGroup = isGroupChat(ctx.chat.type);
     log("msg", `IN document from=${senderId} chat=${chatId} file="${ctx.message.document.file_name ?? "?"}"`);
+
+    trackUserPresence(senderId, chatId, ctx.from, ctx.chat.type);
+
+    // Group passive listening for documents
+    if (inGroup && config.group.passiveListening && !shouldRespondInGroup(ctx.message as Parameters<typeof shouldRespondInGroup>[0])) {
+      dbMessages.append(`telegram_${chatId}`, "user", `[${displayName}]: [document: ${ctx.message.document.file_name ?? "file"}] ${ctx.message.caption ?? ""}`);
+      log("msg", `PASSIVE document from=${senderId} chat=${chatId}`);
+      return;
+    }
+
     if (isRateLimited(chatId)) { log("msg", `RATE_LIMITED chat=${chatId}`); await ctx.reply("slow down!"); return; }
 
     const doc = ctx.message.document;
@@ -749,6 +904,9 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
     if (caption) {
       content = `${caption}\n\n${content}`;
     }
+    if (inGroup) {
+      content = `[${displayName}]: ${content}`;
+    }
 
     // Reply context for documents
     if (ctx.message.reply_to_message?.text) {
@@ -762,6 +920,8 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
         content,
         senderId, chatId, channel: "telegram",
         sessionKey: `telegram_${chatId}`,
+        senderDisplayName: displayName,
+        chatType: inGroup ? "group" : "private",
         onAck: (text) => ctx.reply(text).catch(() => {}),
       });
 
@@ -792,7 +952,19 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
     if (processedMessages.has(key)) return;
     processedMessages.add(key);
     const chatId = String(ctx.chat.id);
+    const displayName = getDisplayName(ctx.from);
+    const inGroup = isGroupChat(ctx.chat.type);
     log("msg", `IN voice from=${senderId} chat=${chatId} duration=${ctx.message.voice.duration}s`);
+
+    trackUserPresence(senderId, chatId, ctx.from, ctx.chat.type);
+
+    // Group passive listening for voice — can't check text content, so only respond if reply-to-bot
+    if (inGroup && config.group.passiveListening && !shouldRespondInGroup(ctx.message as Parameters<typeof shouldRespondInGroup>[0])) {
+      dbMessages.append(`telegram_${chatId}`, "user", `[${displayName}]: [voice message]`);
+      log("msg", `PASSIVE voice from=${senderId} chat=${chatId}`);
+      return;
+    }
+
     if (isRateLimited(chatId)) { log("msg", `RATE_LIMITED chat=${chatId}`); await ctx.reply("slow down!"); return; }
 
     const voice = ctx.message.voice;
@@ -819,6 +991,7 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
 
     let content = `[voice message] ${transcription}`;
     content = enrichContent(content, ctx.message);
+    if (inGroup) content = `[${displayName}]: ${content}`;
     const tierOverride = consumeTierOverride(chatId);
     const t0 = Date.now();
 
@@ -829,6 +1002,8 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
         senderId, chatId, channel: "telegram",
         sessionKey: `telegram_${chatId}`,
         tierOverride,
+        senderDisplayName: displayName,
+        chatType: inGroup ? "group" : "private",
         onAck: (text) => ctx.reply(text).catch(() => {}),
       });
 
@@ -859,7 +1034,18 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
     if (processedMessages.has(key)) return;
     processedMessages.add(key);
     const chatId = String(ctx.chat.id);
+    const displayName = getDisplayName(ctx.from);
+    const inGroup = isGroupChat(ctx.chat.type);
     log("msg", `IN video_note from=${senderId} chat=${chatId}`);
+
+    trackUserPresence(senderId, chatId, ctx.from, ctx.chat.type);
+
+    if (inGroup && config.group.passiveListening && !shouldRespondInGroup(ctx.message as Parameters<typeof shouldRespondInGroup>[0])) {
+      dbMessages.append(`telegram_${chatId}`, "user", `[${displayName}]: [video note]`);
+      log("msg", `PASSIVE video_note from=${senderId} chat=${chatId}`);
+      return;
+    }
+
     if (isRateLimited(chatId)) { log("msg", `RATE_LIMITED chat=${chatId}`); await ctx.reply("slow down!"); return; }
 
     const videoNote = ctx.message.video_note;
@@ -884,6 +1070,7 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
 
     let content = `[voice message] ${transcription}`;
     content = enrichContent(content, ctx.message);
+    if (inGroup) content = `[${displayName}]: ${content}`;
     const tierOverride = consumeTierOverride(chatId);
     const t0 = Date.now();
 
@@ -894,6 +1081,8 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
         senderId, chatId, channel: "telegram",
         sessionKey: `telegram_${chatId}`,
         tierOverride,
+        senderDisplayName: displayName,
+        chatType: inGroup ? "group" : "private",
         onAck: (text) => ctx.reply(text).catch(() => {}),
       });
 
@@ -924,10 +1113,21 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
     if (processedMessages.has(key)) return;
     processedMessages.add(key);
     const chatId = String(ctx.editedMessage!.chat.id);
+    const displayName = getDisplayName(ctx.from);
+    const inGroup = isGroupChat(ctx.editedMessage!.chat.type);
     log("msg", `IN edited from=${senderId} chat=${chatId} "${ctx.editedMessage!.text?.slice(0, 80)}"`);
+
+    trackUserPresence(senderId, chatId, ctx.from, ctx.editedMessage!.chat.type);
+
+    // Group passive listening for edits
+    if (inGroup && config.group.passiveListening && !shouldRespondInGroup(ctx.editedMessage as Parameters<typeof shouldRespondInGroup>[0])) {
+      return;
+    }
+
     if (isRateLimited(chatId)) return;
 
-    const content = `[edited] ${ctx.editedMessage!.text}`;
+    let content = `[edited] ${ctx.editedMessage!.text}`;
+    if (inGroup) content = `[${displayName}]: ${content}`;
     const t0 = Date.now();
 
     startTyping(chatId);
@@ -936,6 +1136,8 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
         content,
         senderId, chatId, channel: "telegram",
         sessionKey: `telegram_${chatId}`,
+        senderDisplayName: displayName,
+        chatType: inGroup ? "group" : "private",
       });
 
       consecutiveErrors = 0;
@@ -978,6 +1180,64 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
   const kodaEnv = process.env.KODA_ENV ?? (config.telegram.useWebhook ? "production" : "development");
   const isAdmin = (userId: string) => config.telegram.adminIds.includes(userId);
   const bootTime = new Date();
+
+  /** Gate a command behind admin check. Returns true if allowed, false if denied. */
+  const requireAdmin = async (ctx: { reply: (text: string) => Promise<unknown> }, senderId: string): Promise<boolean> => {
+    if (isAdmin(senderId)) return true;
+    await ctx.reply("admin only.").catch(() => {});
+    return false;
+  };
+
+  /** Determine whether the bot should actively respond in a group chat. */
+  const shouldRespondInGroup = (message: {
+    text?: string;
+    caption?: string;
+    entities?: Array<{ type: string; offset: number; length: number }>;
+    caption_entities?: Array<{ type: string; offset: number; length: number }>;
+    reply_to_message?: { from?: { id: number } };
+    new_chat_members?: Array<{ id: number }>;
+  }): boolean => {
+    const text = message.text ?? message.caption ?? "";
+    const entities = message.entities ?? message.caption_entities ?? [];
+
+    // 1. @mention of the bot
+    const botUsername = bot.botInfo.username.toLowerCase();
+    for (const entity of entities) {
+      if (entity.type === "mention") {
+        const mention = text.slice(entity.offset, entity.offset + entity.length).toLowerCase();
+        if (mention === `@${botUsername}`) return true;
+      }
+    }
+
+    // 2. Reply to bot's own message
+    if (message.reply_to_message?.from?.id === bot.botInfo.id) return true;
+
+    // 3. Bot's name triggers in text (case-insensitive)
+    const lower = text.toLowerCase();
+    const triggers = config.group.botNameTriggers;
+    for (const trigger of triggers) {
+      // Word boundary match to avoid false positives
+      const re = new RegExp(`\\b${trigger.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i");
+      if (re.test(lower)) return true;
+    }
+
+    // 4. Bot added as new chat member
+    if (message.new_chat_members?.some((m) => m.id === bot.botInfo.id)) return true;
+
+    return false;
+  };
+
+  /** Track user profile and chat membership on incoming message. */
+  const trackUserPresence = (senderId: string, chatId: string, from: { first_name?: string; last_name?: string; username?: string } | undefined, chatType: string) => {
+    try {
+      const displayName = getDisplayName(from);
+      const role = isAdmin(senderId) ? "admin" as const : "member" as const;
+      userProfiles.upsert({ userId: senderId, displayName, username: from?.username, role });
+      if (isGroupChat(chatType)) {
+        chatMembers.upsert(chatId, senderId);
+      }
+    } catch { /* DB not migrated yet — safe to skip */ }
+  };
 
   // --- Notify admins helper ---
   const notifyAdmins = async (text: string) => {
@@ -1025,6 +1285,52 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
     msg += `platform: ${process.platform}/${process.arch}`;
 
     await ctx.reply(msg);
+  });
+
+  // --- /adduser command (admin-only) ---
+  bot.command("adduser", async (ctx) => {
+    const senderId = String(ctx.from?.id);
+    if (!isAllowed(senderId)) return;
+    if (!(await requireAdmin(ctx, senderId))) return;
+
+    const args = ctx.message!.text.replace(/^\/adduser\s*/, "").trim();
+    if (!args || !/^\d+$/.test(args)) {
+      await ctx.reply("usage: /adduser <telegram_user_id>");
+      return;
+    }
+
+    allowFrom.add(args);
+    try {
+      userProfiles.upsert({ userId: args, displayName: `User ${args}`, role: "member" });
+    } catch { /* DB not migrated yet */ }
+    await ctx.reply(`user ${args} added.`);
+    log("telegram", `admin ${senderId} added user ${args}`);
+  });
+
+  // --- /removeuser command (admin-only) ---
+  bot.command("removeuser", async (ctx) => {
+    const senderId = String(ctx.from?.id);
+    if (!isAllowed(senderId)) return;
+    if (!(await requireAdmin(ctx, senderId))) return;
+
+    const args = ctx.message!.text.replace(/^\/removeuser\s*/, "").trim();
+    if (!args || !/^\d+$/.test(args)) {
+      await ctx.reply("usage: /removeuser <telegram_user_id>");
+      return;
+    }
+
+    if (args === senderId) {
+      await ctx.reply("can't remove yourself.");
+      return;
+    }
+    if (isAdmin(args)) {
+      await ctx.reply("can't remove an admin.");
+      return;
+    }
+
+    allowFrom.delete(args);
+    await ctx.reply(`user ${args} removed.`);
+    log("telegram", `admin ${senderId} removed user ${args}`);
   });
 
   // --- Initialize bot (required before handleUpdate in webhook mode) ---

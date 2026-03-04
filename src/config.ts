@@ -58,6 +58,9 @@ const ConfigSchema = z.object({
     charsPerToken: z.number().min(1).default(4),
     escalationStep: z.number().min(1).default(5),
     toolArgLogMaxChars: z.number().min(50).default(500),
+    uncertaintyEscalation: z.boolean().default(true),
+    enableSummarization: z.boolean().default(true),
+    summarizationBatchSize: z.number().min(5).max(30).default(10),
   })),
   timeouts: withEmptyDefault(z.object({
     llm: z.number().min(5000).default(120_000),
@@ -109,6 +112,11 @@ const ConfigSchema = z.object({
     dailyBriefingCron: z.string().default("08:00"),
     backupIntervalHours: z.number().min(1).default(24),
     gcIntervalHours: z.number().min(1).default(1),
+    webFetch: z.boolean().default(true),
+    webFetchMaxBodyBytes: z.number().default(500_000),
+    httpRequest: z.boolean().default(true),
+    enableOutcomeLearning: z.boolean().default(true),
+    memoryConsolidationInterval: z.number().min(5).default(15),
   })),
   subagent: withEmptyDefault(z.object({
     timeoutMs: z.number().min(10_000).default(90_000),
@@ -122,6 +130,10 @@ const ConfigSchema = z.object({
   })),
   github: withEmptyDefault(z.object({
     token: z.string().optional(),
+  })),
+  group: withEmptyDefault(z.object({
+    botNameTriggers: z.array(z.string()).default(["koda"]),
+    passiveListening: z.boolean().default(true),
   })),
   composio: withEmptyDefault(z.object({
     apiKey: z.string().optional(),
@@ -302,6 +314,9 @@ export async function persistConfig(config: Config): Promise<void> {
     charsPerToken: config.agent.charsPerToken,
     escalationStep: config.agent.escalationStep,
     toolArgLogMaxChars: config.agent.toolArgLogMaxChars,
+    uncertaintyEscalation: config.agent.uncertaintyEscalation,
+    enableSummarization: config.agent.enableSummarization,
+    summarizationBatchSize: config.agent.summarizationBatchSize,
   };
   serializable.exa = { numResults: config.exa.numResults };
   serializable.timeouts = config.timeouts;
@@ -316,10 +331,19 @@ export async function persistConfig(config: Config): Promise<void> {
     dailyBriefingCron: config.features.dailyBriefingCron,
     backupIntervalHours: config.features.backupIntervalHours,
     gcIntervalHours: config.features.gcIntervalHours,
+    webFetch: config.features.webFetch,
+    webFetchMaxBodyBytes: config.features.webFetchMaxBodyBytes,
+    httpRequest: config.features.httpRequest,
+    enableOutcomeLearning: config.features.enableOutcomeLearning,
+    memoryConsolidationInterval: config.features.memoryConsolidationInterval,
   };
   serializable.subagent = {
     timeoutMs: config.subagent.timeoutMs,
     maxSteps: config.subagent.maxSteps,
+  };
+  serializable.group = {
+    botNameTriggers: config.group.botNameTriggers,
+    passiveListening: config.group.passiveListening,
   };
   serializable.sandbox = config.sandbox;
   serializable.workspace = config.workspace;

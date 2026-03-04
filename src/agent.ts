@@ -13,13 +13,14 @@ import { createOpenRouter } from "@openrouter/ai-sdk-provider";
 import { createOllama } from "ollama-ai-provider";
 import type { Config, Tier } from "./config.js";
 import { classifyTier, classifyIntent, getModelId, calculateCost, shouldAck, FAILOVER } from "./router.js";
-import { messages as dbMessages, usage as dbUsage } from "./db.js";
+import { messages as dbMessages, usage as dbUsage, toolOutcomes, summaries as dbSummaries } from "./db.js";
 import { formatUserTime } from "./time.js";
 import { withToolContext, getPendingFiles } from "./tools/index.js";
 import type { UserProfile } from "./tools/memory.js";
 import { log, logInfo, logError } from "./log.js";
 import { sanitizeForPrompt, redactSensitiveArgs } from "./security.js";
 import { detectFollowup } from "./followup.js";
+import { summarizeAndStore } from "./summarize.js";
 import { tasks as dbTasks } from "./db.js";
 import { parseCronNext } from "./time.js";
 
@@ -37,6 +38,10 @@ export interface AgentInput {
   onAck?: (text: string) => void;
   onTypingStart?: () => void;
   onTypingStop?: () => void;
+  /** Display name of the message sender (for group attribution). */
+  senderDisplayName?: string;
+  /** Chat type: 'private' for 1:1, 'group' for group/supergroup. */
+  chatType?: "private" | "group";
 }
 
 export interface AgentResult {
@@ -54,8 +59,12 @@ export interface AgentDeps {
   getContextPrompt: () => string | null;
   getSkillsSummary: () => Promise<string | null>;
   getProfile: (userId: string, query: string, sessionKey?: string) => Promise<UserProfile>;
-  ingestConversation: (sessionKey: string, userId: string, messages: Array<{ role: string; content: string }>) => Promise<void>;
+  ingestConversation: (sessionKey: string, userId: string, messages: Array<{ role: string; content: string }>, chatId?: string) => Promise<void>;
   getSoulAcks?: () => string[];
+  /** Fetch project memory profile for group chats. */
+  getProjectMemories?: (chatId: string, query: string) => Promise<{ static: string[]; memories: string[] }>;
+  /** Get active members for a group chat (used in system prompt). */
+  getGroupMembers?: (chatId: string) => Array<{ userId: string; displayName: string; role: string }>;
 }
 
 const ACK_TEMPLATES = [
@@ -116,7 +125,7 @@ export function isLlmCircuitOpen(): boolean {
  * Trims by estimated token count (chars / 4) rather than fixed message count,
  * so short messages are kept and long ones are trimmed more aggressively.
  */
-function trimHistory(messages: ModelMessage[], maxTokens: number, charsPerToken: number): ModelMessage[] {
+function trimHistory(messages: ModelMessage[], maxTokens: number, charsPerToken: number, sessionKey?: string): ModelMessage[] {
   let totalChars = 0;
   for (const msg of messages) {
     totalChars += (typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content)).length;
@@ -134,8 +143,20 @@ function trimHistory(messages: ModelMessage[], maxTokens: number, charsPerToken:
   }
   if (removed === 0) return messages;
 
+  // Try to inject a summary instead of bare "[N messages omitted]"
+  let prefix = `[${removed} earlier messages omitted — context trimmed for length]`;
+  if (sessionKey) {
+    try {
+      const summaries = dbSummaries.getLatest(sessionKey, 3);
+      if (summaries.length > 0) {
+        const bullets = summaries.map((s) => s.summary).join("\n");
+        prefix = `[Earlier conversation summary]\n${bullets}`;
+      }
+    } catch { /* DB not migrated yet — use fallback */ }
+  }
+
   return [
-    { role: "user" as const, content: `[${removed} earlier messages omitted — context trimmed for length]` },
+    { role: "user" as const, content: prefix },
     ...messages.slice(removed),
   ];
 }
@@ -150,6 +171,16 @@ function buildSystemPrompt(deps: {
   workspace: string;
   timezone: string;
   hasWebSearch: boolean;
+  maxSteps: number;
+  hasWebFetch: boolean;
+  hasHttpRequest: boolean;
+  hasAnalyzeData: boolean;
+  knownIssues?: string[];
+  /** Group chat context (omit for private chats). */
+  groupContext?: {
+    members: Array<{ displayName: string; role: string }>;
+    projectProfile?: { static: string[]; memories: string[] };
+  };
 }): string {
   const now = new Date();
   const formatted = formatUserTime(now, deps.timezone);
@@ -160,7 +191,8 @@ function buildSystemPrompt(deps: {
   if (deps.tier === "fast") {
     parts.push(`current time: ${timeParts}, ${formatted}
 
-split replies with ${MESSAGE_DELIMITER}. keep messages short and casual. 1-2 sentences each.`);
+split replies with ${MESSAGE_DELIMITER}. keep messages short and casual. 1-2 sentences each.
+for multi-part requests, tackle one part at a time.`);
   } else {
     parts.push(`## current time
 <current_time>
@@ -185,6 +217,13 @@ rules:
 - 2-4 messages per reply is ideal
 - simple one-word or one-line answers don't need splitting
 - after using tools, still summarize what you did in a brief response`);
+
+    // Reasoning section (deep tier only)
+    parts.push(`## reasoning
+- think before acting on multi-step requests. briefly outline your plan before using tools.
+- use spawnAgent for independent sub-tasks that can run in parallel.
+- summarize progress after completing each sub-task.
+- you have ${deps.maxSteps} tool steps total. after using ~70% of them, start wrapping up and deliver partial answers over abrupt cutoff.`);
   }
 
   parts.push(`## tool use
@@ -195,7 +234,17 @@ use tools when the user asks you to actually do something (not just chat).
 - reminders/scheduling: use createReminder/createRecurringTask/listTasks/deleteTask
 - multi-step requests: chain multiple tools in sequence and briefly summarize what happened
 - if runSandboxed succeeds, include the actual command output (stdout/stderr) in your reply instead of guessing
-if a tool fails or isn't available, say that clearly and continue with the best fallback.`);
+if a tool fails or isn't available, say that clearly and continue with the best fallback.
+- when a tool fails: read the error message carefully, don't retry blindly — try a different approach or different arguments.
+- if multiple approaches fail: summarize what you tried and why it didn't work.
+- when running code: write to file → run it → if it errors, read the error, fix the code, re-run (up to 3 tries). for quick one-liners, run directly.`);
+
+  if (deps.hasAnalyzeData) {
+    parts[parts.length - 1] += `\n- use analyzeData for CSV/JSON data — it gives you stats and sample rows without needing to run code.`;
+  }
+  if (deps.hasHttpRequest) {
+    parts[parts.length - 1] += `\n- use httpRequest when the user asks you to call an API or interact with external services.`;
+  }
 
   if (deps.soulPrompt) parts.push(deps.soulPrompt);
 
@@ -238,6 +287,9 @@ you have the webSearch tool. use it whenever asked about:
 - any fact that could have changed since 2024
 
 your training data is outdated. for anything time-sensitive — search first, answer second.`);
+    if (deps.hasWebFetch) {
+      parts[parts.length - 1] += `\n\nuse fetchUrl to read specific URLs directly. use webSearch to discover pages, fetchUrl to read them.`;
+    }
   }
 
   parts.push(`## research quality
@@ -262,6 +314,43 @@ The sub-agent researches while you continue the conversation. Mention that you'r
     parts.push(`# Available Skills\n\nTo use a skill, read its SKILL.md file using the readFile tool.\n\n${deps.skillsSummary}`);
   }
 
+  // Group chat context
+  if (deps.groupContext) {
+    const memberList = deps.groupContext.members.map((m) => `- ${m.displayName} (${m.role})`).join("\n");
+    parts.push(`## group chat mode
+you are in a group chat. messages are prefixed with [sender name]. address people by name when relevant.
+individual memory (remember/recall) applies to the message sender. project memory (rememberProject/recallProject) is shared across all group members.
+
+active members:
+${memberList}`);
+
+    const pp = deps.groupContext.projectProfile;
+    if (pp && (pp.static.length > 0 || pp.memories.length > 0)) {
+      const projectParts: string[] = ["## project knowledge"];
+      if (pp.static.length > 0) {
+        projectParts.push(`<project_facts>\n${pp.static.map((f) => `- ${sanitizeForPrompt(f)}`).join("\n")}\n</project_facts>`);
+      }
+      if (pp.memories.length > 0) {
+        projectParts.push(`<project_context>\n${pp.memories.map((m) => `- ${sanitizeForPrompt(m)}`).join("\n")}\n</project_context>`);
+      }
+      parts.push(projectParts.join("\n\n"));
+    }
+  }
+
+  // Known issues from tool outcome learning
+  if (deps.knownIssues && deps.knownIssues.length > 0) {
+    parts.push(`## known issues\nthese tools have failed recently — adjust your approach:\n${deps.knownIssues.map((h) => `- ${h}`).join("\n")}`);
+  }
+
+  // Self-check (deep tier only)
+  if (deps.tier !== "fast") {
+    parts.push(`## before responding
+before sending your final answer, quickly review:
+- did you answer what was actually asked?
+- are your claims backed by tool results, not assumptions?
+- is anything missing that the user would expect?`);
+  }
+
   return parts.join("\n\n---\n\n");
 }
 
@@ -284,10 +373,37 @@ function classifyAndAck(input: AgentInput, logPrefix: string, deps?: AgentDeps):
 
 /** Fetch profile + skills summary, build system prompt. */
 async function buildAgentContext(deps: AgentDeps, input: AgentInput, tier: Tier, skipQuery: boolean): Promise<string> {
-  const [profile, skillsSummary] = await Promise.all([
-    deps.getProfile(input.senderId, skipQuery ? "" : input.content, input.sessionKey),
+  const isGroup = input.chatType === "group";
+  const query = skipQuery ? "" : input.content;
+
+  const promises: [Promise<UserProfile>, Promise<string | null>, Promise<{ static: string[]; memories: string[] } | null>] = [
+    deps.getProfile(input.senderId, query, input.sessionKey),
     tier === "fast" ? Promise.resolve(null) : deps.getSkillsSummary(),
-  ]);
+    isGroup && deps.getProjectMemories ? deps.getProjectMemories(input.chatId, query) : Promise.resolve(null),
+  ];
+
+  const [profile, skillsSummary, projectProfile] = await Promise.all(promises);
+
+  // Gather known issues from tool outcome learning
+  let knownIssues: string[] | undefined;
+  if (deps.config.features.enableOutcomeLearning) {
+    try {
+      const failures = toolOutcomes.getRecentFailures(input.senderId, 24);
+      if (failures.length > 0) {
+        knownIssues = failures.map((f) => `${f.toolName}: ${f.errorSnippet} (failed ${f.count}x)`);
+      }
+    } catch { /* DB not migrated yet — ignore */ }
+  }
+
+  // Build group context if applicable
+  let groupContext: { members: Array<{ displayName: string; role: string }>; projectProfile?: { static: string[]; memories: string[] } } | undefined;
+  if (isGroup) {
+    const members = deps.getGroupMembers?.(input.chatId) ?? [];
+    groupContext = {
+      members: members.map((m) => ({ displayName: m.displayName, role: m.role })),
+      ...(projectProfile ? { projectProfile } : {}),
+    };
+  }
 
   return buildSystemPrompt({
     tier,
@@ -299,6 +415,12 @@ async function buildAgentContext(deps: AgentDeps, input: AgentInput, tier: Tier,
     workspace: deps.config.workspace,
     timezone: deps.config.scheduler.timezone,
     hasWebSearch: "webSearch" in deps.tools,
+    maxSteps: deps.config.agent.maxSteps,
+    hasWebFetch: "fetchUrl" in deps.tools,
+    hasHttpRequest: "httpRequest" in deps.tools,
+    hasAnalyzeData: "analyzeData" in deps.tools,
+    knownIssues,
+    groupContext,
   });
 }
 
@@ -316,16 +438,18 @@ function buildMessages(input: AgentInput, history: Array<{ role: string; content
   ];
 }
 
-/** Shared prepareStep callback — handles tier escalation only. Compaction is done pre-flight via trimHistory(). */
+/** Shared prepareStep callback — handles tier escalation (step-based + uncertainty-based). */
 function makePrepareStep(
   provider: ReturnType<typeof createOpenRouter>,
   tierOrder: Tier[],
   config: Config,
-  state: { currentTier: Tier; stepCount: number },
+  state: { currentTier: Tier; stepCount: number; uncertaintyCount: number },
   logPrefix: string,
 ) {
   return ({ stepNumber }: { stepNumber: number }) => {
     state.stepCount = stepNumber;
+
+    // Step-based escalation
     if (stepNumber > config.agent.escalationStep && state.currentTier !== "deep") {
       const idx = tierOrder.indexOf(state.currentTier);
       if (idx < tierOrder.length - 1) {
@@ -336,13 +460,30 @@ function makePrepareStep(
         return { model: provider(newModelId, { models: newFallbacks }) };
       }
     }
+
+    // Uncertainty-based escalation
+    if (config.agent.uncertaintyEscalation && state.uncertaintyCount >= 2 && state.currentTier === "fast") {
+      state.currentTier = "deep";
+      const newModelId = getModelId("deep", config);
+      logInfo("agent", `${logPrefix}UNCERTAINTY ESCALATED to deep model=${newModelId} (${state.uncertaintyCount} signals)`);
+      const newFallbacks = FAILOVER["deep"] ?? [];
+      return { model: provider(newModelId, { models: newFallbacks }) };
+    }
+
     return {};
   };
 }
 
-/** Shared onStepFinish callback — tracks tool usage and logs results/errors. */
-function makeOnStepFinish(toolsUsed: string[], state: { stepCount: number }, logPrefix: string) {
-  return async (step: { toolCalls?: Array<{ toolName: string; args?: unknown }>; toolResults?: Array<{ toolName: string; result?: unknown }> }) => {
+const UNCERTAINTY_SIGNALS = ["i'm not sure", "i think", "might be", "unclear", "i'm unsure", "not certain", "possibly", "i believe"];
+
+/** Shared onStepFinish callback — tracks tool usage, logs results/errors, scans for uncertainty, records outcomes. */
+function makeOnStepFinish(
+  toolsUsed: string[],
+  state: { stepCount: number; uncertaintyCount: number },
+  logPrefix: string,
+  opts?: { userId?: string; enableOutcomeLearning?: boolean },
+) {
+  return async (step: { text?: string; toolCalls?: Array<{ toolName: string; args?: unknown }>; toolResults?: Array<{ toolName: string; result?: unknown }> }) => {
     if (step.toolCalls) {
       for (const call of step.toolCalls) {
         toolsUsed.push(call.toolName);
@@ -358,12 +499,39 @@ function makeOnStepFinish(toolsUsed: string[], state: { stepCount: number }, log
         } else {
           logInfo("agent", `${logPrefix}step ${state.stepCount} RESULT ${res.toolName} ${raw.slice(0, 300)}`);
         }
+
+        // Record tool outcomes for learning
+        if (opts?.enableOutcomeLearning && opts.userId) {
+          try {
+            const approach = step.toolCalls
+              ?.find((c) => c.toolName === res.toolName)
+              ?.args;
+            toolOutcomes.record({
+              userId: opts.userId,
+              toolName: res.toolName,
+              approach: JSON.stringify(approach ?? {}).slice(0, 200),
+              success: !isError,
+              errorSnippet: isError ? raw.slice(0, 300) : undefined,
+            });
+          } catch { /* DB not migrated yet — ignore */ }
+        }
+      }
+    }
+
+    // Scan text output for uncertainty signals (fast tier escalation)
+    if (step.text) {
+      const lower = step.text.toLowerCase();
+      for (const signal of UNCERTAINTY_SIGNALS) {
+        if (lower.includes(signal)) {
+          state.uncertaintyCount++;
+          break;
+        }
       }
     }
   };
 }
 
-/** Post-processing: cost calc, usage tracking, message save, conversation ingestion. */
+/** Post-processing: cost calc, usage tracking, message save, conversation ingestion, summarization. */
 function finalizeResult(
   deps: AgentDeps,
   input: AgentInput,
@@ -399,9 +567,24 @@ function finalizeResult(
   dbMessages.append(input.sessionKey, "assistant", cleanedForHistory, uniqueTools);
 
   const allMessages = [...history, { role: "user", content: input.content }, { role: "assistant", content: cleanedForHistory }];
-  deps.ingestConversation(input.sessionKey, input.senderId, allMessages).catch((err) => {
+  deps.ingestConversation(input.sessionKey, input.senderId, allMessages, input.chatId).catch((err) => {
     log("agent", "conversation ingestion failed: %s", (err as Error).message);
   });
+
+  // Async summarization — fire when unsummarized message count exceeds batch size
+  if (deps.config.agent.enableSummarization) {
+    try {
+      const msgCount = dbMessages.count(input.sessionKey);
+      const latestSummary = dbSummaries.getLatest(input.sessionKey, 1);
+      const summarizedUpTo = latestSummary.length > 0 ? latestSummary[0]!.messageRangeEnd : 0;
+      const unsummarized = msgCount - summarizedUpTo;
+      if (unsummarized >= deps.config.agent.summarizationBatchSize) {
+        summarizeAndStore(input.sessionKey, deps.config).catch((err) => {
+          log("agent", "%ssummarization failed: %s", logPrefix, (err as Error).message);
+        });
+      }
+    } catch { /* DB not migrated yet — ignore */ }
+  }
 
   // Follow-up intent detection (user-initiated messages only)
   if (!input.source || input.source === "user") {
@@ -457,12 +640,12 @@ export function createAgent(deps: AgentDeps) {
     const { tier, skipQuery } = classifyAndAck(input, logPrefix, deps);
     const systemPrompt = await buildAgentContext(deps, input, tier, skipQuery);
     const history = dbMessages.getHistory(input.sessionKey, 30);
-    const messageList = trimHistory(buildMessages(input, history), config.agent.historyTokenBudget, config.agent.charsPerToken);
+    const messageList = trimHistory(buildMessages(input, history), config.agent.historyTokenBudget, config.agent.charsPerToken, input.sessionKey);
 
     input.onTypingStart?.();
 
     const toolsUsed: string[] = [];
-    const state = { currentTier: tier, stepCount: 0 };
+    const state = { currentTier: tier, stepCount: 0, uncertaintyCount: 0 };
 
     const toolCostRef = { total: 0 };
 
@@ -493,7 +676,10 @@ export function createAgent(deps: AgentDeps) {
           temperature: config.agent.temperature,
           abortSignal: input.abortSignal,
           prepareStep: makePrepareStep(provider, tierOrder, config, state, logPrefix),
-          onStepFinish: makeOnStepFinish(toolsUsed, state, logPrefix),
+          onStepFinish: makeOnStepFinish(toolsUsed, state, logPrefix, {
+            userId: input.senderId,
+            enableOutcomeLearning: config.features.enableOutcomeLearning,
+          }),
         });
 
         llmFailures = 0;
@@ -540,10 +726,10 @@ export function createStreamAgent(deps: AgentDeps) {
     const { tier, skipQuery } = classifyAndAck(input, logPrefix, deps);
     const systemPrompt = await buildAgentContext(deps, input, tier, skipQuery);
     const history = dbMessages.getHistory(input.sessionKey, 30);
-    const messageList = trimHistory(buildMessages(input, history), config.agent.historyTokenBudget, config.agent.charsPerToken);
+    const messageList = trimHistory(buildMessages(input, history), config.agent.historyTokenBudget, config.agent.charsPerToken, input.sessionKey);
 
     const toolsUsed: string[] = [];
-    const state = { currentTier: tier, stepCount: 0 };
+    const state = { currentTier: tier, stepCount: 0, uncertaintyCount: 0 };
 
     const modelId = getModelId(state.currentTier, config);
     logInfo("agent", `${logPrefix}model=${modelId} session=${input.sessionKey} history=${messageList.length}msgs`);
@@ -569,7 +755,10 @@ export function createStreamAgent(deps: AgentDeps) {
         maxOutputTokens: config.agent.maxTokens,
         temperature: config.agent.temperature,
         prepareStep: makePrepareStep(provider, tierOrder, config, state, logPrefix),
-        onStepFinish: makeOnStepFinish(toolsUsed, state, logPrefix),
+        onStepFinish: makeOnStepFinish(toolsUsed, state, logPrefix, {
+          userId: input.senderId,
+          enableOutcomeLearning: config.features.enableOutcomeLearning,
+        }),
         onError: ({ error }) => {
           logError("agent", "stream error", error);
         },

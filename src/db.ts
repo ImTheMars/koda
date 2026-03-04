@@ -16,7 +16,7 @@ let stmtAppendMessage: ReturnType<Database["prepare"]> | null = null;
 let stmtGetHistory: ReturnType<Database["prepare"]> | null = null;
 let stmtTrackUsage: ReturnType<Database["prepare"]> | null = null;
 
-const SCHEMA_VERSION = 4;
+const SCHEMA_VERSION = 6;
 
 export function initDb(dbPath: string): Database {
   currentDbPath = dbPath;
@@ -150,6 +150,55 @@ function runMigrations(database: Database): void {
     try { database.exec("ALTER TABLE tasks ADD COLUMN consecutive_failures INTEGER NOT NULL DEFAULT 0"); } catch { /* column already exists */ }
     database.run("INSERT OR REPLACE INTO state (key, value, updated_at) VALUES ('schema_version', '4', datetime('now'))");
     log("db", "Migrated to schema version 4");
+  }
+
+  if (currentVersion < 5) {
+    database.exec(`
+      CREATE TABLE IF NOT EXISTS conversation_summaries (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_key TEXT NOT NULL,
+        summary TEXT NOT NULL,
+        message_range_start INTEGER NOT NULL,
+        message_range_end INTEGER NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_summaries_session ON conversation_summaries(session_key);
+
+      CREATE TABLE IF NOT EXISTS tool_outcomes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id TEXT NOT NULL,
+        tool_name TEXT NOT NULL,
+        approach TEXT NOT NULL,
+        success INTEGER NOT NULL DEFAULT 1,
+        error_snippet TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_outcomes_tool ON tool_outcomes(tool_name, success);
+    `);
+    database.run("INSERT OR REPLACE INTO state (key, value, updated_at) VALUES ('schema_version', '5', datetime('now'))");
+    log("db", "Migrated to schema version 5");
+  }
+
+  if (currentVersion < 6) {
+    database.exec(`
+      CREATE TABLE IF NOT EXISTS user_profiles (
+        user_id TEXT PRIMARY KEY,
+        display_name TEXT NOT NULL,
+        username TEXT,
+        role TEXT NOT NULL DEFAULT 'member' CHECK(role IN ('admin','member')),
+        first_seen TEXT DEFAULT (datetime('now')),
+        last_seen TEXT DEFAULT (datetime('now'))
+      );
+
+      CREATE TABLE IF NOT EXISTS chat_members (
+        chat_id TEXT NOT NULL,
+        user_id TEXT NOT NULL,
+        last_active TEXT DEFAULT (datetime('now')),
+        PRIMARY KEY(chat_id, user_id)
+      );
+    `);
+    database.run("INSERT OR REPLACE INTO state (key, value, updated_at) VALUES ('schema_version', '6', datetime('now'))");
+    log("db", "Migrated to schema version 6");
   }
 }
 
@@ -435,5 +484,141 @@ export const state = {
 
   delete(key: string): void {
     getDb().run("DELETE FROM state WHERE key = ?", [key]);
+  },
+};
+
+// --- Conversation Summaries ---
+
+export const summaries = {
+  store(sessionKey: string, summary: string, rangeStart: number, rangeEnd: number): void {
+    getDb().run(
+      "INSERT INTO conversation_summaries (session_key, summary, message_range_start, message_range_end) VALUES (?, ?, ?, ?)",
+      [sessionKey, summary, rangeStart, rangeEnd],
+    );
+  },
+
+  getLatest(sessionKey: string, limit = 3): Array<{
+    summary: string;
+    messageRangeStart: number;
+    messageRangeEnd: number;
+    createdAt: string;
+  }> {
+    return getDb()
+      .query("SELECT summary, message_range_start as messageRangeStart, message_range_end as messageRangeEnd, created_at as createdAt FROM conversation_summaries WHERE session_key = ? ORDER BY id DESC LIMIT ?")
+      .all(sessionKey, limit) as Array<{
+        summary: string;
+        messageRangeStart: number;
+        messageRangeEnd: number;
+        createdAt: string;
+      }>;
+  },
+};
+
+// --- Tool Outcomes ---
+
+export const toolOutcomes = {
+  record(data: {
+    userId: string;
+    toolName: string;
+    approach: string;
+    success: boolean;
+    errorSnippet?: string;
+  }): void {
+    getDb().run(
+      "INSERT INTO tool_outcomes (user_id, tool_name, approach, success, error_snippet) VALUES (?, ?, ?, ?, ?)",
+      [data.userId, data.toolName, data.approach, data.success ? 1 : 0, data.errorSnippet ?? null],
+    );
+  },
+
+  getRecentFailures(userId: string, hoursBack = 24): Array<{
+    toolName: string;
+    errorSnippet: string;
+    count: number;
+  }> {
+    return getDb()
+      .query(`SELECT tool_name as toolName, error_snippet as errorSnippet, COUNT(*) as count
+              FROM tool_outcomes
+              WHERE user_id = ? AND success = 0
+                AND datetime(created_at) >= datetime('now', ?)
+              GROUP BY tool_name, error_snippet
+              HAVING COUNT(*) >= 3
+              ORDER BY count DESC
+              LIMIT 5`)
+      .all(userId, `-${hoursBack} hours`) as Array<{
+        toolName: string;
+        errorSnippet: string;
+        count: number;
+      }>;
+  },
+};
+
+// --- User Profiles ---
+
+export interface UserProfileRow {
+  userId: string;
+  displayName: string;
+  username: string | null;
+  role: "admin" | "member";
+  firstSeen: string;
+  lastSeen: string;
+}
+
+export const userProfiles = {
+  upsert(data: { userId: string; displayName: string; username?: string; role?: "admin" | "member" }): void {
+    getDb().run(
+      `INSERT INTO user_profiles (user_id, display_name, username, role)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(user_id) DO UPDATE SET
+         display_name = excluded.display_name,
+         username = COALESCE(excluded.username, user_profiles.username),
+         last_seen = datetime('now')`,
+      [data.userId, data.displayName, data.username ?? null, data.role ?? "member"],
+    );
+  },
+
+  get(userId: string): UserProfileRow | null {
+    const row = getDb()
+      .query("SELECT user_id as userId, display_name as displayName, username, role, first_seen as firstSeen, last_seen as lastSeen FROM user_profiles WHERE user_id = ?")
+      .get(userId) as UserProfileRow | null;
+    return row;
+  },
+
+  getAll(): UserProfileRow[] {
+    return getDb()
+      .query("SELECT user_id as userId, display_name as displayName, username, role, first_seen as firstSeen, last_seen as lastSeen FROM user_profiles ORDER BY last_seen DESC")
+      .all() as UserProfileRow[];
+  },
+
+  setRole(userId: string, role: "admin" | "member"): boolean {
+    return getDb().run("UPDATE user_profiles SET role = ? WHERE user_id = ?", [role, userId]).changes > 0;
+  },
+
+  touch(userId: string): void {
+    getDb().run("UPDATE user_profiles SET last_seen = datetime('now') WHERE user_id = ?", [userId]);
+  },
+};
+
+// --- Chat Members ---
+
+export interface ChatMemberRow {
+  chatId: string;
+  userId: string;
+  lastActive: string;
+}
+
+export const chatMembers = {
+  upsert(chatId: string, userId: string): void {
+    getDb().run(
+      `INSERT INTO chat_members (chat_id, user_id)
+       VALUES (?, ?)
+       ON CONFLICT(chat_id, user_id) DO UPDATE SET last_active = datetime('now')`,
+      [chatId, userId],
+    );
+  },
+
+  getByChatId(chatId: string): ChatMemberRow[] {
+    return getDb()
+      .query("SELECT chat_id as chatId, user_id as userId, last_active as lastActive FROM chat_members WHERE chat_id = ? ORDER BY last_active DESC")
+      .all(chatId) as ChatMemberRow[];
   },
 };

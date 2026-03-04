@@ -21,6 +21,8 @@ import { registerStatusTools } from "./status.js";
 import { registerSandboxTools } from "./sandbox.js";
 import { registerImageTools } from "./image.js";
 import { registerFileTools } from "./files.js";
+import { registerWebTools } from "./web.js";
+import { registerDataTools } from "./data.js";
 import { createComposioClient } from "../composio.js";
 
 interface ToolRuntimeContext {
@@ -80,6 +82,7 @@ export async function buildTools(deps: {
     ...registerMemoryTools({
       memory: memoryProvider,
       getUserId: () => getToolContext().userId,
+      getChatId: () => getToolContext().chatId,
     }),
     ...registerFilesystemTools({ workspace }),
     ...registerSkillTools({ skillLoader, workspace, exaApiKey: config.exa.apiKey, githubToken: config.github?.token }),
@@ -122,6 +125,23 @@ export async function buildTools(deps: {
 
   // File sending
   Object.assign(tools, registerFileTools({ workspace }));
+
+  // Web tools (fetchUrl + httpRequest)
+  if (config.features.webFetch || config.features.httpRequest) {
+    const webTools = registerWebTools({
+      maxBodyBytes: config.features.webFetchMaxBodyBytes,
+      onCost: addToolCost,
+    });
+    if (config.features.webFetch) {
+      tools.fetchUrl = webTools.fetchUrl!;
+    }
+    if (config.features.httpRequest) {
+      tools.httpRequest = webTools.httpRequest!;
+    }
+  }
+
+  // Data analysis
+  Object.assign(tools, registerDataTools());
 
   // Composio integrations (Gmail, Calendar, GitHub)
   if (config.composio?.apiKey) {

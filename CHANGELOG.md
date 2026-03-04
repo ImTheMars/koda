@@ -4,6 +4,50 @@ all notable changes to koda.
 
 ---
 
+## 2026-03-03
+### multi-user & group chat support
+
+koda now works in Telegram group chats. the bot listens passively to all messages, responds only when addressed (@mention, reply, or name trigger), and builds both per-user and shared project knowledge.
+
+**prerequisite**: disable bot privacy mode via BotFather (`/setprivacy → Disable`).
+
+#### added
+
+- **group chat detection** — `isGroupChat()` helper; bot distinguishes private vs group/supergroup chats across all message types.
+- **mention-based activation** — `shouldRespondInGroup()` triggers on: `@bot` mention, reply-to-bot, configurable name triggers (default: "koda"), bot added as member. all other messages are stored passively.
+- **passive listening** — in groups, all messages are stored in session history with `[sender name]` attribution but don't invoke the agent unless addressed.
+- **message attribution** — group messages prefixed with `[DisplayName]: ...` in history and agent input for multi-user context.
+- **shared project memory** — `rememberProject` and `recallProject` tools store/search per-chat project decisions, goals, and action items in `project-{chatId}` containers.
+- **project context in system prompt** — group chats inject `<project_facts>` and `<project_context>` sections from Supermemory project profiles.
+- **group mode system prompt** — active member list with roles, instructions for name-based addressing, project vs personal memory usage guidance.
+- **dual extraction** — `ingestConversation()` runs two passes for group chats: per-user facts into `user-{senderId}`, project facts into `project-{chatId}`.
+- **admin permissions** — `requireAdmin()` gates `/clear`, `/model` in group chats; `/adduser <id>` and `/removeuser <id>` admin-only commands to manage runtime access.
+- **user profiles** (DB v6) — `user_profiles` table tracks display name, username, role (admin/member), first/last seen. admin profiles seeded from config on boot.
+- **chat membership** (DB v6) — `chat_members` table tracks per-chat user activity. used for system prompt member list.
+- **config `group` section** — `botNameTriggers: string[]` (default: `["koda"]`), `passiveListening: boolean` (default: `true`). zero breaking changes.
+- **multi-user summarization** — group session summaries include per-person action items and attribution.
+- **34 new tests** (`src/__tests__/group.test.ts`) — DB operations, group detection, mention activation (8 scenarios), message attribution, admin permissions, config defaults.
+
+#### changed
+
+- **Supermemory SDK upgrade** — replaced manual `SmClient` interface with native SDK types. `client.profile()` replaces 2-search manual profile building. `client.memories.forget()` replaces search→delete. `client.memories.updateMemory()` handles contradictions with versioning (was: delete+re-add). `entityContext` parameter guides extraction on all `client.add()` calls.
+- **`AgentInput`** — extended with `senderDisplayName?: string` and `chatType?: 'private' | 'group'`.
+- **`AgentDeps`** — extended with `getProjectMemories()` and `getGroupMembers()`.
+- **`MemoryProvider`** — extended with `storeProject()`, `recallProject()`, `getProjectMemories()`. `ingestConversation()` accepts optional `chatId` for project extraction.
+- **`registerMemoryTools()`** — now accepts `getChatId` for project memory tool context.
+- **`/help` command** — includes `/adduser`, `/removeuser`, and group-specific mention instructions.
+
+#### database
+
+- **schema v6** — `user_profiles` + `chat_members` tables with automatic migration from v5.
+
+#### verification
+
+- `bunx tsc --noEmit` — 0 errors
+- `bun test` — 214 pass, 0 fail (11 test files)
+
+---
+
 ## 2026-03-02
 ### sendMessageDraft streaming (grammy)
 

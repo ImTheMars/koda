@@ -6,7 +6,7 @@
 
 import { mkdir, readFile, writeFile, unlink } from "fs/promises";
 import { resolve } from "path";
-import { initDb, closeDb, messages as dbMessages, state as dbState, tasks as dbTasks, vacuumDb, backupDatabase } from "./db.js";
+import { initDb, closeDb, messages as dbMessages, state as dbState, tasks as dbTasks, vacuumDb, backupDatabase, userProfiles, chatMembers } from "./db.js";
 import { parseCronNext } from "./time.js";
 import { createAgent, createStreamAgent, type AgentDeps } from "./agent.js";
 import { startRepl } from "./channels/repl.js";
@@ -61,14 +61,37 @@ const agentDeps: AgentDeps = {
   getContextPrompt: () => getContextContent(),
   getSkillsSummary: () => skillLoader.buildSkillsSummary(),
   getProfile: (userId, query, sessionKey) => memoryProvider.getProfile(userId, query || undefined, sessionKey),
-  ingestConversation: (sessionKey, userId, messages) => memoryProvider.ingestConversation(sessionKey, userId, messages),
+  ingestConversation: (sessionKey, userId, messages, chatId) => memoryProvider.ingestConversation(sessionKey, userId, messages, chatId),
   getSoulAcks: () => soulLoader.getAckTemplates(),
+  getProjectMemories: memoryProvider.getProjectMemories
+    ? (chatId, query) => memoryProvider.getProjectMemories!(chatId, query)
+    : undefined,
+  getGroupMembers: (chatId) => {
+    try {
+      const members = chatMembers.getByChatId(chatId);
+      return members.map((m) => {
+        const profile = userProfiles.get(m.userId);
+        return {
+          userId: m.userId,
+          displayName: profile?.displayName ?? `User ${m.userId}`,
+          role: profile?.role ?? "member",
+        };
+      });
+    } catch { return []; }
+  },
 };
 
 // Setup entity context for owner on first boot
 memoryProvider.setupEntityContext(config.owner.id).catch((err) => {
   logWarn("boot", `Entity context setup failed: ${(err as Error).message}`);
 });
+
+// Seed admin profiles from config
+try {
+  for (const adminId of config.telegram.adminIds) {
+    userProfiles.upsert({ userId: adminId, displayName: `Admin ${adminId}`, role: "admin" });
+  }
+} catch { /* DB not migrated yet — safe to skip */ }
 
 const runAgent = createAgent(agentDeps);
 const streamAgentFn = createStreamAgent(agentDeps);
