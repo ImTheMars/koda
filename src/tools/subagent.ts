@@ -35,6 +35,8 @@ const structuredResults = new Map<string, StructuredSubagentResult>();
 // Tools that sub-agents are never allowed to use, regardless of allowlist.
 const ALWAYS_BLOCKED = new Set([
   "spawnAgent",           // no recursion
+  "createPlanRecord",     // durable plan ownership stays with main agent
+  "approvePlan",          // approval stays with main agent
   "createReminder",       // no scheduling side effects
   "createRecurringTask",  // no scheduling side effects
   "listTasks",            // no scheduling side effects
@@ -48,11 +50,16 @@ const ALWAYS_BLOCKED = new Set([
 const DEFAULT_ALLOWED = new Set([
   "webSearch",
   "extractUrl",
+  "fetchUrl",
   "remember",
   "recall",
+  "assessmentSnapshot",
   "readFile",
   "writeFile",
   "listFiles",
+  "getPlan",
+  "updatePlanStep",
+  "verifyOutcome",
   "skills",
   "systemStatus",
 ]);
@@ -199,6 +206,7 @@ export function registerSubAgentTools(deps: {
             `- When DONE, call returnResult({ summary, data, sources, confidence, notes }) with your findings.`,
             `- Do NOT use the <|msg|> delimiter.`,
             `- For factual/current research: include sources (URLs) and avoid exact numbers unless they come from sources.`,
+            `- If you were given a durable plan step, update it with updatePlanStep before you finish.`,
             `- If you run out of time, return partial findings with caveats instead of guessing.`,
             `- Be thorough but concise. If stuck, return what you have so far.`,
           );

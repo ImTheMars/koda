@@ -1,5 +1,7 @@
 # KODA v2 — EXECUTIVE AUDIT REPORT
 
+> historical snapshot: this audit predates the autonomy pivot work and parts of the testing/runtime inventory are now out of date.
+
 **Date:** February 26, 2026
 **Version Audited:** v1.0.1
 **Audited By:** Automated 6-Agent Parallel Audit
@@ -43,7 +45,7 @@ Koda is a **production-deployed personal AI assistant** running on Railway, acce
 | **Feature Set** | A | Rich — memory, scheduling, sandbox, sub-agents, skills, MCP |
 | **Code Quality** | B- | 31+ `any` types, 30+ swallowed errors, inconsistent patterns |
 | **Security** | B | Good foundations (path containment, sandboxing), gaps in logging/validation |
-| **Testing** | D | Zero unit/integration tests, only LLM-judge benchmarks |
+| **Testing** | C+ | Deterministic Bun tests plus LLM-judge benchmarks; autonomy eval coverage still growing |
 | **Performance** | B+ | Fast boot, good async patterns, some blocking operations |
 | **Observability** | C | No structured logging, no metrics, no tracing |
 | **Documentation** | B | Good README/CHANGELOG, missing dev guides |
@@ -568,19 +570,19 @@ Three different approaches used simultaneously:
 
 ## 10. TESTING & QA STATUS
 
-### Current State: MINIMAL
+### Current State: PARTIAL
 
 | Test Type | Status | Coverage |
 |-----------|--------|----------|
-| **Unit Tests** | None | 0% |
-| **Integration Tests** | None | 0% |
+| **Unit Tests** | Present | Core deterministic coverage for config, router, DB, security, events, follow-up, web, and data |
+| **Integration Tests** | Limited | Focused mostly on DB/runtime helpers |
 | **E2E Tests** | None | 0% |
 | **Benchmarks** | 44 tests / 13 categories | Behavioral coverage |
 | **CI/CD** | Release-only | No PR checks |
 
 ### Benchmark Suite (What Exists)
 
-The project has a **novel LLM-judge-powered benchmark system** instead of traditional tests:
+The project has a **hybrid benchmark system** alongside deterministic tests:
 
 - **44 test cases** across 13 categories (chat, memory, search, scheduling, file I/O, sandbox, multi-turn, tool chaining, composio, sub-agents, tier escalation, error recovery, edge cases)
 - **Hybrid grading:** Programmatic checks (free) + LLM judge (~$0.001/test)

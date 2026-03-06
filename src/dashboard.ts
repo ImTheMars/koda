@@ -14,7 +14,7 @@
 import type { SkillLoader } from "./tools/skills.js";
 import type { Config } from "./config.js";
 import type { MemoryProvider } from "./tools/memory.js";
-import { usage as dbUsage, tasks as dbTasks } from "./db.js";
+import { usage as dbUsage, tasks as dbTasks, assessment as dbAssessment, plans as dbPlans } from "./db.js";
 import { getSpawnLog, killSpawn } from "./tools/subagent.js";
 import { subscribe } from "./events.js";
 
@@ -47,6 +47,23 @@ async function skillsResponse(skillLoader: SkillLoader): Promise<Response> {
 function tasksResponse(userId: string): Response {
   const tasks = dbTasks.listByUser(userId);
   return Response.json({ tasks });
+}
+
+function goalsResponse(userId: string): Response {
+  return Response.json({ goals: dbAssessment.listGoals(userId).slice(0, 10) });
+}
+
+function reviewsResponse(userId: string): Response {
+  return Response.json({ reviews: dbAssessment.listReviews(userId, 5) });
+}
+
+function plansResponse(userId: string): Response {
+  return Response.json({
+    plans: dbPlans.listByUser(userId).slice(0, 10).map((plan) => ({
+      ...plan,
+      steps: dbPlans.listSteps(plan.id),
+    })),
+  });
 }
 
 function spawnsResponse(): Response {
@@ -94,6 +111,9 @@ export async function handleDashboardRequest(req: Request, deps: DashboardDeps):
   if (url.pathname === "/api/usage") return usageResponse(deps.defaultUserId);
   if (url.pathname === "/api/skills") return skillsResponse(deps.skillLoader);
   if (url.pathname === "/api/tasks") return tasksResponse(deps.defaultUserId);
+  if (url.pathname === "/api/goals") return goalsResponse(deps.defaultUserId);
+  if (url.pathname === "/api/reviews") return reviewsResponse(deps.defaultUserId);
+  if (url.pathname === "/api/plans") return plansResponse(deps.defaultUserId);
   if (url.pathname === "/api/events") return sseResponse();
 
   // Memory search + delete
@@ -579,6 +599,28 @@ function buildDashboardHtml(deps: DashboardDeps): string {
       </ul>
     </div>
 
+    <!-- Goals -->
+    <div class="section">
+      <div class="section-header">
+        <span class="section-title">Goals</span>
+        <span class="badge" id="goalsBadge">—</span>
+      </div>
+      <ul class="tasks-list" id="goalsList">
+        <li class="empty">Loading...</li>
+      </ul>
+    </div>
+
+    <!-- Plans -->
+    <div class="section">
+      <div class="section-header">
+        <span class="section-title">Durable Plans</span>
+        <span class="badge" id="plansBadge">—</span>
+      </div>
+      <ul class="spawns-list" id="plansList">
+        <li class="empty">Loading...</li>
+      </ul>
+    </div>
+
     <!-- Memory search -->
     <div class="section">
       <div class="section-header">
@@ -733,6 +775,41 @@ function buildDashboardHtml(deps: DashboardDeps): string {
       }).join('');
     }
 
+    function renderGoals(data) {
+      var list = document.getElementById('goalsList');
+      document.getElementById('goalsBadge').textContent = data.goals.length;
+      if (!data.goals.length) {
+        list.innerHTML = '<li class="empty">No goals tracked yet</li>';
+        return;
+      }
+      list.innerHTML = data.goals.map(function(goal) {
+        var target = goal.targetDate ? relTime(goal.targetDate) : 'no target';
+        return '<li class="task-row">' +
+          '<span class="task-type type-recurring">' + esc(goal.status) + '</span>' +
+          '<span class="task-desc">' + esc(goal.title) + ' · ' + esc(goal.domain) + '</span>' +
+          '<span class="task-time">' + esc(target) + '</span>' +
+          '</li>';
+      }).join('');
+    }
+
+    function renderPlans(data) {
+      var list = document.getElementById('plansList');
+      document.getElementById('plansBadge').textContent = data.plans.length;
+      if (!data.plans.length) {
+        list.innerHTML = '<li class="empty">No durable plans yet</li>';
+        return;
+      }
+      list.innerHTML = data.plans.map(function(plan) {
+        var nextStep = (plan.steps || []).find(function(step) { return step.status === 'pending' || step.status === 'in_progress'; });
+        return '<li class="spawn-row">' +
+          '<span class="spawn-status" style="color:' + (plan.status === 'done' ? 'var(--green)' : plan.status === 'blocked' ? 'var(--red)' : 'var(--accent)') + '">·</span>' +
+          '<span class="spawn-name">' + esc(plan.title) + '</span>' +
+          '<span class="spawn-tools">' + esc(nextStep ? ('next: ' + nextStep.title) : plan.goal) + '</span>' +
+          '<span class="spawn-meta">' + esc(plan.status) + (plan.riskLevel ? (' · ' + plan.riskLevel) : '') + '</span>' +
+          '</li>';
+      }).join('');
+    }
+
     async function killAgent(sessionKey) {
       if (!confirm('Kill this sub-agent?')) return;
       await fetch('/api/spawns?session=' + encodeURIComponent(sessionKey), { method: 'DELETE' });
@@ -807,12 +884,16 @@ function buildDashboardHtml(deps: DashboardDeps): string {
           fetch('/api/usage').then(function(r) { return r.json(); }),
           fetch('/api/skills').then(function(r) { return r.json(); }),
           fetch('/api/tasks').then(function(r) { return r.json(); }),
+          fetch('/api/goals').then(function(r) { return r.json(); }),
+          fetch('/api/plans').then(function(r) { return r.json(); }),
           fetch('/api/spawns').then(function(r) { return r.json(); }),
         ]);
         renderUsage(results[0]);
         renderSkills(results[1]);
         renderTasks(results[2]);
-        spawnList = results[3].spawns || [];
+        renderGoals(results[3]);
+        renderPlans(results[4]);
+        spawnList = results[5].spawns || [];
         renderSpawns(spawnList);
         fmtUptime();
         var now = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });

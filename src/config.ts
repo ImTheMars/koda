@@ -103,6 +103,13 @@ const ConfigSchema = z.object({
   proactive: withEmptyDefault(z.object({
     tickIntervalMs: z.number().min(10_000).default(30_000),
   })),
+  autonomy: withEmptyDefault(z.object({
+    monthlyBudgetUsd: z.number().min(0).default(100),
+    perPlanBudgetUsd: z.number().min(0).default(15),
+    approvalRiskLevel: z.enum(["medium", "high"]).default("high"),
+    allowBrowserAutomation: z.boolean().default(false),
+    maxConcurrentPlans: z.number().min(1).max(20).default(5),
+  })),
   features: withEmptyDefault(z.object({
     scheduler: z.boolean().default(true),
     debug: z.boolean().default(false),
@@ -110,6 +117,8 @@ const ConfigSchema = z.object({
     messageRetentionDays: z.number().min(1).default(90),
     skillDiscoveryCron: z.string().default("sun 09:00"),
     dailyBriefingCron: z.string().default("08:00"),
+    weeklyReviewCron: z.string().default("sun 18:00"),
+    goalDriftCron: z.string().default("wed 18:00"),
     backupIntervalHours: z.number().min(1).default(24),
     gcIntervalHours: z.number().min(1).default(1),
     webFetch: z.boolean().default(true),
@@ -276,6 +285,10 @@ export async function loadConfig(configPath?: string): Promise<Config> {
     throw new Error("Invalid configuration:\n  telegram.token: Required unless mode is 'cli-only'");
   }
 
+  if (config.telegram.useWebhook && !config.telegram.webhookSecret) {
+    throw new Error("Invalid configuration:\n  telegram.webhookSecret: Required when webhook mode is enabled");
+  }
+
   const projectRoot = process.cwd();
   config.workspace = resolvePath(config.workspace, projectRoot);
   config.soul.path = resolvePath(config.soul.path, projectRoot);
@@ -322,6 +335,7 @@ export async function persistConfig(config: Config): Promise<void> {
   serializable.timeouts = config.timeouts;
   serializable.scheduler = { timezone: config.scheduler.timezone };
   serializable.proactive = { tickIntervalMs: config.proactive.tickIntervalMs };
+  serializable.autonomy = config.autonomy;
   serializable.features = {
     scheduler: config.features.scheduler,
     debug: config.features.debug,
@@ -329,6 +343,8 @@ export async function persistConfig(config: Config): Promise<void> {
     messageRetentionDays: config.features.messageRetentionDays,
     skillDiscoveryCron: config.features.skillDiscoveryCron,
     dailyBriefingCron: config.features.dailyBriefingCron,
+    weeklyReviewCron: config.features.weeklyReviewCron,
+    goalDriftCron: config.features.goalDriftCron,
     backupIntervalHours: config.features.backupIntervalHours,
     gcIntervalHours: config.features.gcIntervalHours,
     webFetch: config.features.webFetch,

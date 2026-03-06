@@ -50,6 +50,14 @@ export async function bootMcp(config: Config, tools: ToolSet): Promise<McpEntry[
       const { client, toolKeys } = await connectMcpServer(server, tools, shouldNamespace);
       mcpClients.push({ name: server.name, server, client, reconnecting: false, lastSuccess: Date.now() });
       log("boot", `MCP: ${server.name} (${toolKeys.length} tools${shouldNamespace ? ", namespaced" : ""})`);
+      const hasBrowserSurface = toolKeys.some((key) => /browser|playwright|puppeteer|computer/i.test(key));
+      if (hasBrowserSurface) {
+        if (config.autonomy.allowBrowserAutomation) {
+          log("boot", `MCP: ${server.name} exposes browser/computer-use capabilities`);
+        } else {
+          logWarn("boot", `MCP: ${server.name} exposes browser/computer-use tools, but autonomy.allowBrowserAutomation is disabled`);
+        }
+      }
     } catch (err) {
       logWarn("boot", `MCP: ${server.name} failed to connect: ${(err as Error).message}`);
     }

@@ -66,6 +66,19 @@ describe("loadConfig", () => {
     expect(config.features.gcIntervalHours).toBeGreaterThan(0);
     expect(typeof config.features.skillDiscoveryCron).toBe("string");
     expect(typeof config.features.dailyBriefingCron).toBe("string");
+    expect(typeof config.features.weeklyReviewCron).toBe("string");
+    expect(typeof config.features.goalDriftCron).toBe("string");
+  });
+
+  test("autonomy defaults are set", async () => {
+    process.env.KODA_MODE = "cli-only";
+    process.env.KODA_OPENROUTER_API_KEY = "test-key-for-validation";
+    const mod = await import("../config.js");
+    const config = await mod.loadConfig();
+    expect(config.autonomy.monthlyBudgetUsd).toBeGreaterThanOrEqual(0);
+    expect(config.autonomy.perPlanBudgetUsd).toBeGreaterThanOrEqual(0);
+    expect(["medium", "high"]).toContain(config.autonomy.approvalRiskLevel);
+    expect(typeof config.autonomy.allowBrowserAutomation).toBe("boolean");
   });
 
   test("telegram rate limit defaults are set", async () => {
@@ -89,10 +102,22 @@ describe("loadConfig", () => {
     process.env.KODA_MODE = "cli-only";
     process.env.KODA_OPENROUTER_API_KEY = "test-key";
     process.env.KODA_TELEGRAM_WEBHOOK_URL = "https://example.com/webhook";
+    process.env.KODA_TELEGRAM_WEBHOOK_SECRET = "secret";
     const mod = await import("../config.js");
     const config = await mod.loadConfig();
     expect(config.telegram.useWebhook).toBe(true);
     expect(config.telegram.webhookUrl).toBe("https://example.com/webhook");
+    delete process.env.KODA_TELEGRAM_WEBHOOK_URL;
+    delete process.env.KODA_TELEGRAM_WEBHOOK_SECRET;
+  });
+
+  test("webhook mode requires secret", async () => {
+    process.env.KODA_MODE = "cli-only";
+    process.env.KODA_OPENROUTER_API_KEY = "test-key";
+    process.env.KODA_TELEGRAM_WEBHOOK_URL = "https://example.com/webhook";
+    delete process.env.KODA_TELEGRAM_WEBHOOK_SECRET;
+    const mod = await import("../config.js");
+    await expect(mod.loadConfig()).rejects.toThrow("webhookSecret");
     delete process.env.KODA_TELEGRAM_WEBHOOK_URL;
   });
 

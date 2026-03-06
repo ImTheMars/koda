@@ -17,6 +17,7 @@ import { messages as dbMessages, usage as dbUsage, toolOutcomes, summaries as db
 import { formatUserTime } from "./time.js";
 import { withToolContext, getPendingFiles } from "./tools/index.js";
 import type { UserProfile } from "./tools/memory.js";
+import { summarizeToolGovernance } from "./tools/autonomy.js";
 import { log, logInfo, logError } from "./log.js";
 import { sanitizeForPrompt, redactSensitiveArgs } from "./security.js";
 import { detectFollowup } from "./followup.js";
@@ -61,6 +62,10 @@ export interface AgentDeps {
   getProfile: (userId: string, query: string, sessionKey?: string) => Promise<UserProfile>;
   ingestConversation: (sessionKey: string, userId: string, messages: Array<{ role: string; content: string }>, chatId?: string) => Promise<void>;
   getSoulAcks?: () => string[];
+  /** Structured assessment summary for the user. */
+  getAssessmentSummary?: (userId: string) => Promise<string | null>;
+  /** Active durable plans for the user. */
+  getActivePlansSummary?: (userId: string) => Promise<string | null>;
   /** Fetch project memory profile for group chats. */
   getProjectMemories?: (chatId: string, query: string) => Promise<{ static: string[]; memories: string[] }>;
   /** Get active members for a group chat (used in system prompt). */
@@ -175,6 +180,9 @@ function buildSystemPrompt(deps: {
   hasWebFetch: boolean;
   hasHttpRequest: boolean;
   hasAnalyzeData: boolean;
+  assessmentSummary?: string | null;
+  activePlansSummary?: string | null;
+  toolGovernanceSummary?: string | null;
   knownIssues?: string[];
   /** Group chat context (omit for private chats). */
   groupContext?: {
@@ -229,9 +237,12 @@ rules:
   parts.push(`## tool use
 use tools when the user asks you to actually do something (not just chat).
 - memory: use remember to store facts, recall to look them up, deleteMemory when they ask to forget/remove something
+- assessment: use upsertGoal, logObservation, createIntervention, and storeReview to build a durable evidence-backed model of the user
 - files: use readFile/writeFile/listFiles for workspace file tasks
 - code/commands: use runSandboxed for shell commands or script execution
 - reminders/scheduling: use createReminder/createRecurringTask/listTasks/deleteTask
+- durable work: use createPlanRecord/getPlan/updatePlanStep/listPlans for hard or multi-step tasks that should survive across sessions
+- verification: use verifyOutcome before claiming that an important file, reminder, URL, or plan result is complete
 - multi-step requests: chain multiple tools in sequence and briefly summarize what happened
 - if runSandboxed succeeds, include the actual command output (stdout/stderr) in your reply instead of guessing
 if a tool fails or isn't available, say that clearly and continue with the best fallback.
@@ -248,8 +259,23 @@ if a tool fails or isn't available, say that clearly and continue with the best 
 
   if (deps.soulPrompt) parts.push(deps.soulPrompt);
 
+  parts.push(`## assessment mindset
+- act like an evidence-based operator and assessor, not just a conversational helper
+- separate observed facts, user claims, and your inferences
+- track contradictions instead of smoothing them over
+- prefer specific next actions over generic encouragement
+- when the user asks for guidance, assess patterns, constraints, and likely leverage points`);
+
   if (deps.contextPrompt) {
     parts.push(`## Project Context\n${deps.contextPrompt}`);
+  }
+
+  if (deps.assessmentSummary) {
+    parts.push(`## structured assessment state\n${deps.assessmentSummary}`);
+  }
+
+  if (deps.activePlansSummary) {
+    parts.push(`## active durable plans\n${deps.activePlansSummary}`);
   }
 
   if (deps.isProfileDegraded) {
@@ -300,6 +326,22 @@ for factual comparisons, current topics, benchmarks, and "pros/cons" requests:
 - avoid exact numbers unless they came from tool results
 - if sources disagree or you're unsure, say that clearly
 - do not start with local/meta tools like readFile/listFiles/skills unless the user asked about local files/skills or skills`);
+
+  parts.push(`## durable execution
+for requests that are long-horizon, high-impact, or clearly multi-step:
+- create or update a durable plan before doing the work
+- make the success criteria and verification strategy explicit
+- keep plan steps concrete and independently verifiable
+- after each meaningful action, update the relevant plan step
+- if a step fails, mark it blocked or failed and explain the blocker instead of pretending the plan is still healthy`);
+
+  if (deps.toolGovernanceSummary) {
+    parts.push(`## autonomy governance
+before using medium/high-risk tools, check whether the action is reversible and what verification it requires.
+for high-risk actions, ask for approval unless the user has already clearly authorized the specific action.
+
+${deps.toolGovernanceSummary}`);
+  }
 
   if (deps.tier !== "fast") {
     parts.push(`## Background research
@@ -376,13 +418,21 @@ async function buildAgentContext(deps: AgentDeps, input: AgentInput, tier: Tier,
   const isGroup = input.chatType === "group";
   const query = skipQuery ? "" : input.content;
 
-  const promises: [Promise<UserProfile>, Promise<string | null>, Promise<{ static: string[]; memories: string[] } | null>] = [
+  const promises: [
+    Promise<UserProfile>,
+    Promise<string | null>,
+    Promise<{ static: string[]; memories: string[] } | null>,
+    Promise<string | null>,
+    Promise<string | null>,
+  ] = [
     deps.getProfile(input.senderId, query, input.sessionKey),
     tier === "fast" ? Promise.resolve(null) : deps.getSkillsSummary(),
     isGroup && deps.getProjectMemories ? deps.getProjectMemories(input.chatId, query) : Promise.resolve(null),
+    deps.getAssessmentSummary ? deps.getAssessmentSummary(input.senderId) : Promise.resolve(null),
+    deps.getActivePlansSummary ? deps.getActivePlansSummary(input.senderId) : Promise.resolve(null),
   ];
 
-  const [profile, skillsSummary, projectProfile] = await Promise.all(promises);
+  const [profile, skillsSummary, projectProfile, assessmentSummary, activePlansSummary] = await Promise.all(promises);
 
   // Gather known issues from tool outcome learning
   let knownIssues: string[] | undefined;
@@ -419,6 +469,9 @@ async function buildAgentContext(deps: AgentDeps, input: AgentInput, tier: Tier,
     hasWebFetch: "fetchUrl" in deps.tools,
     hasHttpRequest: "httpRequest" in deps.tools,
     hasAnalyzeData: "analyzeData" in deps.tools,
+    assessmentSummary,
+    activePlansSummary,
+    toolGovernanceSummary: summarizeToolGovernance(Object.keys(deps.tools)),
     knownIssues,
     groupContext,
   });

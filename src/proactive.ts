@@ -5,7 +5,7 @@
  */
 
 import type { Config } from "./config.js";
-import { tasks as dbTasks, messages as dbMessages } from "./db.js";
+import { tasks as dbTasks, messages as dbMessages, plans as dbPlans } from "./db.js";
 import { parseCronNext } from "./time.js";
 import { log, logError } from "./log.js";
 
@@ -45,6 +45,22 @@ export interface ProactiveDeps {
 export function startProactive(deps: ProactiveDeps): { stop: () => void } {
   const { config } = deps;
   let booted = false;
+
+  const buildPlanPrompt = (plan: ReturnType<typeof dbPlans.getNextRunnable>[number]): string => {
+    const step = plan.nextStep;
+    const base = [
+      `[plan continuation] continue the durable plan "${plan.title}" (${plan.id}).`,
+      `goal: ${plan.goal}`,
+      plan.successCriteria ? `success criteria: ${plan.successCriteria}` : null,
+      plan.verificationStrategy ? `verification strategy: ${plan.verificationStrategy}` : null,
+      step ? `next step: ${step.title}` : "there is no pending step left; verify the plan and close it if complete.",
+      step?.instructions ? `step instructions: ${step.instructions}` : null,
+      step?.expectedArtifact ? `expected artifact: ${step.expectedArtifact}` : null,
+      step?.verificationHint ? `verification hint: ${step.verificationHint}` : null,
+      `use the durable planning and verification tools. update the plan step state before you finish.`,
+    ].filter(Boolean);
+    return base.join("\n");
+  };
 
   // Catch-up: fire missed one-shot reminders on startup (skip stale ones)
   const catchUp = async () => {
@@ -116,9 +132,46 @@ export function startProactive(deps: ProactiveDeps): { stop: () => void } {
     log("proactive", "tick");
   };
 
+  const checkPlans = async () => {
+    if (!booted) return;
+    const runnablePlans = dbPlans.getNextRunnable(config.autonomy.maxConcurrentPlans);
+    for (const plan of runnablePlans) {
+      if (!plan.nextStep) {
+        dbPlans.setStatus(plan.id, "done", { nextRunAt: null });
+        continue;
+      }
+
+      const nextRunAt = new Date(Date.now() + 15 * 60_000).toISOString();
+      dbPlans.updateStep(plan.id, plan.nextStep.id, {
+        status: "in_progress",
+        notes: "scheduler dispatched continuation run",
+      });
+      dbPlans.markRun(plan.id, nextRunAt);
+
+      deps.runAgent({
+        content: buildPlanPrompt(plan),
+        senderId: plan.userId,
+        chatId: plan.chatId,
+        channel: deps.defaultChannel,
+        sessionKey: `${deps.defaultChannel}_${plan.chatId}`,
+        source: "scheduler",
+      }).catch((err) => {
+        logError("proactive", "Plan continuation failed", err);
+        dbPlans.updateStep(plan.id, plan.nextStep!.id, {
+          status: "blocked",
+          lastError: (err as Error).message,
+          notes: "scheduler continuation failed",
+        });
+      });
+    }
+  };
+
   const tick = async () => {
     // Reminders ALWAYS fire — user explicitly scheduled them.
-    if (config.features.scheduler) await checkTasks();
+    if (config.features.scheduler) {
+      await checkTasks();
+      await checkPlans();
+    }
   };
 
   // Register module-level nudge so schedule tools can trigger precise checks

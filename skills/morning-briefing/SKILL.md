@@ -1,11 +1,11 @@
 ---
 name: morning-briefing
-description: On-demand morning briefing with tasks, schedule, and weather
+description: On-demand briefing with goals, schedule, and active plans
 ---
 
 # Morning Briefing
 
-Assemble a concise daily briefing when the user asks for it.
+Assemble a concise daily briefing that surfaces what matters most today.
 
 ## When to Use
 
@@ -14,25 +14,22 @@ Assemble a concise daily briefing when the user asks for it.
 
 ## Procedure
 
-1. **Read HEARTBEAT.md** using readFile to get pending tasks
-2. **List scheduled tasks** using listTasks for upcoming reminders
-3. **Recall context** using searchMemories with queries like "plans", "goals", "priorities"
-4. **Get weather** using webSearch for the user's local weather forecast
+1. **Inspect structured state** using `assessmentSnapshot`, `listGoals`, and `listPlans`
+2. **List scheduled tasks** using `listTasks` for upcoming reminders and recurring work
+3. **Recall context** using `recall` if you need recent personal context that is not in the structured state
+4. **Use webSearch only if the user explicitly wants live context** like weather or news
 5. **Assemble the briefing** in this format:
 
 ```
-good morning! here's your briefing.
+good morning. here's the real picture for today.
 
-tasks:
-- [pending items from HEARTBEAT.md]
+focus:
+- [top goals, critical plans, or overdue follow-through]
 
 upcoming:
 - [next reminders and scheduled tasks]
 
-weather:
-- [brief forecast]
-
-[optional: anything relevant from memory]
+[optional: one pattern or risk to watch today]
 ```
 
 ## Guidelines
@@ -42,3 +39,4 @@ weather:
 - Use the current time from your system prompt for context (morning vs afternoon vs evening)
 - If it's not morning, adjust the greeting ("good afternoon", "good evening")
 - Don't search for news unless the user specifically asks
+- Prefer the most important constraint, risk, or leverage point over a generic motivational message

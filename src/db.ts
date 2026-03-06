@@ -1,7 +1,7 @@
 /**
  * SQLite persistence layer via bun:sqlite.
  *
- * Tables: messages, tasks, usage, state, subagents
+ * Tables: messages, tasks, usage, state, subagents, assessment_*, plans
  * WAL mode for concurrent reads.
  */
 
@@ -16,7 +16,7 @@ let stmtAppendMessage: ReturnType<Database["prepare"]> | null = null;
 let stmtGetHistory: ReturnType<Database["prepare"]> | null = null;
 let stmtTrackUsage: ReturnType<Database["prepare"]> | null = null;
 
-const SCHEMA_VERSION = 6;
+const SCHEMA_VERSION = 8;
 
 export function initDb(dbPath: string): Database {
   currentDbPath = dbPath;
@@ -84,6 +84,103 @@ export function initDb(dbPath: string): Database {
     );
     CREATE INDEX IF NOT EXISTS idx_subagents_name ON subagents(name, updated_at DESC);
     CREATE INDEX IF NOT EXISTS idx_subagents_updated ON subagents(updated_at DESC);
+
+    CREATE TABLE IF NOT EXISTS assessment_goals (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      domain TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'paused', 'done', 'cancelled')),
+      target_date TEXT,
+      success_criteria TEXT,
+      confidence REAL NOT NULL DEFAULT 0.5,
+      notes TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_assessment_goals_user ON assessment_goals(user_id, status, updated_at DESC);
+
+    CREATE TABLE IF NOT EXISTS assessment_observations (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      domain TEXT NOT NULL,
+      statement TEXT NOT NULL,
+      source TEXT NOT NULL,
+      evidence_type TEXT NOT NULL,
+      confidence REAL NOT NULL DEFAULT 0.5,
+      contradicts TEXT,
+      observed_at TEXT NOT NULL,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_assessment_observations_user ON assessment_observations(user_id, observed_at DESC);
+
+    CREATE TABLE IF NOT EXISTS assessment_interventions (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      goal_id TEXT,
+      recommendation TEXT NOT NULL,
+      rationale TEXT,
+      status TEXT NOT NULL DEFAULT 'planned' CHECK(status IN ('planned', 'active', 'done', 'abandoned')),
+      start_date TEXT,
+      follow_up_at TEXT,
+      outcome TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY(goal_id) REFERENCES assessment_goals(id) ON DELETE SET NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_assessment_interventions_user ON assessment_interventions(user_id, status, updated_at DESC);
+
+    CREATE TABLE IF NOT EXISTS assessment_reviews (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      period_start TEXT NOT NULL,
+      period_end TEXT NOT NULL,
+      findings TEXT NOT NULL,
+      risks TEXT,
+      wins TEXT,
+      next_actions TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_assessment_reviews_user ON assessment_reviews(user_id, created_at DESC);
+
+    CREATE TABLE IF NOT EXISTS plans (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      chat_id TEXT NOT NULL,
+      title TEXT NOT NULL,
+      goal TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft', 'active', 'blocked', 'done', 'cancelled')),
+      success_criteria TEXT,
+      verification_strategy TEXT,
+      risk_level TEXT NOT NULL DEFAULT 'medium' CHECK(risk_level IN ('low', 'medium', 'high')),
+      requires_approval INTEGER NOT NULL DEFAULT 0,
+      approved_at TEXT,
+      blocked_reason TEXT,
+      next_run_at TEXT,
+      last_run_at TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_plans_user ON plans(user_id, status, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_plans_run ON plans(status, next_run_at);
+
+    CREATE TABLE IF NOT EXISTS plan_steps (
+      id TEXT PRIMARY KEY,
+      plan_id TEXT NOT NULL,
+      step_order INTEGER NOT NULL,
+      title TEXT NOT NULL,
+      instructions TEXT,
+      status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'in_progress', 'done', 'blocked', 'failed', 'cancelled')),
+      expected_artifact TEXT,
+      verification_hint TEXT,
+      assigned_agent TEXT,
+      notes TEXT,
+      last_error TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now')),
+      updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+      FOREIGN KEY(plan_id) REFERENCES plans(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_plan_steps_plan ON plan_steps(plan_id, step_order);
 
   `);
 
@@ -199,6 +296,115 @@ function runMigrations(database: Database): void {
     `);
     database.run("INSERT OR REPLACE INTO state (key, value, updated_at) VALUES ('schema_version', '6', datetime('now'))");
     log("db", "Migrated to schema version 6");
+  }
+
+  if (currentVersion < 7) {
+    database.exec(`
+      CREATE TABLE IF NOT EXISTS assessment_goals (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        domain TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active', 'paused', 'done', 'cancelled')),
+        target_date TEXT,
+        success_criteria TEXT,
+        confidence REAL NOT NULL DEFAULT 0.5,
+        notes TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_assessment_goals_user ON assessment_goals(user_id, status, updated_at DESC);
+
+      CREATE TABLE IF NOT EXISTS assessment_observations (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        domain TEXT NOT NULL,
+        statement TEXT NOT NULL,
+        source TEXT NOT NULL,
+        evidence_type TEXT NOT NULL,
+        confidence REAL NOT NULL DEFAULT 0.5,
+        contradicts TEXT,
+        observed_at TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_assessment_observations_user ON assessment_observations(user_id, observed_at DESC);
+
+      CREATE TABLE IF NOT EXISTS assessment_interventions (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        goal_id TEXT,
+        recommendation TEXT NOT NULL,
+        rationale TEXT,
+        status TEXT NOT NULL DEFAULT 'planned' CHECK(status IN ('planned', 'active', 'done', 'abandoned')),
+        start_date TEXT,
+        follow_up_at TEXT,
+        outcome TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY(goal_id) REFERENCES assessment_goals(id) ON DELETE SET NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_assessment_interventions_user ON assessment_interventions(user_id, status, updated_at DESC);
+
+      CREATE TABLE IF NOT EXISTS assessment_reviews (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        period_start TEXT NOT NULL,
+        period_end TEXT NOT NULL,
+        findings TEXT NOT NULL,
+        risks TEXT,
+        wins TEXT,
+        next_actions TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_assessment_reviews_user ON assessment_reviews(user_id, created_at DESC);
+    `);
+    database.run("INSERT OR REPLACE INTO state (key, value, updated_at) VALUES ('schema_version', '7', datetime('now'))");
+    log("db", "Migrated to schema version 7");
+  }
+
+  if (currentVersion < 8) {
+    database.exec(`
+      CREATE TABLE IF NOT EXISTS plans (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        chat_id TEXT NOT NULL,
+        title TEXT NOT NULL,
+        goal TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft', 'active', 'blocked', 'done', 'cancelled')),
+        success_criteria TEXT,
+        verification_strategy TEXT,
+        risk_level TEXT NOT NULL DEFAULT 'medium' CHECK(risk_level IN ('low', 'medium', 'high')),
+        requires_approval INTEGER NOT NULL DEFAULT 0,
+        approved_at TEXT,
+        blocked_reason TEXT,
+        next_run_at TEXT,
+        last_run_at TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+      CREATE INDEX IF NOT EXISTS idx_plans_user ON plans(user_id, status, updated_at DESC);
+      CREATE INDEX IF NOT EXISTS idx_plans_run ON plans(status, next_run_at);
+
+      CREATE TABLE IF NOT EXISTS plan_steps (
+        id TEXT PRIMARY KEY,
+        plan_id TEXT NOT NULL,
+        step_order INTEGER NOT NULL,
+        title TEXT NOT NULL,
+        instructions TEXT,
+        status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'in_progress', 'done', 'blocked', 'failed', 'cancelled')),
+        expected_artifact TEXT,
+        verification_hint TEXT,
+        assigned_agent TEXT,
+        notes TEXT,
+        last_error TEXT,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        FOREIGN KEY(plan_id) REFERENCES plans(id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_plan_steps_plan ON plan_steps(plan_id, step_order);
+    `);
+    database.run("INSERT OR REPLACE INTO state (key, value, updated_at) VALUES ('schema_version', '8', datetime('now'))");
+    log("db", "Migrated to schema version 8");
   }
 }
 
@@ -620,5 +826,417 @@ export const chatMembers = {
     return getDb()
       .query("SELECT chat_id as chatId, user_id as userId, last_active as lastActive FROM chat_members WHERE chat_id = ? ORDER BY last_active DESC")
       .all(chatId) as ChatMemberRow[];
+  },
+};
+
+// --- Assessment State ---
+
+export interface GoalRow {
+  id: string;
+  userId: string;
+  title: string;
+  domain: string;
+  status: "active" | "paused" | "done" | "cancelled";
+  targetDate: string | null;
+  successCriteria: string | null;
+  confidence: number;
+  notes: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ObservationRow {
+  id: string;
+  userId: string;
+  domain: string;
+  statement: string;
+  source: string;
+  evidenceType: string;
+  confidence: number;
+  contradicts: string | null;
+  observedAt: string;
+  createdAt: string;
+}
+
+export interface InterventionRow {
+  id: string;
+  userId: string;
+  goalId: string | null;
+  recommendation: string;
+  rationale: string | null;
+  status: "planned" | "active" | "done" | "abandoned";
+  startDate: string | null;
+  followUpAt: string | null;
+  outcome: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface ReviewRow {
+  id: string;
+  userId: string;
+  periodStart: string;
+  periodEnd: string;
+  findings: string;
+  risks: string | null;
+  wins: string | null;
+  nextActions: string | null;
+  createdAt: string;
+}
+
+export const assessment = {
+  upsertGoal(input: {
+    id: string;
+    userId: string;
+    title: string;
+    domain: string;
+    status?: GoalRow["status"];
+    targetDate?: string | null;
+    successCriteria?: string | null;
+    confidence?: number;
+    notes?: string | null;
+  }): void {
+    getDb().run(
+      `INSERT INTO assessment_goals (id, user_id, title, domain, status, target_date, success_criteria, confidence, notes, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))
+       ON CONFLICT(id) DO UPDATE SET
+         title = excluded.title,
+         domain = excluded.domain,
+         status = excluded.status,
+         target_date = excluded.target_date,
+         success_criteria = excluded.success_criteria,
+         confidence = excluded.confidence,
+         notes = excluded.notes,
+         updated_at = datetime('now')`,
+      [
+        input.id,
+        input.userId,
+        input.title,
+        input.domain,
+        input.status ?? "active",
+        input.targetDate ?? null,
+        input.successCriteria ?? null,
+        input.confidence ?? 0.5,
+        input.notes ?? null,
+      ],
+    );
+  },
+
+  listGoals(userId: string, status?: GoalRow["status"]): GoalRow[] {
+    const query = status
+      ? "SELECT id, user_id as userId, title, domain, status, target_date as targetDate, success_criteria as successCriteria, confidence, notes, created_at as createdAt, updated_at as updatedAt FROM assessment_goals WHERE user_id = ? AND status = ? ORDER BY updated_at DESC"
+      : "SELECT id, user_id as userId, title, domain, status, target_date as targetDate, success_criteria as successCriteria, confidence, notes, created_at as createdAt, updated_at as updatedAt FROM assessment_goals WHERE user_id = ? ORDER BY updated_at DESC";
+    return status
+      ? getDb().query(query).all(userId, status) as GoalRow[]
+      : getDb().query(query).all(userId) as GoalRow[];
+  },
+
+  addObservation(input: {
+    id: string;
+    userId: string;
+    domain: string;
+    statement: string;
+    source: string;
+    evidenceType: string;
+    confidence?: number;
+    contradicts?: string | null;
+    observedAt: string;
+  }): void {
+    getDb().run(
+      `INSERT INTO assessment_observations (id, user_id, domain, statement, source, evidence_type, confidence, contradicts, observed_at, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`,
+      [
+        input.id,
+        input.userId,
+        input.domain,
+        input.statement,
+        input.source,
+        input.evidenceType,
+        input.confidence ?? 0.5,
+        input.contradicts ?? null,
+        input.observedAt,
+      ],
+    );
+  },
+
+  listObservations(userId: string, limit = 25): ObservationRow[] {
+    return getDb()
+      .query("SELECT id, user_id as userId, domain, statement, source, evidence_type as evidenceType, confidence, contradicts, observed_at as observedAt, created_at as createdAt FROM assessment_observations WHERE user_id = ? ORDER BY observed_at DESC, created_at DESC LIMIT ?")
+      .all(userId, limit) as ObservationRow[];
+  },
+
+  addIntervention(input: {
+    id: string;
+    userId: string;
+    goalId?: string | null;
+    recommendation: string;
+    rationale?: string | null;
+    status?: InterventionRow["status"];
+    startDate?: string | null;
+    followUpAt?: string | null;
+    outcome?: string | null;
+  }): void {
+    getDb().run(
+      `INSERT INTO assessment_interventions (id, user_id, goal_id, recommendation, rationale, status, start_date, follow_up_at, outcome, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))`,
+      [
+        input.id,
+        input.userId,
+        input.goalId ?? null,
+        input.recommendation,
+        input.rationale ?? null,
+        input.status ?? "planned",
+        input.startDate ?? null,
+        input.followUpAt ?? null,
+        input.outcome ?? null,
+      ],
+    );
+  },
+
+  listInterventions(userId: string, status?: InterventionRow["status"]): InterventionRow[] {
+    const query = status
+      ? "SELECT id, user_id as userId, goal_id as goalId, recommendation, rationale, status, start_date as startDate, follow_up_at as followUpAt, outcome, created_at as createdAt, updated_at as updatedAt FROM assessment_interventions WHERE user_id = ? AND status = ? ORDER BY updated_at DESC"
+      : "SELECT id, user_id as userId, goal_id as goalId, recommendation, rationale, status, start_date as startDate, follow_up_at as followUpAt, outcome, created_at as createdAt, updated_at as updatedAt FROM assessment_interventions WHERE user_id = ? ORDER BY updated_at DESC";
+    return status
+      ? getDb().query(query).all(userId, status) as InterventionRow[]
+      : getDb().query(query).all(userId) as InterventionRow[];
+  },
+
+  addReview(input: {
+    id: string;
+    userId: string;
+    periodStart: string;
+    periodEnd: string;
+    findings: string;
+    risks?: string | null;
+    wins?: string | null;
+    nextActions?: string | null;
+  }): void {
+    getDb().run(
+      `INSERT INTO assessment_reviews (id, user_id, period_start, period_end, findings, risks, wins, next_actions, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))`,
+      [input.id, input.userId, input.periodStart, input.periodEnd, input.findings, input.risks ?? null, input.wins ?? null, input.nextActions ?? null],
+    );
+  },
+
+  listReviews(userId: string, limit = 10): ReviewRow[] {
+    return getDb()
+      .query("SELECT id, user_id as userId, period_start as periodStart, period_end as periodEnd, findings, risks, wins, next_actions as nextActions, created_at as createdAt FROM assessment_reviews WHERE user_id = ? ORDER BY created_at DESC LIMIT ?")
+      .all(userId, limit) as ReviewRow[];
+  },
+
+  buildSummary(userId: string): {
+    goals: GoalRow[];
+    observations: ObservationRow[];
+    interventions: InterventionRow[];
+    reviews: ReviewRow[];
+  } {
+    return {
+      goals: assessment.listGoals(userId).slice(0, 5),
+      observations: assessment.listObservations(userId, 6),
+      interventions: assessment.listInterventions(userId).slice(0, 5),
+      reviews: assessment.listReviews(userId, 3),
+    };
+  },
+};
+
+// --- Plans ---
+
+export interface PlanRow {
+  id: string;
+  userId: string;
+  chatId: string;
+  title: string;
+  goal: string;
+  status: "draft" | "active" | "blocked" | "done" | "cancelled";
+  successCriteria: string | null;
+  verificationStrategy: string | null;
+  riskLevel: "low" | "medium" | "high";
+  requiresApproval: boolean;
+  approvedAt: string | null;
+  blockedReason: string | null;
+  nextRunAt: string | null;
+  lastRunAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PlanStepRow {
+  id: string;
+  planId: string;
+  stepOrder: number;
+  title: string;
+  instructions: string | null;
+  status: "pending" | "in_progress" | "done" | "blocked" | "failed" | "cancelled";
+  expectedArtifact: string | null;
+  verificationHint: string | null;
+  assignedAgent: string | null;
+  notes: string | null;
+  lastError: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export const plans = {
+  create(input: {
+    id: string;
+    userId: string;
+    chatId: string;
+    title: string;
+    goal: string;
+    status?: PlanRow["status"];
+    successCriteria?: string | null;
+    verificationStrategy?: string | null;
+    riskLevel?: PlanRow["riskLevel"];
+    requiresApproval?: boolean;
+    approvedAt?: string | null;
+    blockedReason?: string | null;
+    nextRunAt?: string | null;
+  }): void {
+    getDb().run(
+      `INSERT INTO plans (id, user_id, chat_id, title, goal, status, success_criteria, verification_strategy, risk_level, requires_approval, approved_at, blocked_reason, next_run_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'), datetime('now'))`,
+      [
+        input.id,
+        input.userId,
+        input.chatId,
+        input.title,
+        input.goal,
+        input.status ?? "draft",
+        input.successCriteria ?? null,
+        input.verificationStrategy ?? null,
+        input.riskLevel ?? "medium",
+        input.requiresApproval ? 1 : 0,
+        input.approvedAt ?? null,
+        input.blockedReason ?? null,
+        input.nextRunAt ?? null,
+      ],
+    );
+  },
+
+  addSteps(planId: string, steps: Array<{
+    id: string;
+    title: string;
+    instructions?: string | null;
+    expectedArtifact?: string | null;
+    verificationHint?: string | null;
+    assignedAgent?: string | null;
+  }>): void {
+    const d = getDb();
+    const stmt = d.prepare(
+      `INSERT INTO plan_steps (id, plan_id, step_order, title, instructions, expected_artifact, verification_hint, assigned_agent, status, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', datetime('now'), datetime('now'))`,
+    );
+    const tx = d.transaction(() => {
+      steps.forEach((step, index) => {
+        stmt.run(step.id, planId, index + 1, step.title, step.instructions ?? null, step.expectedArtifact ?? null, step.verificationHint ?? null, step.assignedAgent ?? null);
+      });
+    });
+    tx();
+  },
+
+  listByUser(userId: string, status?: PlanRow["status"]): PlanRow[] {
+    const query = status
+      ? "SELECT id, user_id as userId, chat_id as chatId, title, goal, status, success_criteria as successCriteria, verification_strategy as verificationStrategy, risk_level as riskLevel, requires_approval as requiresApproval, approved_at as approvedAt, blocked_reason as blockedReason, next_run_at as nextRunAt, last_run_at as lastRunAt, created_at as createdAt, updated_at as updatedAt FROM plans WHERE user_id = ? AND status = ? ORDER BY updated_at DESC"
+      : "SELECT id, user_id as userId, chat_id as chatId, title, goal, status, success_criteria as successCriteria, verification_strategy as verificationStrategy, risk_level as riskLevel, requires_approval as requiresApproval, approved_at as approvedAt, blocked_reason as blockedReason, next_run_at as nextRunAt, last_run_at as lastRunAt, created_at as createdAt, updated_at as updatedAt FROM plans WHERE user_id = ? ORDER BY updated_at DESC";
+    const rows = status
+      ? getDb().query(query).all(userId, status) as Array<Omit<PlanRow, "requiresApproval"> & { requiresApproval: number }>
+      : getDb().query(query).all(userId) as Array<Omit<PlanRow, "requiresApproval"> & { requiresApproval: number }>;
+    return rows.map((row) => ({ ...row, requiresApproval: row.requiresApproval === 1 }));
+  },
+
+  get(planId: string): (PlanRow & { steps: PlanStepRow[] }) | null {
+    const row = getDb()
+      .query("SELECT id, user_id as userId, chat_id as chatId, title, goal, status, success_criteria as successCriteria, verification_strategy as verificationStrategy, risk_level as riskLevel, requires_approval as requiresApproval, approved_at as approvedAt, blocked_reason as blockedReason, next_run_at as nextRunAt, last_run_at as lastRunAt, created_at as createdAt, updated_at as updatedAt FROM plans WHERE id = ?")
+      .get(planId) as (Omit<PlanRow, "requiresApproval"> & { requiresApproval: number }) | null;
+    if (!row) return null;
+    return {
+      ...row,
+      requiresApproval: row.requiresApproval === 1,
+      steps: plans.listSteps(planId),
+    };
+  },
+
+  listSteps(planId: string): PlanStepRow[] {
+    return getDb()
+      .query("SELECT id, plan_id as planId, step_order as stepOrder, title, instructions, status, expected_artifact as expectedArtifact, verification_hint as verificationHint, assigned_agent as assignedAgent, notes, last_error as lastError, created_at as createdAt, updated_at as updatedAt FROM plan_steps WHERE plan_id = ? ORDER BY step_order ASC")
+      .all(planId) as PlanStepRow[];
+  },
+
+  getNextRunnable(limit = 5): Array<PlanRow & { nextStep: PlanStepRow | null }> {
+    const rows = getDb()
+      .query(`SELECT id FROM plans
+              WHERE status = 'active'
+                AND (requires_approval = 0 OR approved_at IS NOT NULL)
+                AND next_run_at IS NOT NULL
+                AND datetime(next_run_at) <= datetime('now')
+              ORDER BY next_run_at ASC
+              LIMIT ?`)
+      .all(limit) as Array<{ id: string }>;
+    return rows.map((row) => {
+      const plan = plans.get(row.id);
+      if (!plan) throw new Error(`Plan ${row.id} missing`);
+      const nextStep = plan.steps.find((step) => step.status === "pending" || step.status === "in_progress") ?? null;
+      return { ...plan, nextStep };
+    });
+  },
+
+  setStatus(planId: string, status: PlanRow["status"], opts?: {
+    blockedReason?: string | null;
+    approvedAt?: string | null;
+    nextRunAt?: string | null;
+  }): void {
+    getDb().run(
+      `UPDATE plans
+       SET status = ?, blocked_reason = ?, approved_at = COALESCE(?, approved_at), next_run_at = ?, updated_at = datetime('now')
+       WHERE id = ?`,
+      [status, opts?.blockedReason ?? null, opts?.approvedAt ?? null, opts?.nextRunAt ?? null, planId],
+    );
+  },
+
+  updateStep(planId: string, stepId: string, update: {
+    status?: PlanStepRow["status"];
+    notes?: string | null;
+    lastError?: string | null;
+    assignedAgent?: string | null;
+  }): void {
+    const existing = getDb()
+      .query("SELECT id FROM plan_steps WHERE id = ? AND plan_id = ?")
+      .get(stepId, planId) as { id: string } | null;
+    if (!existing) return;
+    getDb().run(
+      `UPDATE plan_steps
+       SET status = COALESCE(?, status),
+           notes = COALESCE(?, notes),
+           last_error = COALESCE(?, last_error),
+           assigned_agent = COALESCE(?, assigned_agent),
+           updated_at = datetime('now')
+       WHERE id = ? AND plan_id = ?`,
+      [update.status ?? null, update.notes ?? null, update.lastError ?? null, update.assignedAgent ?? null, stepId, planId],
+    );
+    plans.refreshProgress(planId);
+  },
+
+  markRun(planId: string, nextRunAt?: string | null): void {
+    getDb().run(
+      "UPDATE plans SET last_run_at = datetime('now'), next_run_at = ?, updated_at = datetime('now') WHERE id = ?",
+      [nextRunAt ?? null, planId],
+    );
+  },
+
+  refreshProgress(planId: string): void {
+    const steps = plans.listSteps(planId);
+    if (steps.length === 0) return;
+    const hasFailed = steps.some((step) => step.status === "failed" || step.status === "blocked");
+    const allDone = steps.every((step) => step.status === "done" || step.status === "cancelled");
+    if (allDone) {
+      plans.setStatus(planId, "done", { nextRunAt: null });
+      return;
+    }
+    if (hasFailed) {
+      plans.setStatus(planId, "blocked", { blockedReason: "a plan step is blocked or failed", nextRunAt: null });
+      return;
+    }
+    plans.setStatus(planId, "active", { nextRunAt: new Date().toISOString() });
   },
 };

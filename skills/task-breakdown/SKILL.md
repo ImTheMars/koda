@@ -21,12 +21,14 @@ Break down a large goal into concrete, schedulable subtasks.
    - Completable in one sitting (30 min to 2 hours)
    - Independently meaningful — delivers visible progress
 3. **Order by dependency** — what must happen first? what can be parallel?
-4. **Suggest a schedule** — map subtasks to reasonable dates/times based on:
+4. **Create a durable plan** — use `createPlanRecord` when the work should persist across sessions or needs verification
+5. **Suggest a schedule** — map subtasks to reasonable dates/times based on:
    - User's timezone and typical availability
    - Logical ordering and dependencies
    - Buffer time between related tasks
-5. **Offer to schedule** — ask if the user wants reminders created for each subtask
-6. **If confirmed**, use createReminder or createRecurringTask for each one
+6. **Offer to schedule** — ask if the user wants reminders created for each subtask
+7. **If confirmed**, use createReminder or createRecurringTask for each one
+8. **Track completion** — update durable plan steps as the work progresses and use `verifyOutcome` before marking important work done
 
 ## Guidelines
 
@@ -35,3 +37,4 @@ Break down a large goal into concrete, schedulable subtasks.
 - Include a "review progress" check-in task at the midpoint for longer plans
 - Don't over-schedule — leave breathing room
 - Adapt granularity to the user's experience level with the topic
+- When the task is high impact or likely to span multiple sessions, prefer a durable plan over a one-off checklist in chat

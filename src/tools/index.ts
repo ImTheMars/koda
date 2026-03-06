@@ -23,6 +23,7 @@ import { registerImageTools } from "./image.js";
 import { registerFileTools } from "./files.js";
 import { registerWebTools } from "./web.js";
 import { registerDataTools } from "./data.js";
+import { registerAutonomyTools } from "./autonomy.js";
 import { createComposioClient } from "../composio.js";
 
 interface ToolRuntimeContext {
@@ -86,6 +87,12 @@ export async function buildTools(deps: {
     }),
     ...registerFilesystemTools({ workspace }),
     ...registerSkillTools({ skillLoader, workspace, exaApiKey: config.exa.apiKey, githubToken: config.github?.token }),
+    ...registerAutonomyTools({
+      workspace,
+      getUserId: () => getToolContext().userId,
+      getChatId: () => getToolContext().chatId,
+      autonomy: config.autonomy,
+    }),
   };
 
   // Search (optional — needs Exa key)

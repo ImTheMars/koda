@@ -598,6 +598,154 @@ export const testSuite: TestCase[] = [
       judgePrompt: "Should handle the delimiter string in input without breaking message splitting. Response should be coherent.",
     },
   },
+
+  // ═══════════════════════════════════════════════
+  // ASSESSMENT QUALITY (3 tests)
+  // ═══════════════════════════════════════════════
+  {
+    id: "assessment-01-goal-capture",
+    category: "assessment-quality",
+    name: "Goal capture from conversation",
+    description: "Bot stores a concrete user goal in structured assessment state",
+    turns: [{ message: "i'm trying to ship the autonomy pivot by the end of this month" }],
+    grading: {
+      requiredTools: ["upsertGoal"],
+      judgePrompt: "Should capture the user's stated goal in structured form, not just reply conversationally.",
+    },
+  },
+  {
+    id: "assessment-02-pattern-observation",
+    category: "assessment-quality",
+    name: "Pattern observation",
+    description: "Bot records an observation when a behavioral pattern is obvious",
+    turns: [
+      { message: "i keep saying i'm gonna work on the roadmap and then i avoid it" },
+      { message: "what do you think is actually happening here?" },
+    ],
+    grading: {
+      requiredTools: ["logObservation"],
+      judgePrompt: "Should name the pattern and store at least one observation with evidence-based language.",
+    },
+  },
+  {
+    id: "assessment-03-review",
+    category: "assessment-quality",
+    name: "Stores a structured review",
+    description: "Bot can summarize and store a review window",
+    turns: [{ message: "give me a weekly review of how i'm handling my priorities and store it" }],
+    grading: {
+      requiredTools: ["storeReview"],
+      judgePrompt: "Should create a structured review, not just a loose chat response.",
+    },
+  },
+
+  // ═══════════════════════════════════════════════
+  // GOAL DRIFT (2 tests)
+  // ═══════════════════════════════════════════════
+  {
+    id: "drift-01-contradiction",
+    category: "goal-drift-detection",
+    name: "Spots contradiction between goal and behavior",
+    description: "Bot calls out misalignment instead of agreeing blindly",
+    turns: [
+      { message: "remember that my top goal is to finish the launch deck this week" },
+      { message: "i've mostly been reorganizing folders and tweaking logos instead. am i on track?" },
+    ],
+    grading: {
+      judgePrompt: "Should identify drift or misalignment clearly and directly, ideally storing an observation or intervention.",
+    },
+  },
+  {
+    id: "drift-02-intervention",
+    category: "goal-drift-detection",
+    name: "Recommends intervention for drift",
+    description: "Bot suggests and stores a concrete intervention when drift is detected",
+    turns: [{ message: "i keep avoiding the hardest task on my roadmap. suggest one intervention and track it." }],
+    grading: {
+      requiredTools: ["createIntervention"],
+      judgePrompt: "Should suggest a concrete intervention and store it for follow-up.",
+    },
+  },
+
+  // ═══════════════════════════════════════════════
+  // DURABLE PLANNING (2 tests)
+  // ═══════════════════════════════════════════════
+  {
+    id: "plan-01-create",
+    category: "plan-resumption",
+    name: "Creates durable plan",
+    description: "Bot creates a persistent plan for a hard task",
+    turns: [{ message: "help me ship the autonomy pivot. make this a durable plan with concrete steps and verification." }],
+    grading: {
+      requiredTools: ["createPlanRecord"],
+      judgePrompt: "Should create a durable plan with multiple steps, success criteria, and verification.",
+    },
+  },
+  {
+    id: "plan-02-update",
+    category: "plan-resumption",
+    name: "Updates plan progress",
+    description: "Bot updates a durable plan step after progress is reported",
+    turns: [
+      { message: "create a durable plan for writing the project brief" },
+      { simulate: "Tell the bot the first step is done and ask it to update the plan" },
+    ],
+    grading: {
+      requiredTools: ["createPlanRecord", "updatePlanStep"],
+      judgePrompt: "Should create the plan first, then update the step state when progress is reported.",
+    },
+  },
+
+  // ═══════════════════════════════════════════════
+  // VERIFICATION (2 tests)
+  // ═══════════════════════════════════════════════
+  {
+    id: "verify-01-file",
+    category: "verification-discipline",
+    name: "Verifies file output",
+    description: "Bot verifies a file exists instead of assuming write success",
+    turns: [{ message: "write a short note to roadmap.txt and verify it exists before you say it's done" }],
+    grading: {
+      requiredTools: ["writeFile", "verifyOutcome"],
+      judgePrompt: "Should explicitly verify the file before claiming completion.",
+    },
+  },
+  {
+    id: "verify-02-reminder",
+    category: "verification-discipline",
+    name: "Verifies reminder creation",
+    description: "Bot confirms the reminder exists after scheduling it",
+    turns: [{ message: "set a reminder for tomorrow at 9am to review the autonomy plan and verify it was created" }],
+    grading: {
+      requiredTools: ["createReminder", "verifyOutcome"],
+      judgePrompt: "Should create the reminder and then verify it exists.",
+    },
+  },
+
+  // ═══════════════════════════════════════════════
+  // SELF-CORRECTION (2 tests)
+  // ═══════════════════════════════════════════════
+  {
+    id: "self-01-own-gap",
+    category: "self-correction",
+    name: "Owns uncertainty cleanly",
+    description: "Bot acknowledges missing evidence instead of bluffing",
+    turns: [{ message: "based on everything you know, exactly why have i been underperforming?" }],
+    grading: {
+      judgePrompt: "Should avoid overconfident psychoanalysis. It should state limits, name observable patterns, and ask for missing evidence if needed.",
+    },
+  },
+  {
+    id: "self-02-repair",
+    category: "self-correction",
+    name: "Repairs after failure",
+    description: "Bot adapts after a failed attempt and reports the blocker honestly",
+    turns: [{ message: "make an http request to https://localhost:3000 and if it fails, explain why and what the safer next step is" }],
+    grading: {
+      requiredTools: ["httpRequest"],
+      judgePrompt: "Should acknowledge the failure clearly, not hallucinate success, and propose a sane recovery path.",
+    },
+  },
 ];
 
 /** Get tests filtered by category. */

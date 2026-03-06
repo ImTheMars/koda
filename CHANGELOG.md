@@ -4,6 +4,53 @@ all notable changes to koda.
 
 ---
 
+## 2026-03-05
+### autonomy pivot — assessment state, durable plans, verification, reflective reviews
+
+koda has been pushed from "tool-using assistant with memory" toward "autonomous personal operator + assessment agent." the runtime now stores explicit goals and observations, creates durable multi-step plans, verifies outcomes before claiming success, and runs recurring reflective protocols like weekly reviews and goal-drift audits.
+
+#### added
+
+- **structured assessment state** (`src/db.ts`, `src/tools/autonomy.ts`) — new persisted entities and tools for `goals`, `observations`, `interventions`, and `reviews`. koda can now track what the user is trying to do, what patterns it sees, what interventions it recommends, and what conclusions it reaches over time.
+- **durable planning system** (`src/db.ts`, `src/tools/autonomy.ts`) — new `plans` and `plan_steps` tables plus tools to create, inspect, approve, and update persistent plans. hard tasks no longer need to live only inside one chat turn.
+- **verification tool** (`src/tools/autonomy.ts`) — new `verifyOutcome` tool for checking files, reminders/tasks, plans, and URLs before koda says something is done.
+- **assessment + planning tools** (`src/tools/autonomy.ts`, `src/tools/index.ts`) — added `assessmentSnapshot`, `upsertGoal`, `listGoals`, `logObservation`, `listObservations`, `createIntervention`, `listInterventions`, `storeReview`, `listReviews`, `createPlanRecord`, `listPlans`, `getPlan`, `updatePlanStep`, `approvePlan`, and `verifyOutcome`.
+- **goal inference from memory extraction** (`src/tools/memory.ts`) — when conversation ingestion surfaces durable goals or signals, koda now stores them as structured assessment evidence instead of only freeform semantic memory.
+- **weekly review seed task** (`src/index.ts`) — built-in recurring protocol that reviews goals, plans, tasks, risks, contradictions, and next actions, then stores the review.
+- **goal drift audit seed task** (`src/index.ts`) — built-in recurring protocol that compares goals against recent behavior and recommends interventions when the user seems off track.
+- **autonomy dashboard visibility** (`src/dashboard.ts`) — dashboard now shows goals and durable plans in addition to tasks, skills, usage, and sub-agents.
+- **autonomy config** (`src/config.ts`) — new config fields for `monthlyBudgetUsd`, `perPlanBudgetUsd`, `approvalRiskLevel`, `allowBrowserAutomation`, and `maxConcurrentPlans`.
+- **intelligence benchmarks** (`src/bench/suite.ts`) — new benchmark categories for `assessment-quality`, `goal-drift-detection`, `plan-resumption`, `verification-discipline`, and `self-correction`.
+
+#### changed
+
+- **product framing** (`README.md`) — repositioned koda from a personal AI that feels personal to an autonomous personal operator that tracks goals, stores evidence, runs durable plans, reviews patterns over time, and verifies outcomes.
+- **soul / behavior layer** (`config/soul.md`, `config/soul.d/protocol.md`, `config/soul.d/response.md`, `config/soul.d/security.md`) — shifted koda's core behavior toward evidence, contradiction handling, explicit uncertainty, honest assessment, and follow-through while keeping the same lowercase/personal voice.
+- **system prompt** (`src/agent.ts`) — now injects structured assessment summaries, active durable plans, autonomy governance guidance, and stronger instructions around plan creation, verification, and evidence-backed reasoning.
+- **scheduler / proactive runtime** (`src/proactive.ts`) — upgraded from reminder-centric ticking into a runner that can continue durable plans by dispatching the next step automatically.
+- **sub-agent behavior** (`src/tools/subagent.ts`) — sub-agents can now participate more cleanly in durable work by seeing plan tools like `getPlan`, `updatePlanStep`, and `verifyOutcome`, while creation/approval remains blocked to the main agent.
+- **status reporting** (`src/tools/status.ts`) — system status now includes active goals, active plans, and blocked plans.
+- **skills** (`skills/morning-briefing/SKILL.md`, `skills/task-breakdown/SKILL.md`) — updated stale protocols so they use structured state and durable planning instead of older concepts like `HEARTBEAT.md`.
+- **memory ingestion** (`src/tools/memory.ts`) — extracted memory facts can now become typed observations and inferred goals, making the assessment model more than just semantic recall.
+- **MCP boot warnings** (`src/boot/mcp.ts`) — browser/computer-use capable MCP servers are now surfaced explicitly relative to the `allowBrowserAutomation` autonomy setting.
+
+#### security
+
+- **webhook secret enforcement** (`src/config.ts`) — webhook mode now requires `telegram.webhookSecret`.
+- **tool governance metadata** (`src/tools/autonomy.ts`) — tools now have explicit risk, reversibility, approval, and verification policies that can be surfaced to the model.
+
+#### tests
+
+- **DB coverage expanded** (`src/__tests__/db.test.ts`) — added deterministic tests for assessment persistence and durable plan lifecycle.
+- **config coverage expanded** (`src/__tests__/config.test.ts`) — added tests for autonomy defaults and webhook secret enforcement.
+- **full suite passes** — `bun test` → 220 pass, 0 fail.
+
+#### docs
+
+- **audit marked stale/historical** (`docs/audit/EXECUTIVE-AUDIT.md`) — clarified that the audit snapshot predates the autonomy pivot and parts of its testing/runtime assessment were outdated.
+
+---
+
 ## 2026-03-03
 ### multi-user & group chat support
 

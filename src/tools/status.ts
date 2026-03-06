@@ -4,7 +4,7 @@
 
 import { tool, type ToolSet } from "ai";
 import { z } from "zod";
-import { tasks as dbTasks, usage as dbUsage } from "../db.js";
+import { tasks as dbTasks, usage as dbUsage, assessment as dbAssessment, plans as dbPlans } from "../db.js";
 import type { MemoryProvider } from "./memory.js";
 import { isLlmCircuitOpen } from "../agent.js";
 import { VERSION } from "../version.js";
@@ -36,6 +36,8 @@ export function registerStatusTools(deps: { memory: MemoryProvider }): ToolSet {
       // Get all enabled tasks (use far-future date to get everything)
       const allReady = dbTasks.getReady(new Date(Date.now() + 365 * 24 * 3_600_000).toISOString());
       const nextTask = allReady.length > 0 ? allReady[0] : null;
+      const goals = dbAssessment.listGoals(ctx.userId, "active");
+      const activePlans = dbPlans.listByUser(ctx.userId).filter((plan) => plan.status === "active" || plan.status === "blocked");
 
       return {
         version: VERSION,
@@ -53,6 +55,11 @@ export function registerStatusTools(deps: { memory: MemoryProvider }): ToolSet {
         scheduler: {
           activeTaskCount: allReady.length,
           nextTask: nextTask ? { description: nextTask.description, at: nextTask.nextRunAt } : null,
+        },
+        autonomy: {
+          activeGoalCount: goals.length,
+          activePlanCount: activePlans.length,
+          blockedPlanCount: activePlans.filter((plan) => plan.status === "blocked").length,
         },
       };
     },

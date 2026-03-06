@@ -6,7 +6,7 @@
 
 import { mkdir, readFile, writeFile, unlink } from "fs/promises";
 import { resolve } from "path";
-import { initDb, closeDb, messages as dbMessages, state as dbState, tasks as dbTasks, vacuumDb, backupDatabase, userProfiles, chatMembers } from "./db.js";
+import { initDb, closeDb, messages as dbMessages, state as dbState, tasks as dbTasks, vacuumDb, backupDatabase, userProfiles, chatMembers, assessment as dbAssessment, plans as dbPlans } from "./db.js";
 import { parseCronNext } from "./time.js";
 import { createAgent, createStreamAgent, type AgentDeps } from "./agent.js";
 import { startRepl } from "./channels/repl.js";
@@ -63,6 +63,45 @@ const agentDeps: AgentDeps = {
   getProfile: (userId, query, sessionKey) => memoryProvider.getProfile(userId, query || undefined, sessionKey),
   ingestConversation: (sessionKey, userId, messages, chatId) => memoryProvider.ingestConversation(sessionKey, userId, messages, chatId),
   getSoulAcks: () => soulLoader.getAckTemplates(),
+  getAssessmentSummary: async (userId) => {
+    const snapshot = dbAssessment.buildSummary(userId);
+    const lines: string[] = [];
+    if (snapshot.goals.length > 0) {
+      lines.push("goals:");
+      for (const goal of snapshot.goals) {
+        lines.push(`- [${goal.status}] ${goal.title} (${goal.domain})`);
+      }
+    }
+    if (snapshot.observations.length > 0) {
+      lines.push("observations:");
+      for (const item of snapshot.observations.slice(0, 4)) {
+        lines.push(`- ${item.statement} [${item.source}, ${item.confidence.toFixed(2)}]`);
+      }
+    }
+    if (snapshot.interventions.length > 0) {
+      lines.push("interventions:");
+      for (const intervention of snapshot.interventions.slice(0, 3)) {
+        lines.push(`- [${intervention.status}] ${intervention.recommendation}`);
+      }
+    }
+    if (snapshot.reviews.length > 0) {
+      lines.push(`latest_review: ${snapshot.reviews[0]!.findings}`);
+    }
+    return lines.length > 0 ? lines.join("\n") : null;
+  },
+  getActivePlansSummary: async (userId) => {
+    const activePlans = dbPlans.listByUser(userId).filter((plan) => ["active", "blocked", "draft"].includes(plan.status)).slice(0, 5);
+    if (activePlans.length === 0) return null;
+    const lines: string[] = [];
+    for (const plan of activePlans) {
+      const detailed = dbPlans.get(plan.id);
+      const nextStep = detailed?.steps.find((step) => step.status === "pending" || step.status === "in_progress") ?? null;
+      lines.push(`- [${plan.status}] ${plan.title}: ${plan.goal}`);
+      if (nextStep) lines.push(`  next_step: ${nextStep.title}`);
+      if (plan.successCriteria) lines.push(`  success: ${plan.successCriteria}`);
+    }
+    return lines.join("\n");
+  },
   getProjectMemories: memoryProvider.getProjectMemories
     ? (chatId, query) => memoryProvider.getProjectMemories!(chatId, query)
     : undefined,
@@ -161,6 +200,65 @@ Object.assign(tools, registerSubAgentTools({
     });
     dbState.set(BRIEFING_KEY, true);
     log("boot", `Seeded daily briefing (next: ${nextRun.toISOString()})`);
+  } catch { /* already exists or DB not ready — safe to skip */ }
+})();
+
+// --- Seed weekly review ---
+(function seedWeeklyReview() {
+  const REVIEW_KEY = "builtin-weekly-review-v1";
+  if (dbState.get(REVIEW_KEY)) return;
+  try {
+    const ownerId = config.telegram.adminIds[0] ?? config.owner.id;
+    const channel = config.telegram.token ? "telegram" : "cli";
+    const chatId = ownerId;
+    const cron = config.features.weeklyReviewCron;
+    const nextRun = parseCronNext(cron, new Date(), config.scheduler.timezone);
+    dbTasks.create({
+      id: "builtin-weekly-review",
+      userId: ownerId,
+      chatId,
+      channel,
+      type: "recurring",
+      description: "Weekly review",
+      prompt: "Run a weekly review. Use assessmentSnapshot, listGoals, listPlans, listTasks, and listReviews. " +
+              "Identify wins, risks, contradictions, and the 1-3 highest leverage next actions. " +
+              "Store the review with storeReview and keep the message concise but real.",
+      cron,
+      nextRunAt: nextRun.toISOString(),
+      enabled: true,
+      oneShot: false,
+    });
+    dbState.set(REVIEW_KEY, true);
+    log("boot", `Seeded weekly review (next: ${nextRun.toISOString()})`);
+  } catch { /* already exists or DB not ready — safe to skip */ }
+})();
+
+// --- Seed goal drift audit ---
+(function seedGoalDriftAudit() {
+  const DRIFT_KEY = "builtin-goal-drift-v1";
+  if (dbState.get(DRIFT_KEY)) return;
+  try {
+    const ownerId = config.telegram.adminIds[0] ?? config.owner.id;
+    const channel = config.telegram.token ? "telegram" : "cli";
+    const chatId = ownerId;
+    const cron = config.features.goalDriftCron;
+    const nextRun = parseCronNext(cron, new Date(), config.scheduler.timezone);
+    dbTasks.create({
+      id: "builtin-goal-drift",
+      userId: ownerId,
+      chatId,
+      channel,
+      type: "recurring",
+      description: "Goal drift audit",
+      prompt: "Run a goal drift audit. Compare the user's active goals, recent observations, interventions, tasks, and durable plans. " +
+              "Call out where goals and behavior seem misaligned, log any important observations, and recommend one intervention if needed.",
+      cron,
+      nextRunAt: nextRun.toISOString(),
+      enabled: true,
+      oneShot: false,
+    });
+    dbState.set(DRIFT_KEY, true);
+    log("boot", `Seeded goal drift audit (next: ${nextRun.toISOString()})`);
   } catch { /* already exists or DB not ready — safe to skip */ }
 })();
 

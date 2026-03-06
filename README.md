@@ -8,13 +8,13 @@
 </p>
 
 <p align="center">
-  a personal ai that actually feels personal.<br/>
-  <sub>remembers everything. browses the web. schedules tasks. delegates to sub-agents. reads documents. transcribes voice. generates images. loads workspace context. texts like a real one.</sub>
+  an autonomous personal operator that actually knows you.<br/>
+  <sub>tracks goals. stores evidence. runs durable plans. reviews patterns over time. verifies outcomes. browses the web. schedules tasks. delegates to sub-agents. reads documents. texts like a real one.</sub>
 </p>
 
 ---
 
-a long-running ai assistant that connects to telegram or a local cli, routes every message through the right model for the job, remembers your preferences via semantic memory, creates its own skills, schedules reminders, browses the web, spawns sub-agents for parallel work, reads PDFs and documents, transcribes voice messages, generates images, and replies like a real person.
+a long-running personal agent that connects to telegram or a local cli, routes every message through the right model for the job, maintains structured goals and observations, creates durable multi-step plans, verifies important outcomes, remembers your preferences via semantic memory, creates its own skills, schedules reminders and reviews, browses the web, spawns sub-agents for parallel work, reads PDFs and documents, transcribes voice messages, generates images, and replies like a real person.
 
 built on bun. runs on a $5 vps. no bloat.
 
@@ -37,13 +37,13 @@ you (telegram / cli)
    +----------+     |  onStepFinish: track      |
          |          |  stopWhen: 30 steps max    |
          v          +--------------------------+
-   +------------------------------+
-   |  tools                       |
-   |  memory - search - sandbox  |
-   |  filesystem - schedule      |
-   |  skills - soul - status     |
-   |  subagent - image - sendFile|
-   +------------------------------+
+  +------------------------------------------+
+  |  tools                                   |
+  |  memory - assessment - planning - verify |
+  |  search - sandbox - filesystem           |
+  |  schedule - skills - soul - status       |
+  |  subagent - image - sendFile             |
+  +------------------------------------------+
          |
          v
    +----------+
@@ -116,6 +116,9 @@ KODA_SUPERMEMORY_API_KEY=...          # optional — semantic memory (gracefully
 - **reply threading** — reply to any message and koda sees the original text as context.
 - **forwarded messages** — forward messages to koda and it knows who/where they came from.
 - **edited messages** — edit a sent message and koda processes the update.
+- **structured assessment state** — goals, observations, interventions, and reviews are stored explicitly so koda can assess patterns over time instead of relying only on freeform memory.
+- **durable plans** — hard tasks can be stored as multi-step plans with success criteria, verification hints, approvals, and resumable continuation.
+- **verification** — `verifyOutcome` helps confirm files, reminders, plans, and URLs before koda claims a task is done.
 - **image generation** — `generateImage` tool creates images via OpenRouter (default: google/gemini-3-pro-image-preview).
 - **file sending** — `sendFile` tool sends workspace files back as Telegram documents.
 - **tier override** — `/deep` and `/fast` commands force the next message to a specific model tier.
@@ -133,6 +136,7 @@ KODA_SUPERMEMORY_API_KEY=...          # optional — semantic memory (gracefully
 - **workspace context** — place a `CONTEXT.md` in your workspace to inject project context into every system prompt. hot-reloads on change.
 - **request tracing** — every request gets an 8-char ID prefix in logs for easy tracing across agent and sub-agent calls.
 - **task failure tracking** — recurring tasks auto-disable after 3 consecutive failures with user notification.
+- **reflective reviews** — built-in recurring reviews can audit goal drift, follow-through, and patterns in the user's work over time.
 
 ## config reference
 
@@ -171,6 +175,9 @@ all fields are optional except `openrouter.apiKey` (via env var).
 | tool | what it does |
 |------|-------------|
 | **remember** / **recall** | semantic memory via Supermemory — stores facts, retrieves relevant context. gracefully disabled without API key. |
+| **assessmentSnapshot** / **upsertGoal** / **logObservation** / **createIntervention** / **storeReview** | structured personal assessment state — goals, evidence, interventions, and reviews. |
+| **createPlanRecord** / **listPlans** / **getPlan** / **updatePlanStep** / **approvePlan** | durable execution plans with multi-step progress and approval support. |
+| **verifyOutcome** | checks whether important outputs actually exist before claiming success. |
 | **webSearch** / **extractUrl** | exa-powered web search + page content extraction. cost tracked per call. |
 | **readFile** / **writeFile** / **listFiles** | workspace-scoped filesystem. blocked patterns for .env, secrets, node_modules. |
 | **runSandboxed** | isolated Docker container execution with resource limits (512MB RAM, 0.5 CPU, no network). |

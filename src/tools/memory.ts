@@ -7,7 +7,7 @@
 import { tool, type ToolSet } from "ai";
 import { z } from "zod";
 import Supermemory from "supermemory";
-import { messages as dbMessages, state as dbState } from "../db.js";
+import { messages as dbMessages, state as dbState, assessment as dbAssessment } from "../db.js";
 import { log, logWarn, logError } from "../log.js";
 import type { Config } from "../config.js";
 import { addToolCost } from "./index.js";
@@ -70,6 +70,60 @@ interface MemoryFact {
   type: "preference" | "personal" | "project" | "decision" | "action" | "opinion" | "correction";
   confidence: number;
   replaces?: string;
+}
+
+function inferDomainFromText(text: string): string {
+  const lower = text.toLowerCase();
+  if (/\b(work|job|project|team|business|deploy|code|product)\b/.test(lower)) return "work";
+  if (/\b(health|sleep|gym|workout|diet|energy|stress)\b/.test(lower)) return "health";
+  if (/\b(money|budget|finance|income|expense|debt|savings)\b/.test(lower)) return "finances";
+  if (/\b(learn|study|course|read|practice)\b/.test(lower)) return "learning";
+  if (/\b(friend|family|partner|relationship)\b/.test(lower)) return "relationships";
+  return "general";
+}
+
+function maybeExtractGoal(text: string): { title: string; domain: string; successCriteria: string | null } | null {
+  const lower = text.toLowerCase();
+  const match =
+    lower.match(/\b(?:i want to|i'm trying to|i am trying to|my goal is to|i need to|i plan to)\s+(.+)/i) ??
+    lower.match(/\bgoal:\s*(.+)/i);
+  if (!match) return null;
+  const title = text.slice(text.toLowerCase().indexOf(match[1]!.toLowerCase())).trim().replace(/[.]+$/, "");
+  if (!title) return null;
+  return {
+    title,
+    domain: inferDomainFromText(title),
+    successCriteria: null,
+  };
+}
+
+function storeAssessmentEvidence(userId: string, fact: MemoryFact, source: string): void {
+  const domain = inferDomainFromText(fact.content);
+  dbAssessment.addObservation({
+    id: `obs-${crypto.randomUUID().slice(0, 8)}`,
+    userId,
+    domain,
+    statement: fact.content,
+    source,
+    evidenceType: fact.type,
+    confidence: fact.confidence,
+    contradicts: fact.replaces ?? null,
+    observedAt: new Date().toISOString(),
+  });
+
+  const goal = maybeExtractGoal(fact.content);
+  if (goal) {
+    dbAssessment.upsertGoal({
+      id: `goal-${crypto.randomUUID().slice(0, 8)}`,
+      userId,
+      title: goal.title,
+      domain: goal.domain,
+      status: "active",
+      successCriteria: goal.successCriteria,
+      confidence: fact.confidence,
+      notes: `inferred from ${source}`,
+    });
+  }
 }
 
 async function extractMemoryFacts(
@@ -450,6 +504,11 @@ function createSupermemoryProvider(apiKey: string, config?: Config): MemoryProvi
             });
             existingFacts.push(fact.content);
             stored++;
+            try {
+              storeAssessmentEvidence(userId, fact, "memory-extraction");
+            } catch (err) {
+              log("memory", "assessment evidence store failed: %s", (err as Error).message);
+            }
           } catch (err) {
             recordFailure();
             logError("memory", "fact store failed", err);

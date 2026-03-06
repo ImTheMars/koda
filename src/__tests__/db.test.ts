@@ -236,3 +236,85 @@ describe("vacuum", () => {
     expect(() => db.vacuumDb()).not.toThrow();
   });
 });
+
+describe("assessment", () => {
+  test("stores and lists goals", () => {
+    const userId = `goal_user_${Date.now()}`;
+    const id = randomUUID();
+    db.assessment.upsertGoal({
+      id,
+      userId,
+      title: "ship autonomy pivot",
+      domain: "work",
+      status: "active",
+      successCriteria: "first version live",
+      confidence: 0.8,
+    });
+    const goals = db.assessment.listGoals(userId);
+    expect(goals.some((goal) => goal.id === id)).toBe(true);
+  });
+
+  test("stores observations and reviews", () => {
+    const userId = `obs_user_${Date.now()}`;
+    db.assessment.addObservation({
+      id: randomUUID(),
+      userId,
+      domain: "work",
+      statement: "user keeps revisiting the autonomy roadmap",
+      source: "test",
+      evidenceType: "behavior",
+      confidence: 0.9,
+      observedAt: new Date().toISOString(),
+    });
+    db.assessment.addReview({
+      id: randomUUID(),
+      userId,
+      periodStart: new Date(Date.now() - 7 * 86_400_000).toISOString(),
+      periodEnd: new Date().toISOString(),
+      findings: "strong focus on autonomy work",
+    });
+    const summary = db.assessment.buildSummary(userId);
+    expect(summary.observations.length).toBeGreaterThan(0);
+    expect(summary.reviews.length).toBeGreaterThan(0);
+  });
+});
+
+describe("plans", () => {
+  test("creates plan and steps", () => {
+    const planId = randomUUID();
+    db.plans.create({
+      id: planId,
+      userId: "plan_user",
+      chatId: "plan_chat",
+      title: "autonomy rollout",
+      goal: "ship the autonomy pivot",
+      status: "active",
+      nextRunAt: new Date().toISOString(),
+    });
+    db.plans.addSteps(planId, [
+      { id: randomUUID(), title: "update prompt", instructions: "reframe the agent" },
+      { id: randomUUID(), title: "add planner", instructions: "persist plans" },
+    ]);
+    const plan = db.plans.get(planId);
+    expect(plan).toBeDefined();
+    expect(plan?.steps.length).toBe(2);
+  });
+
+  test("updates step progress and marks completion", () => {
+    const planId = randomUUID();
+    const stepId = randomUUID();
+    db.plans.create({
+      id: planId,
+      userId: "plan_user_2",
+      chatId: "plan_chat_2",
+      title: "verify output",
+      goal: "finish plan",
+      status: "active",
+      nextRunAt: new Date().toISOString(),
+    });
+    db.plans.addSteps(planId, [{ id: stepId, title: "verify file" }]);
+    db.plans.updateStep(planId, stepId, { status: "done", notes: "verified" });
+    const plan = db.plans.get(planId);
+    expect(plan?.status).toBe("done");
+  });
+});
