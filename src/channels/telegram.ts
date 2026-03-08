@@ -106,6 +106,21 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
   const typingIntervals = new Map<string, ReturnType<typeof setInterval>>();
   const typingTimeouts = new Map<string, ReturnType<typeof setTimeout>>();
   const tierOverrides = new Map<string, Tier>();
+  // Per-chat serial queue — ensures only one streamAgent call runs at a time per chat.
+  // Each incoming message waits for the previous one to fully complete (including DB writes)
+  // before starting, so history is always up-to-date and responses never duplicate context.
+  const chatQueues = new Map<string, Promise<void>>();
+
+  const enqueueForChat = (chatId: string, fn: () => Promise<void>): void => {
+    const prev = chatQueues.get(chatId) ?? Promise.resolve();
+    const next = prev
+      .then(fn)
+      .catch((err) => logError("telegram", `queue error chat=${chatId}`, err));
+    const cleanup = next.then(() => {
+      if (chatQueues.get(chatId) === cleanup) chatQueues.delete(chatId);
+    });
+    chatQueues.set(chatId, cleanup);
+  };
 
   const dedupTimer = setInterval(() => {
     processedMessages.clear();
@@ -716,43 +731,45 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
       content = `[${displayName}]: ${content}`;
     }
     const tierOverride = consumeTierOverride(chatId);
-    const t0 = Date.now();
+    const threadId = ctx.message.message_thread_id;
 
-    startTyping(chatId);
-    try {
-      const streamResult = await deps.streamAgent({
-        content,
-        senderId, chatId, channel: "telegram",
-        sessionKey: `telegram_${chatId}`,
-        tierOverride,
-        senderDisplayName: displayName,
-        chatType: inGroup ? "group" : "private",
-        onAck: (text) => ctx.reply(text).catch(() => {}),
-      });
+    enqueueForChat(chatId, async () => {
+      const t0 = Date.now();
+      startTyping(chatId);
+      try {
+        const streamResult = await deps.streamAgent({
+          content,
+          senderId, chatId, channel: "telegram",
+          sessionKey: `telegram_${chatId}`,
+          tierOverride,
+          senderDisplayName: displayName,
+          chatType: inGroup ? "group" : "private",
+          onAck: (text) => ctx.reply(text).catch(() => {}),
+        });
 
-      consecutiveErrors = 0;
-      await sendStreamReply({
-        chatId: Number(chatId),
-        threadId: ctx.message.message_thread_id,
-        stream: streamResult.fullStream,
-        onStop: () => stopTyping(chatId),
-      });
-      const agentResult = await streamResult.finishedPromise.catch((err) => { logError("telegram", "agent promise failed", err); return null; });
+        consecutiveErrors = 0;
+        await sendStreamReply({
+          chatId: Number(chatId),
+          threadId,
+          stream: streamResult.fullStream,
+          onStop: () => stopTyping(chatId),
+        });
+        const agentResult = await streamResult.finishedPromise.catch((err) => { logError("telegram", "agent promise failed", err); return null; });
 
-      const elapsed = Date.now() - t0;
-      const replyPreview = (agentResult?.text ?? "").slice(0, 120);
-      log("msg", `OUT text to=${chatId} len=${agentResult?.text?.length ?? 0} tier=${agentResult?.tier ?? "?"} tools=[${agentResult?.toolsUsed?.join(",") ?? ""}] ${elapsed}ms "${replyPreview}"`);
+        const elapsed = Date.now() - t0;
+        const replyPreview = (agentResult?.text ?? "").slice(0, 120);
+        log("msg", `OUT text to=${chatId} len=${agentResult?.text?.length ?? 0} tier=${agentResult?.tier ?? "?"} tools=[${agentResult?.toolsUsed?.join(",") ?? ""}] ${elapsed}ms "${replyPreview}"`);
 
-      // Send pending files
-      if (agentResult?.files?.length) {
-        log("msg", `FILES to=${chatId} count=${agentResult.files.length}`);
-        await sendPendingFiles(Number(chatId), agentResult.files);
+        if (agentResult?.files?.length) {
+          log("msg", `FILES to=${chatId} count=${agentResult.files.length}`);
+          await sendPendingFiles(Number(chatId), agentResult.files);
+        }
+      } catch (err) {
+        stopTyping(chatId);
+        logError("msg", `text from=${senderId} chat=${chatId}`, err);
+        await ctx.reply("ran into an issue, try again?").catch(() => {});
       }
-    } catch (err) {
-      stopTyping(chatId);
-      logError("msg", `text from=${senderId} chat=${chatId} ${Date.now() - t0}ms`, err);
-      await ctx.reply("ran into an issue, try again?").catch(() => {});
-    }
+    });
   });
 
   // --- Photo messages (streaming) ---
@@ -809,36 +826,41 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
     }
     const buffer = Buffer.from(await response.arrayBuffer());
 
-    const t0 = Date.now();
-    startTyping(chatId);
-    try {
-      const streamResult = await deps.streamAgent({
-        content: caption,
-        attachments: [{ type: "image", mimeType: "image/jpeg", data: buffer.toString("base64") }],
-        senderId, chatId, channel: "telegram",
-        sessionKey: `telegram_${chatId}`,
-        senderDisplayName: displayName,
-        chatType: inGroup ? "group" : "private",
-        onAck: (text) => ctx.reply(text).catch(() => {}),
-      });
+    const threadId = ctx.message.message_thread_id;
+    const imageData = buffer.toString("base64");
 
-      consecutiveErrors = 0;
-      await sendStreamReply({
-        chatId: Number(chatId),
-        threadId: ctx.message.message_thread_id,
-        stream: streamResult.fullStream,
-        onStop: () => stopTyping(chatId),
-      });
-      const agentResult = await streamResult.finishedPromise.catch((err) => { logError("telegram", "agent promise failed", err); return null; });
-      log("msg", `OUT photo to=${chatId} len=${agentResult?.text?.length ?? 0} tier=${agentResult?.tier ?? "?"} ${Date.now() - t0}ms`);
-      if (agentResult?.files?.length) {
-        await sendPendingFiles(Number(chatId), agentResult.files);
+    enqueueForChat(chatId, async () => {
+      const t0 = Date.now();
+      startTyping(chatId);
+      try {
+        const streamResult = await deps.streamAgent({
+          content: caption,
+          attachments: [{ type: "image", mimeType: "image/jpeg", data: imageData }],
+          senderId, chatId, channel: "telegram",
+          sessionKey: `telegram_${chatId}`,
+          senderDisplayName: displayName,
+          chatType: inGroup ? "group" : "private",
+          onAck: (text) => ctx.reply(text).catch(() => {}),
+        });
+
+        consecutiveErrors = 0;
+        await sendStreamReply({
+          chatId: Number(chatId),
+          threadId,
+          stream: streamResult.fullStream,
+          onStop: () => stopTyping(chatId),
+        });
+        const agentResult = await streamResult.finishedPromise.catch((err) => { logError("telegram", "agent promise failed", err); return null; });
+        log("msg", `OUT photo to=${chatId} len=${agentResult?.text?.length ?? 0} tier=${agentResult?.tier ?? "?"} ${Date.now() - t0}ms`);
+        if (agentResult?.files?.length) {
+          await sendPendingFiles(Number(chatId), agentResult.files);
+        }
+      } catch (err) {
+        stopTyping(chatId);
+        logError("msg", `photo from=${senderId} chat=${chatId}`, err);
+        await ctx.reply("ran into an issue, try again?").catch(() => {});
       }
-    } catch (err) {
-      stopTyping(chatId);
-      logError("msg", `photo from=${senderId} chat=${chatId} ${Date.now() - t0}ms`, err);
-      await ctx.reply("ran into an issue, try again?").catch(() => {});
-    }
+    });
   });
 
   // --- Document/PDF messages ---
@@ -913,35 +935,39 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
       content = `[replying to: "${ctx.message.reply_to_message.text.slice(0, 500)}"]\n\n${content}`;
     }
 
-    const t0 = Date.now();
-    startTyping(chatId);
-    try {
-      const streamResult = await deps.streamAgent({
-        content,
-        senderId, chatId, channel: "telegram",
-        sessionKey: `telegram_${chatId}`,
-        senderDisplayName: displayName,
-        chatType: inGroup ? "group" : "private",
-        onAck: (text) => ctx.reply(text).catch(() => {}),
-      });
+    const threadId = ctx.message.message_thread_id;
 
-      consecutiveErrors = 0;
-      await sendStreamReply({
-        chatId: Number(chatId),
-        threadId: ctx.message.message_thread_id,
-        stream: streamResult.fullStream,
-        onStop: () => stopTyping(chatId),
-      });
-      const agentResult = await streamResult.finishedPromise.catch((err) => { logError("telegram", "agent promise failed", err); return null; });
-      log("msg", `OUT document to=${chatId} len=${agentResult?.text?.length ?? 0} tier=${agentResult?.tier ?? "?"} ${Date.now() - t0}ms`);
-      if (agentResult?.files?.length) {
-        await sendPendingFiles(Number(chatId), agentResult.files);
+    enqueueForChat(chatId, async () => {
+      const t0 = Date.now();
+      startTyping(chatId);
+      try {
+        const streamResult = await deps.streamAgent({
+          content,
+          senderId, chatId, channel: "telegram",
+          sessionKey: `telegram_${chatId}`,
+          senderDisplayName: displayName,
+          chatType: inGroup ? "group" : "private",
+          onAck: (text) => ctx.reply(text).catch(() => {}),
+        });
+
+        consecutiveErrors = 0;
+        await sendStreamReply({
+          chatId: Number(chatId),
+          threadId,
+          stream: streamResult.fullStream,
+          onStop: () => stopTyping(chatId),
+        });
+        const agentResult = await streamResult.finishedPromise.catch((err) => { logError("telegram", "agent promise failed", err); return null; });
+        log("msg", `OUT document to=${chatId} len=${agentResult?.text?.length ?? 0} tier=${agentResult?.tier ?? "?"} ${Date.now() - t0}ms`);
+        if (agentResult?.files?.length) {
+          await sendPendingFiles(Number(chatId), agentResult.files);
+        }
+      } catch (err) {
+        stopTyping(chatId);
+        logError("msg", `document from=${senderId} chat=${chatId}`, err);
+        await ctx.reply("ran into an issue processing that file.").catch(() => {});
       }
-    } catch (err) {
-      stopTyping(chatId);
-      logError("msg", `document from=${senderId} chat=${chatId} ${Date.now() - t0}ms`, err);
-      await ctx.reply("ran into an issue processing that file.").catch(() => {});
-    }
+    });
   });
 
   // --- Voice messages ---
@@ -993,37 +1019,40 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
     content = enrichContent(content, ctx.message);
     if (inGroup) content = `[${displayName}]: ${content}`;
     const tierOverride = consumeTierOverride(chatId);
-    const t0 = Date.now();
+    const threadId = ctx.message.message_thread_id;
 
-    startTyping(chatId);
-    try {
-      const streamResult = await deps.streamAgent({
-        content,
-        senderId, chatId, channel: "telegram",
-        sessionKey: `telegram_${chatId}`,
-        tierOverride,
-        senderDisplayName: displayName,
-        chatType: inGroup ? "group" : "private",
-        onAck: (text) => ctx.reply(text).catch(() => {}),
-      });
+    enqueueForChat(chatId, async () => {
+      const t0 = Date.now();
+      startTyping(chatId);
+      try {
+        const streamResult = await deps.streamAgent({
+          content,
+          senderId, chatId, channel: "telegram",
+          sessionKey: `telegram_${chatId}`,
+          tierOverride,
+          senderDisplayName: displayName,
+          chatType: inGroup ? "group" : "private",
+          onAck: (text) => ctx.reply(text).catch(() => {}),
+        });
 
-      consecutiveErrors = 0;
-      await sendStreamReply({
-        chatId: Number(chatId),
-        threadId: ctx.message.message_thread_id,
-        stream: streamResult.fullStream,
-        onStop: () => stopTyping(chatId),
-      });
-      const agentResult = await streamResult.finishedPromise.catch((err) => { logError("telegram", "agent promise failed", err); return null; });
-      log("msg", `OUT voice to=${chatId} len=${agentResult?.text?.length ?? 0} tier=${agentResult?.tier ?? "?"} ${Date.now() - t0}ms`);
-      if (agentResult?.files?.length) {
-        await sendPendingFiles(Number(chatId), agentResult.files);
+        consecutiveErrors = 0;
+        await sendStreamReply({
+          chatId: Number(chatId),
+          threadId,
+          stream: streamResult.fullStream,
+          onStop: () => stopTyping(chatId),
+        });
+        const agentResult = await streamResult.finishedPromise.catch((err) => { logError("telegram", "agent promise failed", err); return null; });
+        log("msg", `OUT voice to=${chatId} len=${agentResult?.text?.length ?? 0} tier=${agentResult?.tier ?? "?"} ${Date.now() - t0}ms`);
+        if (agentResult?.files?.length) {
+          await sendPendingFiles(Number(chatId), agentResult.files);
+        }
+      } catch (err) {
+        stopTyping(chatId);
+        logError("msg", `voice from=${senderId} chat=${chatId}`, err);
+        await ctx.reply("ran into an issue, try again?").catch(() => {});
       }
-    } catch (err) {
-      stopTyping(chatId);
-      logError("msg", `voice from=${senderId} chat=${chatId} ${Date.now() - t0}ms`, err);
-      await ctx.reply("ran into an issue, try again?").catch(() => {});
-    }
+    });
   });
 
   // --- Video note (circle video) messages ---
@@ -1072,37 +1101,40 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
     content = enrichContent(content, ctx.message);
     if (inGroup) content = `[${displayName}]: ${content}`;
     const tierOverride = consumeTierOverride(chatId);
-    const t0 = Date.now();
+    const threadId = ctx.message.message_thread_id;
 
-    startTyping(chatId);
-    try {
-      const streamResult = await deps.streamAgent({
-        content,
-        senderId, chatId, channel: "telegram",
-        sessionKey: `telegram_${chatId}`,
-        tierOverride,
-        senderDisplayName: displayName,
-        chatType: inGroup ? "group" : "private",
-        onAck: (text) => ctx.reply(text).catch(() => {}),
-      });
+    enqueueForChat(chatId, async () => {
+      const t0 = Date.now();
+      startTyping(chatId);
+      try {
+        const streamResult = await deps.streamAgent({
+          content,
+          senderId, chatId, channel: "telegram",
+          sessionKey: `telegram_${chatId}`,
+          tierOverride,
+          senderDisplayName: displayName,
+          chatType: inGroup ? "group" : "private",
+          onAck: (text) => ctx.reply(text).catch(() => {}),
+        });
 
-      consecutiveErrors = 0;
-      await sendStreamReply({
-        chatId: Number(chatId),
-        threadId: ctx.message.message_thread_id,
-        stream: streamResult.fullStream,
-        onStop: () => stopTyping(chatId),
-      });
-      const agentResult = await streamResult.finishedPromise.catch((err) => { logError("telegram", "agent promise failed", err); return null; });
-      log("msg", `OUT video_note to=${chatId} len=${agentResult?.text?.length ?? 0} tier=${agentResult?.tier ?? "?"} ${Date.now() - t0}ms`);
-      if (agentResult?.files?.length) {
-        await sendPendingFiles(Number(chatId), agentResult.files);
+        consecutiveErrors = 0;
+        await sendStreamReply({
+          chatId: Number(chatId),
+          threadId,
+          stream: streamResult.fullStream,
+          onStop: () => stopTyping(chatId),
+        });
+        const agentResult = await streamResult.finishedPromise.catch((err) => { logError("telegram", "agent promise failed", err); return null; });
+        log("msg", `OUT video_note to=${chatId} len=${agentResult?.text?.length ?? 0} tier=${agentResult?.tier ?? "?"} ${Date.now() - t0}ms`);
+        if (agentResult?.files?.length) {
+          await sendPendingFiles(Number(chatId), agentResult.files);
+        }
+      } catch (err) {
+        stopTyping(chatId);
+        logError("msg", `video_note from=${senderId} chat=${chatId}`, err);
+        await ctx.reply("ran into an issue, try again?").catch(() => {});
       }
-    } catch (err) {
-      stopTyping(chatId);
-      logError("msg", `video_note from=${senderId} chat=${chatId} ${Date.now() - t0}ms`, err);
-      await ctx.reply("ran into an issue, try again?").catch(() => {});
-    }
+    });
   });
 
   // --- Edited message handling ---
@@ -1128,31 +1160,34 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
 
     let content = `[edited] ${ctx.editedMessage!.text}`;
     if (inGroup) content = `[${displayName}]: ${content}`;
-    const t0 = Date.now();
+    const threadId = ctx.editedMessage!.message_thread_id;
 
-    startTyping(chatId);
-    try {
-      const streamResult = await deps.streamAgent({
-        content,
-        senderId, chatId, channel: "telegram",
-        sessionKey: `telegram_${chatId}`,
-        senderDisplayName: displayName,
-        chatType: inGroup ? "group" : "private",
-      });
+    enqueueForChat(chatId, async () => {
+      const t0 = Date.now();
+      startTyping(chatId);
+      try {
+        const streamResult = await deps.streamAgent({
+          content,
+          senderId, chatId, channel: "telegram",
+          sessionKey: `telegram_${chatId}`,
+          senderDisplayName: displayName,
+          chatType: inGroup ? "group" : "private",
+        });
 
-      consecutiveErrors = 0;
-      await sendStreamReply({
-        chatId: Number(chatId),
-        threadId: ctx.editedMessage!.message_thread_id,
-        stream: streamResult.fullStream,
-        onStop: () => stopTyping(chatId),
-      });
-      const agentResult = await streamResult.finishedPromise.catch((err) => { logError("telegram", "agent promise failed", err); return null; });
-      log("msg", `OUT edited to=${chatId} len=${agentResult?.text?.length ?? 0} ${Date.now() - t0}ms`);
-    } catch (err) {
-      stopTyping(chatId);
-      logError("msg", `edited from=${senderId} chat=${chatId} ${Date.now() - t0}ms`, err);
-    }
+        consecutiveErrors = 0;
+        await sendStreamReply({
+          chatId: Number(chatId),
+          threadId,
+          stream: streamResult.fullStream,
+          onStop: () => stopTyping(chatId),
+        });
+        const agentResult = await streamResult.finishedPromise.catch((err) => { logError("telegram", "agent promise failed", err); return null; });
+        log("msg", `OUT edited to=${chatId} len=${agentResult?.text?.length ?? 0} ${Date.now() - t0}ms`);
+      } catch (err) {
+        stopTyping(chatId);
+        logError("msg", `edited from=${senderId} chat=${chatId}`, err);
+      }
+    });
   });
 
   // --- Start polling with retry ---
