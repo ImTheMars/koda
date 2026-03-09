@@ -66,8 +66,35 @@ const ESSENTIAL_TOOLS: Record<string, string[]> = {
 
 /** Override Composio's stingy defaults for specific tools (matched by slug substring). */
 const TOOL_ARG_DEFAULTS: Record<string, Record<string, unknown>> = {
-  GMAIL_FETCH_EMAILS: { max_results: 25 },
+  GMAIL_FETCH_EMAILS: { max_results: 10 },
 };
+
+/** Truncate email bodies so they don't blow up the context window. */
+function truncateEmailResults(data: unknown, maxBodyLen = 500): unknown {
+  if (!data || typeof data !== "object") return data;
+  const d = data as Record<string, unknown>;
+
+  // Composio returns { messages: [...] } or similar
+  const list = (d["messages"] ?? d["emails"] ?? d["data"]) as unknown[] | undefined;
+  if (!Array.isArray(list)) return data;
+
+  const trimmed = list.map((msg) => {
+    if (!msg || typeof msg !== "object") return msg;
+    const m = { ...(msg as Record<string, unknown>) };
+    for (const key of ["body", "snippet", "textPlain", "textHtml", "messageText", "content"]) {
+      if (typeof m[key] === "string" && (m[key] as string).length > maxBodyLen) {
+        m[key] = (m[key] as string).slice(0, maxBodyLen) + "… [truncated]";
+      }
+    }
+    // Drop heavy HTML fields entirely
+    delete m["textHtml"];
+    delete m["htmlBody"];
+    return m;
+  });
+
+  const key = d["messages"] ? "messages" : d["emails"] ? "emails" : "data";
+  return { ...d, [key]: trimmed };
+}
 
 /** Build a Zod schema from Composio's raw inputParameters */
 function buildZodSchema(inputParams: ComposioToolParam[]): z.ZodObject<Record<string, z.ZodTypeAny>> {
@@ -154,15 +181,19 @@ export function createComposioClient(deps: ComposioDeps): ComposioClient {
         let description = rawTool.description ?? rawTool.name ?? slug;
         // Augment descriptions so model knows to request a reasonable batch size.
         if (slug.toUpperCase().includes("GMAIL_FETCH_EMAILS")) {
-          description += " Default fetches 25 emails. Use max_results to request more.";
+          description += " Fetches up to 10 emails by default (bodies truncated to 500 chars). Use max_results to adjust count.";
         }
         const inputSchema = buildZodSchema(rawTool.inputParameters ?? []);
 
         const toolDefaults = Object.entries(TOOL_ARG_DEFAULTS).find(([key]) => slug.toUpperCase().includes(key))?.[1] ?? {};
+        const isEmailFetch = slug.toUpperCase().includes("GMAIL_FETCH_EMAILS");
         tools[slug] = tool({
           description,
           inputSchema,
-          execute: async (args: Record<string, unknown>) => executeToolDirect(slug, { ...toolDefaults, ...args }),
+          execute: async (args: Record<string, unknown>) => {
+            const result = await executeToolDirect(slug, { ...toolDefaults, ...args });
+            return isEmailFetch ? truncateEmailResults(result) : result;
+          },
         });
       }
       return tools;
