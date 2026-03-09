@@ -13,8 +13,8 @@ import { createOpenRouter } from "@openrouter/ai-sdk-provider";
 import { createOllama } from "ollama-ai-provider";
 import type { Config, Tier } from "./config.js";
 import { classifyTier, classifyIntent, getModelId, getFallbackIds, calculateCost, shouldAck } from "./router.js";
-import { messages as dbMessages, usage as dbUsage, toolOutcomes, summaries as dbSummaries } from "./db.js";
-import { formatUserTime } from "./time.js";
+import { messages as dbMessages, usage as dbUsage, toolOutcomes, summaries as dbSummaries, tasks as dbTasks } from "./db.js";
+import { formatUserTime, parseCronNext } from "./time.js";
 import { withToolContext, getPendingFiles } from "./tools/index.js";
 import type { UserProfile } from "./tools/memory.js";
 import { summarizeToolGovernance } from "./tools/autonomy.js";
@@ -22,8 +22,6 @@ import { log, logInfo, logError } from "./log.js";
 import { sanitizeForPrompt, redactSensitiveArgs } from "./security.js";
 import { detectFollowup } from "./followup.js";
 import { summarizeAndStore } from "./summarize.js";
-import { tasks as dbTasks } from "./db.js";
-import { parseCronNext } from "./time.js";
 
 export interface AgentInput {
   content: string;
@@ -907,14 +905,8 @@ export function createStreamAgent(deps: AgentDeps) {
       },
     );
 
-    async function* textChunks() {
-      for await (const chunk of streamResult.textStream) {
-        yield chunk;
-      }
-    }
-
     return {
-      fullStream: textChunks(),
+      fullStream: streamResult.textStream,
       finishedPromise,
     };
   };
