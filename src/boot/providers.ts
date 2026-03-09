@@ -16,7 +16,6 @@ export interface ProviderResult {
   memoryProvider: MemoryProvider;
   soulLoader: SoulLoader;
   skillLoader: SkillLoader;
-  contextContent: string | null;
   contextWatcher: FSWatcher | null;
   contextDirWatcher: FSWatcher | null;
   contextReloadTimeout: ReturnType<typeof setTimeout> | null;
@@ -91,7 +90,6 @@ export async function bootProviders(config: Config): Promise<ProviderResult> {
     memoryProvider,
     soulLoader,
     skillLoader,
-    contextContent,
     contextWatcher,
     contextDirWatcher,
     contextReloadTimeout,

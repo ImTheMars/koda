@@ -84,17 +84,9 @@ export function killSpawn(sessionKey: string): boolean {
   return true;
 }
 
-export function getRunningSessionKeys(): string[] {
-  return [...abortMap.keys()];
-}
-
 export function getNamedSession(name: string): { sessionKey: string } | undefined {
   const row = dbSubagents.getByName(name);
   return row ?? undefined;
-}
-
-export function listNamedSessions(): Array<{ name: string; sessionKey: string }> {
-  return dbSubagents.getRunning().map((r) => ({ name: r.name, sessionKey: r.sessionKey }));
 }
 
 // ---
