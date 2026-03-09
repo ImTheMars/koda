@@ -4,6 +4,7 @@
 
 import type { Config } from "../config.js";
 import type { TelegramResult } from "../channels/telegram.js";
+import type { SlackResult } from "../channels/slack.js";
 import type { SkillLoader } from "../tools/skills.js";
 import type { MemoryProvider } from "../tools/memory.js";
 import { handleDashboardRequest } from "../dashboard.js";
@@ -13,13 +14,14 @@ import { log } from "../log.js";
 export interface ServerDeps {
   config: Config;
   telegram: TelegramResult | null;
+  slack: SlackResult | null;
   skillLoader: SkillLoader;
   memoryProvider: MemoryProvider;
   defaultUserId: string;
 }
 
 export function bootServer(deps: ServerDeps) {
-  const { config, telegram, skillLoader, memoryProvider, defaultUserId } = deps;
+  const { config, telegram, slack, skillLoader, memoryProvider, defaultUserId } = deps;
 
   const server = Bun.serve({
     port: Number(process.env.PORT ?? 3000),
@@ -43,6 +45,11 @@ export function bootServer(deps: ServerDeps) {
       if (url.pathname === "/telegram" && req.method === "POST" && telegram?.handleWebhook) {
         log("http", `POST /telegram from=${req.headers.get("x-forwarded-for") ?? "?"}`);
         return telegram.handleWebhook(req);
+      }
+
+      if (url.pathname === "/slack" && req.method === "POST" && slack?.handleWebhook) {
+        log("http", `POST /slack from=${req.headers.get("x-forwarded-for") ?? "?"}`);
+        return slack.handleWebhook(req);
       }
 
       const dash = await handleDashboardRequest(req, {

@@ -46,6 +46,13 @@ const ConfigSchema = z.object({
     rateLimitMax: z.number().min(1).default(10),
     rateLimitWindowMs: z.number().min(1000).default(60_000),
   })),
+  slack: withEmptyDefault(z.object({
+    botToken: z.string().optional(),
+    signingSecret: z.string().optional(),
+    botUserId: z.string().optional(),
+    adminIds: z.array(z.string()).default([]),
+    teamId: z.string().optional(),
+  })),
   cli: withEmptyDefault(z.object({
     userId: z.string().default("owner"),
     chatId: z.string().default("owner"),
@@ -197,6 +204,10 @@ function applyEnvOverrides(raw: Record<string, unknown>): Record<string, unknown
     ["KODA_SUPERMEMORY_API_KEY", ["supermemory", "apiKey"]],
     ["KODA_EXA_API_KEY", ["exa", "apiKey"]],
     ["KODA_TELEGRAM_TOKEN", ["telegram", "token"]],
+    ["KODA_SLACK_BOT_TOKEN", ["slack", "botToken"]],
+    ["KODA_SLACK_SIGNING_SECRET", ["slack", "signingSecret"]],
+    ["KODA_SLACK_BOT_USER_ID", ["slack", "botUserId"]],
+    ["KODA_SLACK_TEAM_ID", ["slack", "teamId"]],
     ["KODA_GITHUB_TOKEN", ["github", "token"]],
     ["KODA_COMPOSIO_API_KEY", ["composio", "apiKey"]],
     ["KODA_TELEGRAM_WEBHOOK_URL", ["telegram", "webhookUrl"]],
@@ -228,6 +239,11 @@ function applyEnvOverrides(raw: Record<string, unknown>): Record<string, unknown
     const tg = (raw.telegram ?? {}) as Record<string, unknown>;
     tg.adminIds = env["KODA_TELEGRAM_ADMIN_IDS"].split(",").map((s) => s.trim()).filter(Boolean);
     raw.telegram = tg;
+  }
+  if (env["KODA_SLACK_ADMIN_IDS"]) {
+    const slack = (raw.slack ?? {}) as Record<string, unknown>;
+    slack.adminIds = env["KODA_SLACK_ADMIN_IDS"].split(",").map((s) => s.trim()).filter(Boolean);
+    raw.slack = slack;
   }
 
   // Auto-enable webhook mode when webhook URL is set via env
@@ -284,12 +300,16 @@ export async function loadConfig(configPath?: string): Promise<Config> {
 
   const config = result.data;
 
-  if (config.mode !== "cli-only" && !config.telegram.token) {
-    throw new Error("Invalid configuration:\n  telegram.token: Required unless mode is 'cli-only'");
+  if (config.mode !== "cli-only" && !config.telegram.token && !config.slack.botToken) {
+    throw new Error("Invalid configuration:\n  telegram.token or slack.botToken: One channel is required unless mode is 'cli-only'");
   }
 
   if (config.telegram.useWebhook && !config.telegram.webhookSecret) {
     throw new Error("Invalid configuration:\n  telegram.webhookSecret: Required when webhook mode is enabled");
+  }
+
+  if (config.slack.botToken && !config.slack.signingSecret) {
+    throw new Error("Invalid configuration:\n  slack.signingSecret: Required when Slack is enabled");
   }
 
   const projectRoot = process.cwd();
@@ -321,6 +341,11 @@ export async function persistConfig(config: Config): Promise<void> {
     useWebhook: config.telegram.useWebhook,
     ...(config.telegram.webhookUrl ? { webhookUrl: config.telegram.webhookUrl } : {}),
     ...(config.telegram.webhookSecret ? { webhookSecret: config.telegram.webhookSecret } : {}),
+  };
+  serializable.slack = {
+    adminIds: config.slack.adminIds,
+    ...(config.slack.botUserId ? { botUserId: config.slack.botUserId } : {}),
+    ...(config.slack.teamId ? { teamId: config.slack.teamId } : {}),
   };
   serializable.cli = config.cli;
   serializable.agent = {

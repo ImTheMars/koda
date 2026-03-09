@@ -153,6 +153,55 @@ describe("loadConfig", () => {
     delete process.env.KODA_TELEGRAM_ADMIN_IDS;
   });
 
+  test("env overrides set slack credentials", async () => {
+    process.env.KODA_MODE = "cli-only";
+    process.env.KODA_OPENROUTER_API_KEY = "test-key";
+    process.env.KODA_SLACK_BOT_TOKEN = "xoxb-test";
+    process.env.KODA_SLACK_SIGNING_SECRET = "signing-secret";
+    process.env.KODA_SLACK_BOT_USER_ID = "U_BOT";
+    const mod = await import("../config.js");
+    const config = await mod.loadConfig();
+    expect(config.slack.botToken).toBe("xoxb-test");
+    expect(config.slack.signingSecret).toBe("signing-secret");
+    expect(config.slack.botUserId).toBe("U_BOT");
+    delete process.env.KODA_SLACK_BOT_TOKEN;
+    delete process.env.KODA_SLACK_SIGNING_SECRET;
+    delete process.env.KODA_SLACK_BOT_USER_ID;
+  });
+
+  test("env overrides split comma-separated slack admin ids", async () => {
+    process.env.KODA_MODE = "cli-only";
+    process.env.KODA_OPENROUTER_API_KEY = "test-key";
+    process.env.KODA_SLACK_ADMIN_IDS = "U123,U456";
+    const mod = await import("../config.js");
+    const config = await mod.loadConfig();
+    expect(config.slack.adminIds).toEqual(["U123", "U456"]);
+    delete process.env.KODA_SLACK_ADMIN_IDS;
+  });
+
+  test("non-cli mode accepts slack as the only enabled channel", async () => {
+    process.env.KODA_MODE = "private";
+    process.env.KODA_OPENROUTER_API_KEY = "test-key";
+    delete process.env.KODA_TELEGRAM_TOKEN;
+    process.env.KODA_SLACK_BOT_TOKEN = "xoxb-test";
+    process.env.KODA_SLACK_SIGNING_SECRET = "signing-secret";
+    const mod = await import("../config.js");
+    const config = await mod.loadConfig();
+    expect(config.slack.botToken).toBe("xoxb-test");
+    delete process.env.KODA_SLACK_BOT_TOKEN;
+    delete process.env.KODA_SLACK_SIGNING_SECRET;
+  });
+
+  test("slack mode requires signing secret", async () => {
+    process.env.KODA_MODE = "cli-only";
+    process.env.KODA_OPENROUTER_API_KEY = "test-key";
+    process.env.KODA_SLACK_BOT_TOKEN = "xoxb-test";
+    delete process.env.KODA_SLACK_SIGNING_SECRET;
+    const mod = await import("../config.js");
+    await expect(mod.loadConfig()).rejects.toThrow("slack.signingSecret");
+    delete process.env.KODA_SLACK_BOT_TOKEN;
+  });
+
   test("workspace defaults to ~/.koda", async () => {
     process.env.KODA_MODE = "cli-only";
     process.env.KODA_OPENROUTER_API_KEY = "test-key";

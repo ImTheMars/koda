@@ -30,6 +30,8 @@ interface ToolRuntimeContext {
   userId: string;
   chatId: string;
   channel: string;
+  projectScopeId?: string;
+  workspaceScopeId?: string;
   toolCost: { total: number };
   pendingFiles: Array<{ path: string; caption?: string }>;
 }
@@ -38,6 +40,8 @@ const DEFAULT_CONTEXT: ToolRuntimeContext = {
   userId: "owner",
   chatId: "owner",
   channel: "cli",
+  projectScopeId: undefined,
+  workspaceScopeId: undefined,
   toolCost: { total: 0 },
   pendingFiles: [],
 };
@@ -84,6 +88,8 @@ export async function buildTools(deps: {
       memory: memoryProvider,
       getUserId: () => getToolContext().userId,
       getChatId: () => getToolContext().chatId,
+      getProjectScopeId: () => getToolContext().projectScopeId,
+      getWorkspaceScopeId: () => getToolContext().workspaceScopeId,
     }),
     ...registerFilesystemTools({ workspace }),
     ...registerSkillTools({ skillLoader, workspace, exaApiKey: config.exa.apiKey, githubToken: config.github?.token }),

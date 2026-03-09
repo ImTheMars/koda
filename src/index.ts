@@ -11,6 +11,7 @@ import { parseCronNext } from "./time.js";
 import { createAgent, createStreamAgent, type AgentDeps } from "./agent.js";
 import { startRepl } from "./channels/repl.js";
 import { startTelegram, type TelegramResult } from "./channels/telegram.js";
+import { startSlack, type SlackResult } from "./channels/slack.js";
 import { startProactive } from "./proactive.js";
 import { buildTools } from "./tools/index.js";
 import { registerSubAgentTools, getNamedSession } from "./tools/subagent.js";
@@ -21,6 +22,14 @@ import { bootProviders } from "./boot/providers.js";
 import { bootMcp, reconnectMcpServer, type McpEntry } from "./boot/mcp.js";
 import { bootServer } from "./boot/server.js";
 import { startRailwayMonitor } from "./boot/railway-monitor.js";
+
+type DeliveryChannel = "slack" | "telegram" | "cli";
+
+interface ChannelTarget {
+  channel: DeliveryChannel;
+  userId: string;
+  chatId: string;
+}
 
 // --- CLI routing ---
 const command = process.argv[2];
@@ -45,6 +54,27 @@ log("boot", "Database initialized");
 // --- Boot phase 3: Providers ---
 const { memoryProvider, soulLoader, skillLoader, contextWatcher, contextDirWatcher, contextReloadTimeout, getContextContent } = await bootProviders(config);
 
+function getPrimaryTargets(): ChannelTarget[] {
+  if (config.slack.adminIds.length > 0) {
+    return config.slack.adminIds.map((adminId) => ({
+      channel: "slack" as const,
+      userId: adminId,
+      chatId: adminId,
+    }));
+  }
+  if (config.telegram.adminIds.length > 0) {
+    return config.telegram.adminIds.map((adminId) => ({
+      channel: "telegram" as const,
+      userId: adminId,
+      chatId: adminId,
+    }));
+  }
+  return [{ channel: "cli", userId: config.owner.id, chatId: config.owner.id }];
+}
+
+const primaryTargets = getPrimaryTargets();
+const primaryTarget = primaryTargets[0]!;
+
 // --- Boot phase 4: Tools ---
 const tools = await buildTools({ config, memoryProvider, skillLoader, workspace: config.workspace, soulLoader });
 
@@ -61,7 +91,7 @@ const agentDeps: AgentDeps = {
   getContextPrompt: () => getContextContent(),
   getSkillsSummary: () => skillLoader.buildSkillsSummary(),
   getProfile: (userId, query, sessionKey) => memoryProvider.getProfile(userId, query || undefined, sessionKey),
-  ingestConversation: (sessionKey, userId, messages, chatId) => memoryProvider.ingestConversation(sessionKey, userId, messages, chatId),
+  ingestConversation: (sessionKey, userId, messages, context) => memoryProvider.ingestConversation(sessionKey, userId, messages, context),
   getSoulAcks: () => soulLoader.getAckTemplates(),
   getAssessmentSummary: async (userId) => {
     const snapshot = dbAssessment.buildSummary(userId);
@@ -102,12 +132,15 @@ const agentDeps: AgentDeps = {
     }
     return lines.join("\n");
   },
-  getProjectMemories: memoryProvider.getProjectMemories
-    ? (chatId, query) => memoryProvider.getProjectMemories!(chatId, query)
+  getWorkspaceMemories: memoryProvider.getWorkspaceMemories
+    ? (workspaceId, query) => memoryProvider.getWorkspaceMemories!(workspaceId, query)
     : undefined,
-  getGroupMembers: (chatId) => {
+  getProjectMemories: memoryProvider.getProjectMemories
+    ? (projectScopeId, query) => memoryProvider.getProjectMemories!(projectScopeId, query)
+    : undefined,
+  getGroupMembers: (scopeId) => {
     try {
-      const members = chatMembers.getByChatId(chatId);
+      const members = chatMembers.getByChatId(scopeId);
       return members.map((m) => {
         const profile = userProfiles.get(m.userId);
         return {
@@ -120,15 +153,20 @@ const agentDeps: AgentDeps = {
   },
 };
 
-// Setup entity context for owner on first boot
-memoryProvider.setupEntityContext(config.owner.id).catch((err) => {
-  logWarn("boot", `Entity context setup failed: ${(err as Error).message}`);
-});
+// Setup entity context for primary operators on first boot.
+for (const userId of new Set([config.owner.id, ...primaryTargets.map((target) => target.userId)])) {
+  memoryProvider.setupEntityContext(userId).catch((err) => {
+    logWarn("boot", `Entity context setup failed for ${userId}: ${(err as Error).message}`);
+  });
+}
 
 // Seed admin profiles from config
 try {
   for (const adminId of config.telegram.adminIds) {
     userProfiles.upsert({ userId: adminId, displayName: `Admin ${adminId}`, role: "admin" });
+  }
+  for (const adminId of config.slack.adminIds) {
+    userProfiles.upsert({ userId: adminId, displayName: `Slack Admin ${adminId}`, role: "admin" });
   }
 } catch { /* DB not migrated yet — safe to skip */ }
 
@@ -143,123 +181,82 @@ Object.assign(tools, registerSubAgentTools({
   maxStepsCap: config.subagent.maxSteps,
 }));
 
+function seedRecurringTaskForTargets(params: {
+  seedKeyBase: string;
+  taskIdBase: string;
+  cron: string;
+  description: string;
+  prompt: string;
+}): void {
+  for (const target of primaryTargets) {
+    const seedKey = `${params.seedKeyBase}:${target.channel}:${target.userId}`;
+    if (dbState.get(seedKey)) continue;
+    try {
+      const nextRun = parseCronNext(params.cron, new Date(), config.scheduler.timezone);
+      dbTasks.create({
+        id: `${params.taskIdBase}-${target.channel}-${target.userId}`,
+        userId: target.userId,
+        chatId: target.chatId,
+        channel: target.channel,
+        type: "recurring",
+        description: params.description,
+        prompt: params.prompt,
+        cron: params.cron,
+        nextRunAt: nextRun.toISOString(),
+        enabled: true,
+        oneShot: false,
+      });
+      dbState.set(seedKey, true);
+      log("boot", `Seeded ${params.description} for ${target.channel}:${target.userId} (next: ${nextRun.toISOString()})`);
+    } catch {
+      // already exists or DB not ready — safe to skip
+    }
+  }
+}
+
 // --- Seed built-in recurring tasks (once per install) ---
 (function seedBuiltinTasks() {
-  const SEED_KEY = "builtin-skill-discovery-v1";
-  if (dbState.get(SEED_KEY)) return;
-  try {
-    const ownerId = config.telegram.adminIds[0] ?? config.owner.id;
-    const channel = config.telegram.token ? "telegram" : "cli";
-    const chatId = ownerId;
-    const cron = config.features.skillDiscoveryCron;
-    const nextRun = parseCronNext(cron, new Date(), config.scheduler.timezone);
-    dbTasks.create({
-      id: "builtin-skill-discovery",
-      userId: ownerId,
-      chatId,
-      channel,
-      type: "recurring",
-      description: "Weekly skill discovery",
-      prompt: "Search the skill shop for 3–5 interesting new skills relevant to my recent activity. " +
-              "Briefly list what you found with their rawUrl — don't install anything, just surface the options.",
-      cron,
-      nextRunAt: nextRun.toISOString(),
-      enabled: true,
-      oneShot: false,
-    });
-    dbState.set(SEED_KEY, true);
-    log("boot", `Seeded weekly skill discovery (next: ${nextRun.toISOString()})`);
-  } catch { /* already exists or DB not ready — safe to skip */ }
+  seedRecurringTaskForTargets({
+    seedKeyBase: "builtin-skill-discovery-v2",
+    taskIdBase: "builtin-skill-discovery",
+    cron: config.features.skillDiscoveryCron,
+    description: "Weekly skill discovery",
+    prompt: "Search the skill shop for 3-5 interesting new skills relevant to my recent activity. Briefly list what you found with their rawUrl - don't install anything, just surface the options.",
+  });
 })();
 
 // --- Seed daily briefing (requires Composio Gmail + Calendar) ---
 (function seedDailyBriefing() {
-  const BRIEFING_KEY = "builtin-daily-briefing-v1";
-  if (dbState.get(BRIEFING_KEY)) return;
   if (!config.composio?.apiKey) return;
-  try {
-    const ownerId = config.telegram.adminIds[0] ?? config.owner.id;
-    const channel = config.telegram.token ? "telegram" : "cli";
-    const chatId = ownerId;
-    const cron = config.features.dailyBriefingCron;
-    const nextRun = parseCronNext(cron, new Date(), config.scheduler.timezone);
-    dbTasks.create({
-      id: "builtin-daily-briefing",
-      userId: ownerId,
-      chatId,
-      channel,
-      type: "recurring",
-      description: "Daily morning briefing",
-      prompt: "Give me a brief morning briefing. Check my calendar for today's events, " +
-              "check my recent emails for anything important, and list any pending tasks or reminders. " +
-              "Keep it concise — a quick overview to start my day.",
-      cron,
-      nextRunAt: nextRun.toISOString(),
-      enabled: true,
-      oneShot: false,
-    });
-    dbState.set(BRIEFING_KEY, true);
-    log("boot", `Seeded daily briefing (next: ${nextRun.toISOString()})`);
-  } catch { /* already exists or DB not ready — safe to skip */ }
+  seedRecurringTaskForTargets({
+    seedKeyBase: "builtin-daily-briefing-v2",
+    taskIdBase: "builtin-daily-briefing",
+    cron: config.features.dailyBriefingCron,
+    description: "Daily morning briefing",
+    prompt: "Give me a brief morning briefing. Check my calendar for today's events, check my recent emails for anything important, and list any pending tasks or reminders. Keep it concise - a quick overview to start my day.",
+  });
 })();
 
 // --- Seed weekly review ---
 (function seedWeeklyReview() {
-  const REVIEW_KEY = "builtin-weekly-review-v1";
-  if (dbState.get(REVIEW_KEY)) return;
-  try {
-    const ownerId = config.telegram.adminIds[0] ?? config.owner.id;
-    const channel = config.telegram.token ? "telegram" : "cli";
-    const chatId = ownerId;
-    const cron = config.features.weeklyReviewCron;
-    const nextRun = parseCronNext(cron, new Date(), config.scheduler.timezone);
-    dbTasks.create({
-      id: "builtin-weekly-review",
-      userId: ownerId,
-      chatId,
-      channel,
-      type: "recurring",
-      description: "Weekly review",
-      prompt: "Run a weekly review. Use assessmentSnapshot, listGoals, listPlans, listTasks, and listReviews. " +
-              "Identify wins, risks, contradictions, and the 1-3 highest leverage next actions. " +
-              "Store the review with storeReview and keep the message concise but real.",
-      cron,
-      nextRunAt: nextRun.toISOString(),
-      enabled: true,
-      oneShot: false,
-    });
-    dbState.set(REVIEW_KEY, true);
-    log("boot", `Seeded weekly review (next: ${nextRun.toISOString()})`);
-  } catch { /* already exists or DB not ready — safe to skip */ }
+  seedRecurringTaskForTargets({
+    seedKeyBase: "builtin-weekly-review-v2",
+    taskIdBase: "builtin-weekly-review",
+    cron: config.features.weeklyReviewCron,
+    description: "Weekly review",
+    prompt: "Run a weekly review. Use assessmentSnapshot, listGoals, listPlans, listTasks, and listReviews. Identify wins, risks, contradictions, and the 1-3 highest leverage next actions. Store the review with storeReview and keep the message concise but real.",
+  });
 })();
 
 // --- Seed goal drift audit ---
 (function seedGoalDriftAudit() {
-  const DRIFT_KEY = "builtin-goal-drift-v1";
-  if (dbState.get(DRIFT_KEY)) return;
-  try {
-    const ownerId = config.telegram.adminIds[0] ?? config.owner.id;
-    const channel = config.telegram.token ? "telegram" : "cli";
-    const chatId = ownerId;
-    const cron = config.features.goalDriftCron;
-    const nextRun = parseCronNext(cron, new Date(), config.scheduler.timezone);
-    dbTasks.create({
-      id: "builtin-goal-drift",
-      userId: ownerId,
-      chatId,
-      channel,
-      type: "recurring",
-      description: "Goal drift audit",
-      prompt: "Run a goal drift audit. Compare the user's active goals, recent observations, interventions, tasks, and durable plans. " +
-              "Call out where goals and behavior seem misaligned, log any important observations, and recommend one intervention if needed.",
-      cron,
-      nextRunAt: nextRun.toISOString(),
-      enabled: true,
-      oneShot: false,
-    });
-    dbState.set(DRIFT_KEY, true);
-    log("boot", `Seeded goal drift audit (next: ${nextRun.toISOString()})`);
-  } catch { /* already exists or DB not ready — safe to skip */ }
+  seedRecurringTaskForTargets({
+    seedKeyBase: "builtin-goal-drift-v2",
+    taskIdBase: "builtin-goal-drift",
+    cron: config.features.goalDriftCron,
+    description: "Goal drift audit",
+    prompt: "Run a goal drift audit. Compare the user's active goals, recent observations, interventions, tasks, and durable plans. Call out where goals and behavior seem misaligned, log any important observations, and recommend one intervention if needed.",
+  });
 })();
 
 // --- Named agent routing wrapper ---
@@ -288,11 +285,12 @@ function makeNamedStreamAgent(baseStreamAgent: typeof streamAgentFn): typeof str
 
 // --- Channels ---
 let telegram: TelegramResult | null = null;
+let slack: SlackResult | null = null;
 let repl: { stop: () => void } | null = null;
 
 const routedStreamAgent = makeNamedStreamAgent(streamAgentFn);
 
-if (config.mode !== "cli-only" && config.telegram.token) {
+if (config.mode !== "cli-only" && (config.telegram.token || config.slack.botToken)) {
   // Read deploy timestamp written by SIGTERM handler on the previous run
   const deployTsFile = resolve(config.workspace, ".koda-deploy-ts");
   let deployDurationMs: number | undefined;
@@ -305,16 +303,33 @@ if (config.mode !== "cli-only" && config.telegram.token) {
     // No timestamp file — fresh start or non-deploy restart
   }
 
-  telegram = await startTelegram({ streamAgent: routedStreamAgent, config, deployDurationMs });
-  log("boot", `Channel: telegram enabled${config.telegram.useWebhook ? " (webhook)" : " (polling)"}`);
+  if (config.slack.botToken) {
+    slack = await startSlack({ streamAgent: routedStreamAgent, config });
+    log("boot", "Channel: slack enabled (webhook)");
+  }
+
+  if (config.telegram.token) {
+    telegram = await startTelegram({ streamAgent: routedStreamAgent, config, deployDurationMs });
+    log("boot", `Channel: telegram enabled${config.telegram.useWebhook ? " (webhook)" : " (polling)"}`);
+  }
 }
 
 // --- Railway build monitor ---
 let railwayMonitor: { stop(): void } | null = null;
-if (telegram) {
+if (telegram || slack) {
   railwayMonitor = startRailwayMonitor({
-    onBuildDetected: (msg) => telegram!.notifyAdmins(msg).catch(() => {}),
-    onBuildFailed: (msg) => telegram!.notifyAdmins(msg).catch(() => {}),
+    onBuildDetected: async (msg) => {
+      await Promise.all([
+        telegram?.notifyAdmins(msg).catch(() => {}),
+        slack?.notifyAdmins(msg).catch(() => {}),
+      ]);
+    },
+    onBuildFailed: async (msg) => {
+      await Promise.all([
+        telegram?.notifyAdmins(msg).catch(() => {}),
+        slack?.notifyAdmins(msg).catch(() => {}),
+      ]);
+    },
   });
 }
 
@@ -331,8 +346,8 @@ if (config.mode === "cli-only") {
 // --- Proactive ---
 let proactive: ReturnType<typeof startProactive> | null = null;
 if (config.features.scheduler) {
-  const defaultOwner = config.telegram.adminIds[0] ?? config.owner.id;
-  const defaultChannel = telegram ? "telegram" : "cli";
+  const defaultOwner = primaryTarget.userId;
+  const defaultChannel = primaryTarget.channel;
 
   proactive = startProactive({
     runAgent,
@@ -345,11 +360,15 @@ if (config.features.scheduler) {
         await telegram.sendDirect(chatId, text);
         return;
       }
+      if (channel === "slack" && slack) {
+        await slack.sendDirect(chatId, text);
+        return;
+      }
       logWarn("proactive", `no direct sender for channel: ${channel}`);
     },
     config,
     defaultUserId: defaultOwner,
-    defaultChatId: defaultOwner,
+    defaultChatId: primaryTarget.chatId,
     defaultChannel,
   });
   log("boot", "Proactive: started");
@@ -388,13 +407,13 @@ const hourlyCleanTimer = setInterval(() => {
 }, config.features.gcIntervalHours * 3_600_000);
 
 // --- Boot phase 6: HTTP Server ---
-const dashOwner = config.telegram.adminIds[0] ?? config.owner.id;
 const server = bootServer({
   config,
   telegram,
+  slack,
   skillLoader,
   memoryProvider,
-  defaultUserId: dashOwner,
+  defaultUserId: primaryTarget.userId,
 });
 
 // --- Graceful shutdown ---
@@ -413,6 +432,7 @@ const shutdown = async (signal: "SIGTERM" | "SIGINT") => {
   }
 
   if (telegram) await telegram.stop(signal);
+  if (slack) await slack.stop();
   soulLoader.dispose();
   contextWatcher?.close();
   contextDirWatcher?.close();

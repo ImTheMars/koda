@@ -26,6 +26,8 @@ export interface TelegramDeps {
     content: string; senderId: string; chatId: string; channel: string;
     attachments?: Array<{ type: "image"; mimeType: string; data: string }>;
     sessionKey: string; source?: string;
+    workspaceScopeId?: string;
+    projectScopeId?: string;
     tierOverride?: Tier;
     onAck?: (text: string) => void;
     onTypingStart?: () => void;
@@ -274,6 +276,7 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
   const isAllowed = (userId: string) => allowFrom.size === 0 || allowFrom.has(userId);
   const isAdmin = (userId: string) => config.telegram.adminIds.includes(userId);
   const sessionKeyForChat = (chatId: string) => `telegram_${chatId}`;
+  const projectScopeIdForChat = (chatId: string) => `telegram:${chatId}`;
   const decodeThread = (threadId: string) => telegram.decodeThreadId(threadId);
 
   const isRateLimited = (chatId: string): boolean => {
@@ -409,7 +412,7 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
       const displayName = getDisplayName(from);
       const role = isAdmin(senderId) ? "admin" as const : "member" as const;
       userProfiles.upsert({ userId: senderId, displayName, username: from?.username, role });
-      if (isGroupChat(chatType)) chatMembers.upsert(chatId, senderId);
+      if (isGroupChat(chatType)) chatMembers.upsert(projectScopeIdForChat(chatId), senderId);
     } catch {
       // DB may not be migrated yet.
     }
@@ -840,6 +843,8 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
         chatId,
         channel: "telegram",
         sessionKey: sessionKeyForChat(chatId),
+        workspaceScopeId: inGroup ? projectScopeIdForChat(chatId) : undefined,
+        projectScopeId: inGroup ? projectScopeIdForChat(chatId) : undefined,
         tierOverride,
         source,
         senderDisplayName: displayName,

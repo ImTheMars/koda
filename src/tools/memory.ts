@@ -25,11 +25,26 @@ export interface UserProfile {
   memories: string[];
 }
 
+export interface MemoryScopeContext {
+  channel?: string;
+  chatId?: string;
+  isGroup?: boolean;
+  projectScopeId?: string;
+  senderDisplayName?: string;
+  sessionKey?: string;
+  workspaceScopeId?: string;
+}
+
 export interface MemoryProvider {
   store(userId: string, content: string, tags?: string[]): Promise<{ id: string }>;
   recall(userId: string, query: string, limit?: number, sessionKey?: string): Promise<string[]>;
   getProfile(userId: string, query?: string, sessionKey?: string): Promise<UserProfile>;
-  ingestConversation(sessionKey: string, userId: string, messages: Array<{ role: string; content: string }>, chatId?: string): Promise<void>;
+  ingestConversation(
+    sessionKey: string,
+    userId: string,
+    messages: Array<{ role: string; content: string }>,
+    context?: MemoryScopeContext,
+  ): Promise<void>;
   setupEntityContext(userId: string): Promise<void>;
   healthCheck(): Promise<boolean>;
   readonly isDegraded: boolean;
@@ -43,6 +58,34 @@ export interface MemoryProvider {
   recallProject?(chatId: string, query: string, limit?: number): Promise<string[]>;
   /** Get project profile + query-relevant memories for system prompt. */
   getProjectMemories?(chatId: string, query: string): Promise<{ static: string[]; memories: string[] }>;
+  /** Store a fact into shared business/workspace memory. */
+  storeWorkspace?(workspaceId: string, content: string, tags?: string[]): Promise<{ id: string }>;
+  /** Search shared business/workspace memory. */
+  recallWorkspace?(workspaceId: string, query: string, limit?: number): Promise<string[]>;
+  /** Get workspace profile + query-relevant memories for system prompt. */
+  getWorkspaceMemories?(workspaceId: string, query: string): Promise<{ static: string[]; memories: string[] }>;
+}
+
+export function splitSpeakerPrefix(content: string): { speaker: string | null; text: string } {
+  const match = content.match(/^\[([^\]]+)\]:\s*/);
+  if (!match) return { speaker: null, text: content };
+  return {
+    speaker: match[1]!.trim(),
+    text: content.slice(match[0].length),
+  };
+}
+
+export function filterMessagesForPrivateIngest(
+  messages: Array<{ role: string; content: string }>,
+  senderDisplayName?: string,
+): Array<{ role: string; content: string }> {
+  if (!senderDisplayName) return messages;
+  const filtered = messages.filter((message) => {
+    if (message.role !== "user") return true;
+    const { speaker } = splitSpeakerPrefix(message.content);
+    return speaker === null || speaker === senderDisplayName;
+  });
+  return filtered.length > 0 ? filtered : messages;
 }
 
 // ============================================================
@@ -342,11 +385,89 @@ function bumpIngestCount(sessionKey: string): number {
 const USER_ENTITY_CONTEXT = (displayName?: string) =>
   `Personal AI memory for ${displayName ?? "a user"}. Store: preferences, communication style, project contributions, decisions, work patterns, goals.`;
 
+const WORKSPACE_ENTITY_CONTEXT =
+  "Shared workspace memory for a business. Store: company facts, strategy, policies, recurring decisions, offers, products, clients, and shared operating context.";
+
 const PROJECT_ENTITY_CONTEXT =
   "Shared project memory for a business collaboration. Store: decisions, goals, action items, milestones, business strategy, responsibilities.";
 
 function createSupermemoryProvider(apiKey: string, config?: Config): MemoryProvider {
   const client = new Supermemory({ apiKey });
+  const scopeContainer = (kind: "workspace" | "project", scopeId: string) => `${kind}-${scopeId}`;
+  const scopeEntityContext = (kind: "workspace" | "project") => (
+    kind === "workspace" ? WORKSPACE_ENTITY_CONTEXT : PROJECT_ENTITY_CONTEXT
+  );
+
+  const storeScoped = async (
+    kind: "workspace" | "project",
+    scopeId: string,
+    content: string,
+    tags?: string[],
+  ): Promise<{ id: string }> => {
+    if (isCircuitOpen()) {
+      log("memory", "circuit breaker tripped");
+      return { id: "unavailable" };
+    }
+    try {
+      const result = await client.add({
+        content,
+        containerTag: scopeContainer(kind, scopeId),
+        entityContext: scopeEntityContext(kind),
+        metadata: { scope_id: scopeId, ...(tags?.length ? { tags: tags.join(",") } : {}) },
+      });
+      recordSuccess();
+      return { id: result.id ?? "ok" };
+    } catch (err) {
+      recordFailure();
+      logError("memory", `store${kind[0]!.toUpperCase()}${kind.slice(1)} failed`, err);
+      return { id: "unavailable" };
+    }
+  };
+
+  const recallScoped = async (
+    kind: "workspace" | "project",
+    scopeId: string,
+    query: string,
+    limit = 5,
+  ): Promise<string[]> => {
+    if (isCircuitOpen()) return [];
+    try {
+      const response = await client.search.memories({ q: query, containerTag: scopeContainer(kind, scopeId), limit });
+      recordSuccess();
+      const results = (response as { results?: Array<{ memory?: string; chunk?: string; content?: string }> }).results ?? [];
+      log("memory", "recall%s: %d results", kind, results.length);
+      return results.map((r) => extractMemoryText(r)).filter(Boolean);
+    } catch (err) {
+      recordFailure();
+      logError("memory", `recall${kind[0]!.toUpperCase()}${kind.slice(1)} failed`, err);
+      return [];
+    }
+  };
+
+  const profileScoped = async (
+    kind: "workspace" | "project",
+    scopeId: string,
+    query: string,
+  ): Promise<{ static: string[]; memories: string[] }> => {
+    if (isCircuitOpen()) return { static: [], memories: [] };
+    try {
+      const profileRes = await client.profile({
+        containerTag: scopeContainer(kind, scopeId),
+        ...(query ? { q: query } : {}),
+      });
+      recordSuccess();
+      const staticFacts = profileRes.profile?.static ?? [];
+      const searchResults = (profileRes.searchResults as { results?: Array<{ memory?: string; chunk?: string; content?: string }> } | undefined)
+        ?.results ?? [];
+      const memories = searchResults.map((r) => extractMemoryText(r)).filter(Boolean);
+      log("memory", "%sProfile: static=%d memories=%d", kind, staticFacts.length, memories.length);
+      return { static: staticFacts, memories };
+    } catch (err) {
+      recordFailure();
+      logError("memory", `${kind}Profile failed`, err);
+      return { static: [], memories: [] };
+    }
+  };
 
   return {
     get isDegraded() { return isCircuitOpen(); },
@@ -373,7 +494,7 @@ function createSupermemoryProvider(apiKey: string, config?: Config): MemoryProvi
     async recall(userId, query, limit = 5, sessionKey) {
       if (isCircuitOpen()) {
         log("memory", "sqlite fallback");
-        const history = dbMessages.getHistory(sessionKey ?? `telegram_${userId}`, 50);
+        const history = dbMessages.getHistory(sessionKey ?? `memory_${userId}`, 50);
         const lower = query.toLowerCase();
         return history
           .filter((m) => m.content.toLowerCase().includes(lower))
@@ -396,7 +517,7 @@ function createSupermemoryProvider(apiKey: string, config?: Config): MemoryProvi
     async getProfile(userId, query?, sessionKey?) {
       if (isCircuitOpen()) {
         log("memory", "profile: circuit open, sqlite fallback");
-        const history = dbMessages.getHistory(sessionKey ?? `telegram_${userId}`, 30);
+        const history = dbMessages.getHistory(sessionKey ?? `memory_${userId}`, 30);
         const lower = query?.toLowerCase() ?? "";
         const fallbackMemories = lower
           ? history.filter((m) => m.content.toLowerCase().includes(lower)).slice(0, 5).map((m) => m.content)
@@ -425,16 +546,21 @@ function createSupermemoryProvider(apiKey: string, config?: Config): MemoryProvi
       }
     },
 
-    async ingestConversation(sessionKey, userId, msgs, chatId?) {
+    async ingestConversation(sessionKey, userId, msgs, context) {
       if (isCircuitOpen()) { log("memory", "ingest: circuit open, skipping"); return; }
+      const privateMessages = context?.isGroup
+        ? filterMessagesForPrivateIngest(msgs, context.senderDisplayName)
+        : msgs;
+      const workspaceScopeId = context?.workspaceScopeId;
+      const projectScopeId = context?.projectScopeId;
 
       // Rate limit: only extract every 3rd call
       const count = bumpIngestCount(sessionKey);
 
       if (count % 3 !== 0 || !config) {
         // Fallback to simple excerpt storage
-        const lastUser = [...msgs].reverse().find((m) => m.role === "user");
-        const lastAssistant = [...msgs].reverse().find((m) => m.role === "assistant");
+        const lastUser = [...privateMessages].reverse().find((m) => m.role === "user");
+        const lastAssistant = [...privateMessages].reverse().find((m) => m.role === "assistant");
         if (!lastUser || !lastAssistant) return;
         const summary = `Conversation excerpt:\nUser: ${lastUser.content.slice(0, 300)}\nKoda: ${lastAssistant.content.slice(0, 300)}`;
         try {
@@ -465,7 +591,7 @@ function createSupermemoryProvider(apiKey: string, config?: Config): MemoryProvi
           .map((r) => extractMemoryText(r))
           .filter(Boolean);
 
-        const facts = await extractMemoryFacts(msgs, existingFacts, config);
+        const facts = await extractMemoryFacts(privateMessages, existingFacts, config);
         let stored = 0;
 
         for (const fact of facts) {
@@ -516,27 +642,48 @@ function createSupermemoryProvider(apiKey: string, config?: Config): MemoryProvi
         }
         if (stored > 0) log("memory", "ingest: extracted and stored %d facts for session %s", stored, sessionKey);
 
-        // Group chat: also extract project-level facts into project container
-        if (chatId && chatId.startsWith("-")) {
+        // Shared scopes: capture durable business and project facts from group context.
+        if (context?.isGroup && (workspaceScopeId || projectScopeId)) {
           try {
             const projectFacts = await extractProjectFacts(msgs, config);
+            let workspaceStored = 0;
             let projectStored = 0;
             for (const fact of projectFacts) {
-              try {
-                await client.add({
-                  content: fact.content,
-                  containerTag: `project-${chatId}`,
-                  entityContext: PROJECT_ENTITY_CONTEXT,
-                  metadata: { session: sessionKey, type: fact.type, extracted: "true" },
-                });
-                projectStored++;
-              } catch (err) {
-                logError("memory", "project fact store failed", err);
+              if (workspaceScopeId) {
+                try {
+                  await client.add({
+                    content: fact.content,
+                    containerTag: scopeContainer("workspace", workspaceScopeId),
+                    entityContext: WORKSPACE_ENTITY_CONTEXT,
+                    metadata: { session: sessionKey, type: fact.type, extracted: "true" },
+                  });
+                  workspaceStored++;
+                } catch (err) {
+                  logError("memory", "workspace fact store failed", err);
+                }
+              }
+              if (projectScopeId) {
+                try {
+                  await client.add({
+                    content: fact.content,
+                    containerTag: scopeContainer("project", projectScopeId),
+                    entityContext: PROJECT_ENTITY_CONTEXT,
+                    metadata: { session: sessionKey, type: fact.type, extracted: "true" },
+                  });
+                  projectStored++;
+                } catch (err) {
+                  logError("memory", "project fact store failed", err);
+                }
               }
             }
-            if (projectStored > 0) log("memory", "ingest: stored %d project facts for chat %s", projectStored, chatId);
+            if (workspaceStored > 0) {
+              log("memory", "ingest: stored %d workspace facts for %s", workspaceStored, workspaceScopeId);
+            }
+            if (projectStored > 0) {
+              log("memory", "ingest: stored %d project facts for %s", projectStored, projectScopeId);
+            }
           } catch (err) {
-            log("memory", "project extraction failed: %s", (err as Error).message);
+            log("memory", "shared extraction failed: %s", (err as Error).message);
           }
         }
 
@@ -570,58 +717,29 @@ function createSupermemoryProvider(apiKey: string, config?: Config): MemoryProvi
     },
 
     async storeProject(chatId: string, content: string, tags?: string[]): Promise<{ id: string }> {
-      if (isCircuitOpen()) { log("memory", "circuit breaker tripped"); return { id: "unavailable" }; }
       log("memory", "storeProject chat=%s len=%d", chatId, content.length);
-      try {
-        const result = await client.add({
-          content,
-          containerTag: `project-${chatId}`,
-          entityContext: PROJECT_ENTITY_CONTEXT,
-          metadata: { chat_id: chatId, ...(tags?.length ? { tags: tags.join(",") } : {}) },
-        });
-        recordSuccess();
-        return { id: result.id ?? "ok" };
-      } catch (err) {
-        recordFailure();
-        logError("memory", "storeProject failed", err);
-        return { id: "unavailable" };
-      }
+      return storeScoped("project", chatId, content, tags);
     },
 
     async recallProject(chatId: string, query: string, limit = 5): Promise<string[]> {
-      if (isCircuitOpen()) return [];
-      try {
-        const response = await client.search.memories({ q: query, containerTag: `project-${chatId}`, limit });
-        recordSuccess();
-        const results = (response as { results?: Array<{ memory?: string; chunk?: string; content?: string }> }).results ?? [];
-        log("memory", "recallProject: %d results", results.length);
-        return results.map((r) => extractMemoryText(r)).filter(Boolean);
-      } catch (err) {
-        recordFailure();
-        logError("memory", "recallProject failed", err);
-        return [];
-      }
+      return recallScoped("project", chatId, query, limit);
     },
 
     async getProjectMemories(chatId: string, query: string): Promise<{ static: string[]; memories: string[] }> {
-      if (isCircuitOpen()) return { static: [], memories: [] };
-      try {
-        const profileRes = await client.profile({
-          containerTag: `project-${chatId}`,
-          ...(query ? { q: query } : {}),
-        });
-        recordSuccess();
-        const staticFacts = profileRes.profile?.static ?? [];
-        const searchResults = (profileRes.searchResults as { results?: Array<{ memory?: string; chunk?: string; content?: string }> } | undefined)
-          ?.results ?? [];
-        const memories = searchResults.map((r) => extractMemoryText(r)).filter(Boolean);
-        log("memory", "projectProfile: static=%d memories=%d", staticFacts.length, memories.length);
-        return { static: staticFacts, memories };
-      } catch (err) {
-        recordFailure();
-        logError("memory", "projectProfile failed", err);
-        return { static: [], memories: [] };
-      }
+      return profileScoped("project", chatId, query);
+    },
+
+    async storeWorkspace(workspaceId: string, content: string, tags?: string[]): Promise<{ id: string }> {
+      log("memory", "storeWorkspace workspace=%s len=%d", workspaceId, content.length);
+      return storeScoped("workspace", workspaceId, content, tags);
+    },
+
+    async recallWorkspace(workspaceId: string, query: string, limit = 5): Promise<string[]> {
+      return recallScoped("workspace", workspaceId, query, limit);
+    },
+
+    async getWorkspaceMemories(workspaceId: string, query: string): Promise<{ static: string[]; memories: string[] }> {
+      return profileScoped("workspace", workspaceId, query);
     },
 
     async setupEntityContext(userId) {
@@ -687,6 +805,9 @@ export function createMemoryProvider(config: Config): MemoryProvider {
       async storeProject() { return { id: "unavailable" }; },
       async recallProject() { return []; },
       async getProjectMemories() { return { static: [], memories: [] }; },
+      async storeWorkspace() { return { id: "unavailable" }; },
+      async recallWorkspace() { return []; },
+      async getWorkspaceMemories() { return { static: [], memories: [] }; },
     };
   }
   log("memory", "using Supermemory cloud provider");
@@ -697,8 +818,14 @@ export function createMemoryProvider(config: Config): MemoryProvider {
 // Tools
 // ============================================================
 
-export function registerMemoryTools(deps: { memory: MemoryProvider; getUserId: () => string; getChatId: () => string }): ToolSet {
-  const { memory, getUserId, getChatId } = deps;
+export function registerMemoryTools(deps: {
+  memory: MemoryProvider;
+  getUserId: () => string;
+  getChatId: () => string;
+  getProjectScopeId?: () => string | undefined;
+  getWorkspaceScopeId?: () => string | undefined;
+}): ToolSet {
+  const { memory, getUserId, getChatId, getProjectScopeId, getWorkspaceScopeId } = deps;
 
   const remember = tool({
     description: "Save important facts about the user to long-term memory. Use for preferences, names, schedules, and other personal info.",
@@ -737,6 +864,37 @@ export function registerMemoryTools(deps: { memory: MemoryProvider; getUserId: (
 
   const tools: ToolSet = { remember, recall, deleteMemory };
 
+  if (memory.storeWorkspace) {
+    tools.rememberBusiness = tool({
+      description: "Save shared business knowledge for the current workspace. Use for company facts, products, clients, offers, and strategy.",
+      inputSchema: z.object({
+        content: z.string().describe("The business fact, decision, or shared context to remember"),
+      }),
+      execute: async ({ content }) => {
+        const workspaceId = getWorkspaceScopeId?.();
+        if (!workspaceId) return { success: false, error: "No workspace scope available in this conversation" };
+        const result = await memory.storeWorkspace!(workspaceId, content);
+        return { success: result.id !== "unavailable", id: result.id };
+      },
+    });
+  }
+
+  if (memory.recallWorkspace) {
+    tools.recallBusiness = tool({
+      description: "Search shared business memory for the current workspace.",
+      inputSchema: z.object({
+        query: z.string().describe("What to search for in shared business memory"),
+        limit: z.number().min(1).max(50).optional().default(5),
+      }),
+      execute: async ({ query, limit }) => {
+        const workspaceId = getWorkspaceScopeId?.();
+        if (!workspaceId) return { success: false, error: "No workspace scope available in this conversation" };
+        const results = await memory.recallWorkspace!(workspaceId, query, limit);
+        return { success: true, memories: results, count: results.length };
+      },
+    });
+  }
+
   // Project memory tools (only available when provider supports it)
   if (memory.storeProject) {
     tools.rememberProject = tool({
@@ -745,7 +903,8 @@ export function registerMemoryTools(deps: { memory: MemoryProvider; getUserId: (
         content: z.string().describe("The project fact, decision, or action item to remember"),
       }),
       execute: async ({ content }) => {
-        const result = await memory.storeProject!(getChatId(), content);
+        const projectScopeId = getProjectScopeId?.() ?? getChatId();
+        const result = await memory.storeProject!(projectScopeId, content);
         return { success: result.id !== "unavailable", id: result.id };
       },
     });
@@ -759,7 +918,8 @@ export function registerMemoryTools(deps: { memory: MemoryProvider; getUserId: (
         limit: z.number().min(1).max(50).optional().default(5),
       }),
       execute: async ({ query, limit }) => {
-        const results = await memory.recallProject!(getChatId(), query, limit);
+        const projectScopeId = getProjectScopeId?.() ?? getChatId();
+        const results = await memory.recallProject!(projectScopeId, query, limit);
         return { success: true, memories: results, count: results.length };
       },
     });

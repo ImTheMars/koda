@@ -17,6 +17,13 @@ import {
   parseCommand,
   shouldRespondInTelegramGroup,
 } from "../channels/telegram.js";
+import {
+  getSlackProjectScopeId,
+  getSlackWorkspaceScopeId,
+  shouldRespondInSlackConversation,
+} from "../channels/slack.js";
+import { shouldRequireResearch } from "../agent.js";
+import { filterMessagesForPrivateIngest, splitSpeakerPrefix } from "../tools/memory.js";
 
 const testDbPath = resolve(tmpdir(), `koda-group-test-${Date.now()}.db`);
 let db: typeof import("../db.js");
@@ -225,6 +232,26 @@ describe("shouldRespondInGroup logic", () => {
   });
 });
 
+describe("Slack collaboration helpers", () => {
+  test("builds stable workspace scope ids", () => {
+    expect(getSlackWorkspaceScopeId("T123")).toBe("slack:T123");
+  });
+
+  test("builds stable project scope ids", () => {
+    expect(getSlackProjectScopeId("T123", "C456")).toBe("slack:T123:channel:C456");
+  });
+
+  test("responds in DMs, mentions, and subscribed threads", () => {
+    expect(shouldRespondInSlackConversation({ isDirectMessage: true })).toBe(true);
+    expect(shouldRespondInSlackConversation({ isMention: true })).toBe(true);
+    expect(shouldRespondInSlackConversation({ isSubscribedThread: true })).toBe(true);
+  });
+
+  test("ignores unrelated channel chatter", () => {
+    expect(shouldRespondInSlackConversation({})).toBe(false);
+  });
+});
+
 // ============================================================
 // Message attribution
 // ============================================================
@@ -265,6 +292,44 @@ describe("parseCommand", () => {
 
   test("returns null for plain text", () => {
     expect(parseCommand("hello there")).toBeNull();
+  });
+});
+
+describe("memory attribution helpers", () => {
+  test("splits a group speaker prefix", () => {
+    expect(splitSpeakerPrefix("[Sam]: launch it today")).toEqual({
+      speaker: "Sam",
+      text: "launch it today",
+    });
+  });
+
+  test("filters group messages down to the active sender for private memory", () => {
+    expect(filterMessagesForPrivateIngest([
+      { role: "user", content: "[Sam]: I prefer short replies." },
+      { role: "user", content: "[Alex]: I hate mornings." },
+      { role: "assistant", content: "noted" },
+    ], "Sam")).toEqual([
+      { role: "user", content: "[Sam]: I prefer short replies." },
+      { role: "assistant", content: "noted" },
+    ]);
+  });
+});
+
+describe("research-first policy", () => {
+  test("requires research for product comparison questions", () => {
+    expect(shouldRequireResearch({
+      content: "Can you compare this product with its main competitors and tell me the pricing?",
+      channel: "slack",
+      chatType: "group",
+    })).toBe(true);
+  });
+
+  test("does not require research for internal memory questions", () => {
+    expect(shouldRequireResearch({
+      content: "What did I tell you about our meeting notes?",
+      channel: "slack",
+      chatType: "private",
+    })).toBe(false);
   });
 });
 

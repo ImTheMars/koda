@@ -32,6 +32,8 @@ export interface AgentInput {
   chatId: string;
   channel: string;
   sessionKey: string;
+  workspaceScopeId?: string;
+  projectScopeId?: string;
   source?: string;
   tierOverride?: Tier;
   requestId?: string;
@@ -60,16 +62,31 @@ export interface AgentDeps {
   getContextPrompt: () => string | null;
   getSkillsSummary: () => Promise<string | null>;
   getProfile: (userId: string, query: string, sessionKey?: string) => Promise<UserProfile>;
-  ingestConversation: (sessionKey: string, userId: string, messages: Array<{ role: string; content: string }>, chatId?: string) => Promise<void>;
+  ingestConversation: (
+    sessionKey: string,
+    userId: string,
+    messages: Array<{ role: string; content: string }>,
+    context?: {
+      channel?: string;
+      chatId?: string;
+      isGroup?: boolean;
+      projectScopeId?: string;
+      senderDisplayName?: string;
+      sessionKey?: string;
+      workspaceScopeId?: string;
+    },
+  ) => Promise<void>;
   getSoulAcks?: () => string[];
   /** Structured assessment summary for the user. */
   getAssessmentSummary?: (userId: string) => Promise<string | null>;
   /** Active durable plans for the user. */
   getActivePlansSummary?: (userId: string) => Promise<string | null>;
+  /** Fetch business/workspace memory profile for collaborative contexts. */
+  getWorkspaceMemories?: (workspaceId: string, query: string) => Promise<{ static: string[]; memories: string[] }>;
   /** Fetch project memory profile for group chats. */
-  getProjectMemories?: (chatId: string, query: string) => Promise<{ static: string[]; memories: string[] }>;
+  getProjectMemories?: (projectScopeId: string, query: string) => Promise<{ static: string[]; memories: string[] }>;
   /** Get active members for a group chat (used in system prompt). */
-  getGroupMembers?: (chatId: string) => Array<{ userId: string; displayName: string; role: string }>;
+  getGroupMembers?: (scopeId: string) => Array<{ userId: string; displayName: string; role: string }>;
 }
 
 const ACK_TEMPLATES = [
@@ -87,6 +104,28 @@ export function splitOnDelimiter(text: string): string[] { // exported for chann
   return safe.split(MESSAGE_DELIMITER)
     .map((s) => s.replaceAll(PLACEHOLDER, MESSAGE_DELIMITER).trim())
     .filter(Boolean);
+}
+
+const RESEARCH_TRIGGER_PATTERNS = [
+  /\b(compare|comparison|best|better|worth it|should we|which should|recommend|pros and cons)\b/i,
+  /\b(price|pricing|cost|quote|benchmark|competitor|competitors|market|product)\b/i,
+  /\b(latest|current|recent|today|this year|2025|2026|roadmap|release)\b/i,
+  /\bwhat is this product|tell me about this product|research this|look into\b/i,
+];
+
+export function shouldRequireResearch(input: { content: string; channel: string; chatType?: "private" | "group" }): boolean {
+  const text = input.content.toLowerCase();
+  if (text.length < 20) return false;
+  if (!/[?]/.test(text) && !/\b(compare|best|pricing|market|product|research|should we)\b/i.test(text)) {
+    return false;
+  }
+  if (/\b(remember|recall|summarize our chat|what did i say|where is that file)\b/i.test(text)) {
+    return false;
+  }
+  if (input.channel === "cli" && /\b(local|this repo|this project|this file|codebase)\b/i.test(text)) {
+    return false;
+  }
+  return RESEARCH_TRIGGER_PATTERNS.some((pattern) => pattern.test(input.content));
 }
 
 let llmFailures = 0;
@@ -180,10 +219,12 @@ function buildSystemPrompt(deps: {
   hasWebFetch: boolean;
   hasHttpRequest: boolean;
   hasAnalyzeData: boolean;
+  workspaceProfile?: { static: string[]; memories: string[] } | null;
   assessmentSummary?: string | null;
   activePlansSummary?: string | null;
   toolGovernanceSummary?: string | null;
   knownIssues?: string[];
+  researchRequired?: boolean;
   /** Group chat context (omit for private chats). */
   groupContext?: {
     members: Array<{ displayName: string; role: string }>;
@@ -237,6 +278,7 @@ rules:
   parts.push(`## tool use
 use tools when the user asks you to actually do something (not just chat).
 - memory: use remember to store facts, recall to look them up, deleteMemory when they ask to forget/remove something
+- shared business memory: use rememberBusiness/recallBusiness for company-wide facts, products, clients, offers, policies, and strategy
 - assessment: use upsertGoal, logObservation, createIntervention, and storeReview to build a durable evidence-backed model of the user
 - files: use readFile/writeFile/listFiles for workspace file tasks
 - code/commands: use runSandboxed for shell commands or script execution
@@ -303,6 +345,17 @@ if a tool fails or isn't available, say that clearly and continue with the best 
     }
   }
 
+  if (deps.workspaceProfile && (deps.workspaceProfile.static.length > 0 || deps.workspaceProfile.memories.length > 0)) {
+    const workspaceParts: string[] = ["## shared business context"];
+    if (deps.workspaceProfile.static.length > 0) {
+      workspaceParts.push(`<business_facts>\n${deps.workspaceProfile.static.map((f) => `- ${sanitizeForPrompt(f)}`).join("\n")}\n</business_facts>`);
+    }
+    if (deps.workspaceProfile.memories.length > 0) {
+      workspaceParts.push(`<business_memories>\n${deps.workspaceProfile.memories.map((m) => `- ${sanitizeForPrompt(m)}`).join("\n")}\n</business_memories>`);
+    }
+    parts.push(workspaceParts.join("\n\n"));
+  }
+
   if (deps.hasWebSearch) {
     parts.push(`## web search
 you have the webSearch tool. use it whenever asked about:
@@ -326,6 +379,13 @@ for factual comparisons, current topics, benchmarks, and "pros/cons" requests:
 - avoid exact numbers unless they came from tool results
 - if sources disagree or you're unsure, say that clearly
 - do not start with local/meta tools like readFile/listFiles/skills unless the user asked about local files/skills or skills`);
+
+  if (deps.researchRequired) {
+    parts.push(`## research required for this message
+this request looks like an important external, product, market, or factual question.
+before you answer, you must use webSearch and/or fetchUrl unless the answer is already fully covered by the shared business context above.
+if research tools fail, say that explicitly instead of pretending certainty.`);
+  }
 
   parts.push(`## durable execution
 for requests that are long-horizon, high-impact, or clearly multi-step:
@@ -362,6 +422,7 @@ The sub-agent researches while you continue the conversation. Mention that you'r
     parts.push(`## group chat mode
 you are in a group chat. messages are prefixed with [sender name]. address people by name when relevant.
 individual memory (remember/recall) applies to the message sender. project memory (rememberProject/recallProject) is shared across all group members.
+business memory (rememberBusiness/recallBusiness) is shared across the workspace/business, not just this thread.
 
 active members:
 ${memberList}`);
@@ -422,17 +483,19 @@ async function buildAgentContext(deps: AgentDeps, input: AgentInput, tier: Tier,
     Promise<UserProfile>,
     Promise<string | null>,
     Promise<{ static: string[]; memories: string[] } | null>,
+    Promise<{ static: string[]; memories: string[] } | null>,
     Promise<string | null>,
     Promise<string | null>,
   ] = [
     deps.getProfile(input.senderId, query, input.sessionKey),
     tier === "fast" ? Promise.resolve(null) : deps.getSkillsSummary(),
-    isGroup && deps.getProjectMemories ? deps.getProjectMemories(input.chatId, query) : Promise.resolve(null),
+    input.workspaceScopeId && deps.getWorkspaceMemories ? deps.getWorkspaceMemories(input.workspaceScopeId, query) : Promise.resolve(null),
+    input.projectScopeId && deps.getProjectMemories ? deps.getProjectMemories(input.projectScopeId, query) : Promise.resolve(null),
     deps.getAssessmentSummary ? deps.getAssessmentSummary(input.senderId) : Promise.resolve(null),
     deps.getActivePlansSummary ? deps.getActivePlansSummary(input.senderId) : Promise.resolve(null),
   ];
 
-  const [profile, skillsSummary, projectProfile, assessmentSummary, activePlansSummary] = await Promise.all(promises);
+  const [profile, skillsSummary, workspaceProfile, projectProfile, assessmentSummary, activePlansSummary] = await Promise.all(promises);
 
   // Gather known issues from tool outcome learning
   let knownIssues: string[] | undefined;
@@ -448,7 +511,7 @@ async function buildAgentContext(deps: AgentDeps, input: AgentInput, tier: Tier,
   // Build group context if applicable
   let groupContext: { members: Array<{ displayName: string; role: string }>; projectProfile?: { static: string[]; memories: string[] } } | undefined;
   if (isGroup) {
-    const members = deps.getGroupMembers?.(input.chatId) ?? [];
+    const members = deps.getGroupMembers?.(input.projectScopeId ?? input.chatId) ?? [];
     groupContext = {
       members: members.map((m) => ({ displayName: m.displayName, role: m.role })),
       ...(projectProfile ? { projectProfile } : {}),
@@ -469,10 +532,12 @@ async function buildAgentContext(deps: AgentDeps, input: AgentInput, tier: Tier,
     hasWebFetch: "fetchUrl" in deps.tools,
     hasHttpRequest: "httpRequest" in deps.tools,
     hasAnalyzeData: "analyzeData" in deps.tools,
+    workspaceProfile,
     assessmentSummary,
     activePlansSummary,
     toolGovernanceSummary: summarizeToolGovernance(Object.keys(deps.tools)),
     knownIssues,
+    researchRequired: shouldRequireResearch({ content: input.content, channel: input.channel, chatType: input.chatType }),
     groupContext,
   });
 }
@@ -620,7 +685,15 @@ function finalizeResult(
   dbMessages.append(input.sessionKey, "assistant", cleanedForHistory, uniqueTools);
 
   const allMessages = [...history, { role: "user", content: input.content }, { role: "assistant", content: cleanedForHistory }];
-  deps.ingestConversation(input.sessionKey, input.senderId, allMessages, input.chatId).catch((err) => {
+  deps.ingestConversation(input.sessionKey, input.senderId, allMessages, {
+    channel: input.channel,
+    chatId: input.chatId,
+    isGroup: input.chatType === "group",
+    projectScopeId: input.projectScopeId,
+    senderDisplayName: input.senderDisplayName,
+    sessionKey: input.sessionKey,
+    workspaceScopeId: input.workspaceScopeId,
+  }).catch((err) => {
     log("agent", "conversation ingestion failed: %s", (err as Error).message);
   });
 
@@ -707,6 +780,8 @@ export function createAgent(deps: AgentDeps) {
         userId: input.senderId,
         chatId: input.chatId,
         channel: input.channel,
+        projectScopeId: input.projectScopeId,
+        workspaceScopeId: input.workspaceScopeId,
         toolCost: toolCostRef,
         pendingFiles: [],
       }, async () => {
@@ -795,6 +870,8 @@ export function createStreamAgent(deps: AgentDeps) {
       userId: input.senderId,
       chatId: input.chatId,
       channel: input.channel,
+      projectScopeId: input.projectScopeId,
+      workspaceScopeId: input.workspaceScopeId,
       toolCost: toolCostRef,
       pendingFiles: [],
     }, async () => {

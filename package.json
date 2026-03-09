@@ -12,6 +12,7 @@
   },
   "dependencies": {
     "@ai-sdk/mcp": "^1.0.21",
+    "@chat-adapter/slack": "^4.18.0",
     "@chat-adapter/state-memory": "^4.18.0",
     "@chat-adapter/telegram": "^4.18.0",
     "@clack/prompts": "^0.9.1",
