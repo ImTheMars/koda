@@ -93,15 +93,17 @@ export function getModelId(tier: Tier, config: Config): string {
   }
 }
 
-/** Failover chains per tier — OpenRouter tries these in order */
-export const FAILOVER: Record<Tier, string[]> = {
-  fast: ["google/gemini-3-flash-preview"],
-  deep: ["anthropic/claude-sonnet-4.6"],
-};
+/** Failover chains per tier — defaults to the active tier model when unset. */
+export function getFallbackIds(tier: Tier, config: Config): string[] {
+  const configured = config.openrouter.failovers?.[tier];
+  if (configured && configured.length > 0) return configured;
+  return [getModelId(tier, config)];
+}
 
 // --- Pricing (per 1M tokens) ---
 
 export const PRICING: Record<string, { input: number; output: number }> = {
+  "openai/gpt-5.4": { input: 2.5, output: 15 },
   "google/gemini-3-flash-preview": { input: 0.50, output: 3 },
   "anthropic/claude-sonnet-4.6": { input: 3, output: 15 },
 };

@@ -565,8 +565,11 @@ function buildDashboardHtml(deps: DashboardDeps): string {
   <div class="main">
     <!-- Info bar -->
     <div class="info-bar" id="infoBar">
-      <span><span class="info-label">fast</span><span class="info-value">${escapeHtml(config.openrouter.fastModel)}</span></span>
-      <span><span class="info-label">deep</span><span class="info-value">${escapeHtml(config.openrouter.deepModel)}</span></span>
+      <span><span class="info-label">chat.fast</span><span class="info-value">${escapeHtml(config.openrouter.fastModel)}</span></span>
+      <span><span class="info-label">chat.deep</span><span class="info-value">${escapeHtml(config.openrouter.deepModel)}</span></span>
+      <span><span class="info-label">voice</span><span class="info-value">${escapeHtml(config.openrouter.transcriptionModel)}</span></span>
+      <span><span class="info-label">summary</span><span class="info-value">${escapeHtml(config.openrouter.summaryModel)}</span></span>
+      <span><span class="info-label">memory</span><span class="info-value">${escapeHtml(config.openrouter.memoryModel)}</span></span>
       <span><span class="info-label">uptime</span><span class="info-value" id="uptimeVal">—</span></span>
     </div>
 

@@ -42,6 +42,18 @@ describe("loadConfig", () => {
     expect(config.agent.toolArgLogMaxChars).toBeGreaterThan(0);
   });
 
+  test("openrouter specialist model defaults are set", async () => {
+    process.env.KODA_MODE = "cli-only";
+    process.env.KODA_OPENROUTER_API_KEY = "test-key-for-validation";
+    const mod = await import("../config.js");
+    const config = await mod.loadConfig();
+    expect(config.openrouter.fastModel.length).toBeGreaterThan(0);
+    expect(config.openrouter.deepModel.length).toBeGreaterThan(0);
+    expect(config.openrouter.transcriptionModel).toBe("google/gemini-3-flash-preview");
+    expect(config.openrouter.summaryModel).toBe("google/gemini-3-flash-preview");
+    expect(config.openrouter.memoryModel).toBe("google/gemini-3-flash-preview");
+  });
+
   test("sandbox defaults are set", async () => {
     process.env.KODA_MODE = "cli-only";
     process.env.KODA_OPENROUTER_API_KEY = "test-key-for-validation";

@@ -87,8 +87,8 @@ export function printSummaryTable(report: BenchReport): void {
 
 export function printComparisonTable(baseline: BenchReport, current: BenchReport): void {
   console.log("\n=== Comparison ===\n");
-  console.log(`Baseline: ${baseline.modelConfig.deepModel} (${baseline.timestamp})`);
-  console.log(`Current:  ${current.modelConfig.deepModel} (${current.timestamp})`);
+  console.log(`Baseline: fast=${baseline.modelConfig.fastModel}, deep=${baseline.modelConfig.deepModel} (${baseline.timestamp})`);
+  console.log(`Current:  fast=${current.modelConfig.fastModel}, deep=${current.modelConfig.deepModel} (${current.timestamp})`);
 
   const divider = "+-----------------+-----------+-----------+--------+";
 

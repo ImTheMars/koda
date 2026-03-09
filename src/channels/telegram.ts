@@ -64,7 +64,7 @@ const SEGMENT_DELAY_MS = 400;
 const MAX_DOCUMENT_SIZE = 20 * 1024 * 1024; // 20MB
 const MAX_DOCUMENT_TEXT = 30_000; // chars
 
-/** Transcribe audio via OpenRouter (Gemini Flash with native audio support). */
+/** Transcribe audio via the dedicated OpenRouter transcription model. */
 async function transcribeAudio(audioBuffer: Buffer, config: Config): Promise<string | null> {
   const base64 = audioBuffer.toString("base64");
   try {
@@ -75,7 +75,7 @@ async function transcribeAudio(audioBuffer: Buffer, config: Config): Promise<str
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: config.openrouter.fastModel,
+        model: config.openrouter.transcriptionModel,
         messages: [{
           role: "user",
           content: [
@@ -180,6 +180,19 @@ function enrichContent(text: string, message: {
 
 function isLikelyModelId(value: string): boolean {
   return /^[^\s/]+\/[^\s]+$/.test(value);
+}
+
+function formatTelegramModels(config: Config): string {
+  return (
+    `chat:\n` +
+    `fast: ${config.openrouter.fastModel}\n` +
+    `deep: ${config.openrouter.deepModel}\n` +
+    `image: ${config.openrouter.imageModel}\n\n` +
+    `specialists:\n` +
+    `transcription: ${config.openrouter.transcriptionModel}\n` +
+    `summary: ${config.openrouter.summaryModel}\n` +
+    `memory: ${config.openrouter.memoryModel}`
+  );
 }
 
 async function attachmentToBuffer(attachment: Attachment): Promise<Buffer> {
@@ -495,17 +508,16 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
     const usageText =
       "usage:\n" +
       "/model - show current models\n" +
-      "/model <model-id> - set primary chat model (fast + deep)\n" +
+      "/model <model-id> - set primary chat models (fast + deep)\n" +
       "/model fast <model-id>\n" +
       "/model deep <model-id>\n" +
       "/model image <model-id>\n" +
       "/model all <model-id> - set fast + deep\n" +
-      "/model primary <model-id> - same as all";
+      "/model primary <model-id> - same as all\n\n" +
+      "note: transcription, summary, and memory models are configured separately.";
 
     const showCurrentModels = async () => {
-      await thread.post(
-        `models:\nfast: ${config.openrouter.fastModel}\ndeep: ${config.openrouter.deepModel}\nimage: ${config.openrouter.imageModel}\n\n${usageText}`,
-      );
+      await thread.post(`${formatTelegramModels(config)}\n\n${usageText}`);
     };
 
     if (!args || args === "show" || args === "list") {
@@ -554,7 +566,7 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
     }
 
     const successText = target === "all"
-      ? `fast and deep models changed to ${modelId}`
+      ? `primary chat models changed to ${modelId}`
       : target === "fast"
       ? `fast model changed to ${modelId}`
       : `${target} model changed to ${modelId}`;
@@ -650,7 +662,8 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
         status += `memory: ${heapMb}MB heap / ${rssMb}MB rss\n`;
         status += `llm: ${llmStatus}\n`;
         status += `today: ${todayUsage.totalRequests} requests, $${todayUsage.totalCost.toFixed(4)}\n`;
-        status += `models: fast=${config.openrouter.fastModel}, deep=${config.openrouter.deepModel}\n`;
+        status += `chat: fast=${config.openrouter.fastModel}, deep=${config.openrouter.deepModel}\n`;
+        status += `specialists: voice=${config.openrouter.transcriptionModel}, summary=${config.openrouter.summaryModel}, memory=${config.openrouter.memoryModel}\n`;
         if (nextTask) {
           status += `next task: ${nextTask.description} (${nextTask.nextRunAt})`;
         } else {
@@ -755,6 +768,7 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
         msg += `heap: ${heapMb}MB / rss: ${rssMb}MB\n`;
         msg += `llm: ${llmStatus}\n`;
         msg += `models:\n  fast: ${config.openrouter.fastModel}\n  deep: ${config.openrouter.deepModel}\n  image: ${config.openrouter.imageModel}\n`;
+        msg += `specialists:\n  transcription: ${config.openrouter.transcriptionModel}\n  summary: ${config.openrouter.summaryModel}\n  memory: ${config.openrouter.memoryModel}\n`;
         msg += `---\n`;
         msg += `today: ${todayUsage.totalRequests} req, $${todayUsage.totalCost.toFixed(4)}\n`;
         msg += `month: ${monthUsage.totalRequests} req, $${monthUsage.totalCost.toFixed(4)}\n`;

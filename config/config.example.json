@@ -9,9 +9,12 @@
     "id": "your-user-id"
   },
   "openrouter": {
-    "fastModel": "google/gemini-3-flash-preview",
-    "deepModel": "anthropic/claude-sonnet-4.6",
-    "imageModel": "google/gemini-3-pro-image-preview"
+    "fastModel": "openai/gpt-5.4",
+    "deepModel": "openai/gpt-5.4",
+    "imageModel": "google/gemini-3-pro-image-preview",
+    "transcriptionModel": "google/gemini-3-flash-preview",
+    "summaryModel": "google/gemini-3-flash-preview",
+    "memoryModel": "google/gemini-3-flash-preview"
   },
   "telegram": {
     "allowFrom": ["your-telegram-user-id"],

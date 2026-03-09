@@ -1,6 +1,6 @@
 /**
- * Conversation summarization — sends trimmed messages to fast LLM
- * and stores bullet-point summaries in the database.
+ * Conversation summarization — sends trimmed messages to the
+ * dedicated summary model and stores bullet-point summaries.
  */
 
 import { messages as dbMessages, summaries as dbSummaries } from "./db.js";
@@ -38,7 +38,7 @@ export async function summarizeAndStore(sessionKey: string, config: Config): Pro
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: config.openrouter.fastModel,
+        model: config.openrouter.summaryModel,
         messages: [{
           role: "user",
           content: `Summarize this conversation in 3-5 bullet points. Focus on:

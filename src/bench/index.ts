@@ -4,7 +4,7 @@
  * Usage:
  *   bun run bench                                     # full suite
  *   bun run bench -c memory -v                        # memory tests, verbose
- *   bun run bench -m openai/gpt-5.3-codex             # test specific deep model
+ *   bun run bench -m openai/gpt-5.4                   # test specific deep model
  *   bun run bench --compare benchmarks/baseline.json   # compare with previous
  *   bun run bench --help                               # show usage
  */

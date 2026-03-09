@@ -25,8 +25,8 @@ you (telegram / cli)
          |
          v
    +----------+
-   |  router   |---- fast (gemini 3 flash, $0.50/M)
-   |  2-tier   |---- deep (claude sonnet 4.6, $3/M)
+   |  router   |---- fast (gpt-5.4)
+   |  2-tier   |---- deep (gpt-5.4)
    |  classify |
    +----------+
          |
@@ -54,7 +54,7 @@ you (telegram / cli)
 
 the agent calls `generateText` or `streamText` with tools, the ai sdk handles the loop, and channels call `runAgent()` or `streamAgent()` directly. tool context (userId, chatId, channel) is threaded via AsyncLocalStorage so every tool knows who it's serving without passing state around.
 
-model escalation: if the agent is still working after 5 tool steps on fast tier, it automatically upgrades to deep. starts cheap, scales up only when needed.
+model escalation: if the agent is still working after 5 tool steps on fast tier, it automatically upgrades to deep. chat tiers stay separate even when they point at the same primary model.
 
 failover chains: each tier has a fallback model list via openrouter's `models` array. if the primary model is down, koda falls over to the next model automatically.
 
@@ -107,11 +107,11 @@ KODA_SUPERMEMORY_API_KEY=...          # optional — semantic memory (gracefully
 | `/deep` | force next message to use deep tier |
 | `/fast` | force next message to use fast tier |
 | `/recap` | summarize recent conversation — key topics, decisions, open items |
-| `/model` | view or change models (`/model fast google/gemini-3-flash-preview`) |
+| `/model` | view or change chat/image models (`/model fast openai/gpt-5.4`) |
 
 ## features
 
-- **voice messages** — send voice messages or circle videos. koda transcribes them via Gemini Flash and responds.
+- **voice messages** — send voice messages or circle videos. koda transcribes them via a dedicated transcription model and responds.
 - **document ingestion** — send PDFs, text files (.txt, .md, .csv, .json, .html, .xml) directly in Telegram. koda extracts the text and responds in context.
 - **reply threading** — reply to any message and koda sees the original text as context.
 - **forwarded messages** — forward messages to koda and it knows who/where they came from.
@@ -122,7 +122,7 @@ KODA_SUPERMEMORY_API_KEY=...          # optional — semantic memory (gracefully
 - **image generation** — `generateImage` tool creates images via OpenRouter (default: google/gemini-3-pro-image-preview).
 - **file sending** — `sendFile` tool sends workspace files back as Telegram documents.
 - **tier override** — `/deep` and `/fast` commands force the next message to a specific model tier.
-- **model switching** — `/model` command lets you change fast/deep/image models on the fly, persisted to config.
+- **model switching** — `/model` changes chat/image models on the fly without touching the dedicated transcription, summary, or memory models.
 - **database backup** — automatic daily SQLite backup to `~/.koda/backups/` with 7-day retention.
 - **webhook mode** — optional Telegram webhook support instead of polling.
 - **startup/shutdown notifications** — admin users get notified when koda comes online or goes down.
@@ -146,9 +146,12 @@ all fields are optional except `openrouter.apiKey` (via env var).
 |---------|-------|---------|-------------|
 | `mode` | | `"private"` | `"private"` (telegram) or `"cli-only"` |
 | `owner` | `id` | `"owner"` | owner user ID |
-| `openrouter` | `fastModel` | `google/gemini-3-flash-preview` | fast tier model |
-| `openrouter` | `deepModel` | `anthropic/claude-sonnet-4.6` | deep tier model |
+| `openrouter` | `fastModel` | `openai/gpt-5.4` | fast chat tier model |
+| `openrouter` | `deepModel` | `openai/gpt-5.4` | deep chat tier model |
 | `openrouter` | `imageModel` | `google/gemini-3-pro-image-preview` | image generation model |
+| `openrouter` | `transcriptionModel` | `google/gemini-3-flash-preview` | voice / video transcription model |
+| `openrouter` | `summaryModel` | `google/gemini-3-flash-preview` | conversation summarization model |
+| `openrouter` | `memoryModel` | `google/gemini-3-flash-preview` | memory extraction / consolidation model |
 | `agent` | `maxSteps` | `30` | max tool loop steps |
 | `agent` | `maxTokens` | `8192` | max output tokens per turn |
 | `agent` | `temperature` | `0.7` | LLM temperature |

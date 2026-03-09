@@ -104,6 +104,11 @@ describe("calculateCost", () => {
     expect(cost).toBeCloseTo(3.5, 2);
   });
 
+  test("GPT-5.4 pricing", () => {
+    const cost = calculateCost("openai/gpt-5.4", 1_000_000, 1_000_000);
+    expect(cost).toBeCloseTo(17.5, 2);
+  });
+
   test("Claude Sonnet pricing", () => {
     // Claude: input $3/M, output $15/M
     const cost = calculateCost("anthropic/claude-sonnet-4.6", 1_000_000, 1_000_000);

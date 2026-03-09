@@ -12,7 +12,7 @@ import { generateText, streamText, stepCountIs, type ToolSet, type ModelMessage 
 import { createOpenRouter } from "@openrouter/ai-sdk-provider";
 import { createOllama } from "ollama-ai-provider";
 import type { Config, Tier } from "./config.js";
-import { classifyTier, classifyIntent, getModelId, calculateCost, shouldAck, FAILOVER } from "./router.js";
+import { classifyTier, classifyIntent, getModelId, getFallbackIds, calculateCost, shouldAck } from "./router.js";
 import { messages as dbMessages, usage as dbUsage, toolOutcomes, summaries as dbSummaries } from "./db.js";
 import { formatUserTime } from "./time.js";
 import { withToolContext, getPendingFiles } from "./tools/index.js";
@@ -509,7 +509,7 @@ function makePrepareStep(
         state.currentTier = tierOrder[idx + 1]!;
         const newModelId = getModelId(state.currentTier, config);
         logInfo("agent", `${logPrefix}ESCALATED tier=${state.currentTier} model=${newModelId} (step ${stepNumber})`);
-        const newFallbacks = FAILOVER[state.currentTier] ?? [];
+        const newFallbacks = getFallbackIds(state.currentTier, config);
         return { model: provider(newModelId, { models: newFallbacks }) };
       }
     }
@@ -519,7 +519,7 @@ function makePrepareStep(
       state.currentTier = "deep";
       const newModelId = getModelId("deep", config);
       logInfo("agent", `${logPrefix}UNCERTAINTY ESCALATED to deep model=${newModelId} (${state.uncertaintyCount} signals)`);
-      const newFallbacks = FAILOVER["deep"] ?? [];
+      const newFallbacks = getFallbackIds("deep", config);
       return { model: provider(newModelId, { models: newFallbacks }) };
     }
 
@@ -712,7 +712,7 @@ export function createAgent(deps: AgentDeps) {
       }, async () => {
         const modelId = getModelId(state.currentTier, config);
         logInfo("agent", `${logPrefix}model=${modelId} session=${input.sessionKey} history=${messageList.length}msgs`);
-        const fallbackIds = FAILOVER[state.currentTier] ?? [];
+        const fallbackIds = getFallbackIds(state.currentTier, config);
         const model = provider(modelId, { models: fallbackIds });
 
         const useOllama = tier === "fast" && config.ollama?.enabled && ollamaProvider && config.ollama.fastOnly;
@@ -786,7 +786,7 @@ export function createStreamAgent(deps: AgentDeps) {
 
     const modelId = getModelId(state.currentTier, config);
     logInfo("agent", `${logPrefix}model=${modelId} session=${input.sessionKey} history=${messageList.length}msgs`);
-    const fallbackIds = FAILOVER[state.currentTier] ?? [];
+    const fallbackIds = getFallbackIds(state.currentTier, config);
     const model = provider(modelId, { models: fallbackIds });
 
     const toolCostRef = { total: 0 };

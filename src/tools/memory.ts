@@ -143,7 +143,7 @@ async function extractMemoryFacts(
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: config.openrouter.fastModel,
+        model: config.openrouter.memoryModel,
         messages: [{
           role: "user",
           content: `Extract important facts from this conversation that are worth remembering long-term. Skip transient context, greetings, and small talk.
@@ -195,7 +195,7 @@ async function extractProjectFacts(
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: config.openrouter.fastModel,
+        model: config.openrouter.memoryModel,
         messages: [{
           role: "user",
           content: `Extract project-level facts from this group conversation. Focus on:
@@ -248,7 +248,7 @@ function isDuplicate(newFact: string, existingFacts: string[]): boolean {
   return false;
 }
 
-/** Consolidation pass: merge duplicate/related memories via fast LLM. */
+/** Consolidation pass: merge duplicate/related memories via the dedicated memory model. */
 async function consolidateMemories(client: Supermemory, userId: string, config: Config): Promise<void> {
   try {
     const res = await client.search.memories({
@@ -271,7 +271,7 @@ async function consolidateMemories(client: Supermemory, userId: string, config: 
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: config.openrouter.fastModel,
+        model: config.openrouter.memoryModel,
         messages: [{
           role: "user",
           content: `Merge duplicates and combine related facts from this memory list. Return a consolidated JSON array of strings (one fact per string). Remove exact duplicates and merge related facts into single concise statements.

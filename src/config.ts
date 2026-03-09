@@ -1,7 +1,7 @@
 /**
  * Koda configuration — Zod-validated with env override for secrets.
  *
- * 2-tier LLM: fast (Gemini Flash) / deep (Claude Sonnet).
+ * Chat tiers + specialist model settings.
  */
 
 import { z } from "zod";
@@ -23,9 +23,12 @@ const ConfigSchema = z.object({
   owner: withEmptyDefault(z.object({ id: z.string().default("owner") })),
   openrouter: z.object({
     apiKey: z.string().min(1, "OpenRouter API key is required"),
-    fastModel: z.string().default("google/gemini-3-flash-preview"),
-    deepModel: z.string().default("anthropic/claude-sonnet-4.6"),
+    fastModel: z.string().default("openai/gpt-5.4"),
+    deepModel: z.string().default("openai/gpt-5.4"),
     imageModel: z.string().default("google/gemini-3-pro-image-preview"),
+    transcriptionModel: z.string().default("google/gemini-3-flash-preview"),
+    summaryModel: z.string().default("google/gemini-3-flash-preview"),
+    memoryModel: z.string().default("google/gemini-3-flash-preview"),
     failovers: z.record(z.string(), z.array(z.string())).optional(),
     pricing: z.record(z.string(), z.object({ input: z.number(), output: z.number() })).optional(),
   }),
@@ -308,6 +311,9 @@ export async function persistConfig(config: Config): Promise<void> {
     fastModel: config.openrouter.fastModel,
     deepModel: config.openrouter.deepModel,
     imageModel: config.openrouter.imageModel,
+    transcriptionModel: config.openrouter.transcriptionModel,
+    summaryModel: config.openrouter.summaryModel,
+    memoryModel: config.openrouter.memoryModel,
   };
   serializable.telegram = {
     allowFrom: config.telegram.allowFrom,
