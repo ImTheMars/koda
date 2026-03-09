@@ -1,114 +1,199 @@
 /**
- * Web tools — URL fetching and arbitrary HTTP requests.
+ * Web tools — fetchUrl + httpRequest for reading web pages and calling APIs.
  *
- * fetchUrl: Retrieve the text content of a public URL (low-risk, no approval needed).
- * httpRequest: Make any HTTP request with full method/headers/body control (high-risk, requires approval).
+ * Includes SSRF protection (blocks private IPs, localhost, cloud metadata endpoints).
  */
 
-import { tool } from "ai";
-import type { ToolSet } from "ai";
+import { tool, type ToolSet } from "ai";
 import { z } from "zod";
+import { logInfo, logError } from "../log.js";
 
-const FETCH_TIMEOUT_MS = 30_000;
+const FETCH_COST = 0.0001;
 
-function htmlToText(html: string): string {
-  return html
-    .replace(/<script[\s\S]*?<\/script>/gi, " ")
-    .replace(/<style[\s\S]*?<\/style>/gi, " ")
-    .replace(/<[^>]+>/g, " ")
-    .replace(/&nbsp;/g, " ")
-    .replace(/&amp;/g, "&")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .replace(/\s{2,}/g, " ")
-    .trim();
+/** Private/reserved IP ranges that must be blocked to prevent SSRF. */
+const BLOCKED_HOST_PATTERNS = [
+  /^localhost$/i,
+  /^127\.\d+\.\d+\.\d+$/,
+  /^10\.\d+\.\d+\.\d+$/,
+  /^172\.(1[6-9]|2\d|3[01])\.\d+\.\d+$/,
+  /^192\.168\.\d+\.\d+$/,
+  /^0\.0\.0\.0$/,
+  /^169\.254\.\d+\.\d+$/,           // link-local
+  /^metadata\.google\.internal$/i,
+  /^\[::1\]$/,                       // IPv6 loopback
+  /^\[fd[0-9a-f]{2}:/i,             // IPv6 ULA
+  /^\[fe80:/i,                       // IPv6 link-local
+];
+
+function isBlockedHost(hostname: string): boolean {
+  return BLOCKED_HOST_PATTERNS.some((p) => p.test(hostname));
 }
+
+/** Strip HTML to plain text: remove scripts, styles, tags, collapse whitespace. */
+function stripHtml(html: string): string {
+  let text = html;
+  // Remove script and style blocks
+  text = text.replace(/<script[\s\S]*?<\/script>/gi, "");
+  text = text.replace(/<style[\s\S]*?<\/style>/gi, "");
+  // Remove HTML comments
+  text = text.replace(/<!--[\s\S]*?-->/g, "");
+  // Replace br/p/div/li tags with newlines
+  text = text.replace(/<\s*(?:br|p|div|li|tr|h[1-6])[^>]*>/gi, "\n");
+  // Remove all remaining tags
+  text = text.replace(/<[^>]+>/g, "");
+  // Decode common entities
+  text = text.replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&nbsp;/g, " ");
+  // Collapse whitespace
+  text = text.replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
+  return text;
+}
+
+export { isBlockedHost, stripHtml };
 
 export function registerWebTools(deps: {
   maxBodyBytes: number;
-  onCost: (amount: number) => void;
-}): { fetchUrl?: ToolSet[string]; httpRequest?: ToolSet[string] } {
-  const maxBytes = deps.maxBodyBytes;
-
+  onCost?: (amount: number) => void;
+}): ToolSet {
   const fetchUrl = tool({
-    description:
-      "Fetch the text content of a URL. Use for reading web pages, articles, or documents at a known URL. Returns cleaned text, not raw HTML. Prefer webSearch + extractUrl for discovery — use fetchUrl when you already have a specific URL to read.",
+    description: "Fetch and read the text content of any web page URL. Returns stripped plain text (no HTML). Use for reading articles, documentation, etc.",
     inputSchema: z.object({
-      url: z.string().url().describe("URL to fetch"),
+      url: z.string().url().describe("The URL to fetch"),
     }),
     execute: async ({ url }) => {
+      deps.onCost?.(FETCH_COST);
       try {
-        const res = await fetch(url, {
-          headers: { "User-Agent": "Koda/1.0 (AI assistant)" },
-          signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-        });
+        const parsed = new URL(url);
+        if (!["http:", "https:"].includes(parsed.protocol)) {
+          return { success: false, error: "Only HTTP(S) URLs are supported" };
+        }
+        if (isBlockedHost(parsed.hostname)) {
+          return { success: false, error: "Access to internal/private addresses is blocked" };
+        }
 
-        const contentType = res.headers.get("content-type") ?? "";
-        const raw = await res.text();
-        const truncated = raw.length > maxBytes;
-        const slice = truncated ? raw.slice(0, maxBytes) : raw;
-        const body = contentType.includes("text/html") ? htmlToText(slice) : slice;
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 15_000);
 
-        return {
-          success: res.ok,
-          url,
-          status: res.status,
-          contentType,
-          body,
-          truncated,
-          bytesRead: raw.length,
-        };
+        try {
+          const res = await fetch(url, {
+            signal: controller.signal,
+            headers: { "User-Agent": "Koda/1.0 (AI Assistant)" },
+            redirect: "follow",
+          });
+
+          if (!res.ok) {
+            return { success: false, error: `HTTP ${res.status} ${res.statusText}` };
+          }
+
+          const contentLength = parseInt(res.headers.get("content-length") ?? "0", 10);
+          if (contentLength > deps.maxBodyBytes) {
+            return { success: false, error: `Response too large (${contentLength} bytes, max ${deps.maxBodyBytes})` };
+          }
+
+          const buffer = await res.arrayBuffer();
+          if (buffer.byteLength > deps.maxBodyBytes) {
+            return { success: false, error: `Response too large (${buffer.byteLength} bytes, max ${deps.maxBodyBytes})` };
+          }
+
+          const text = new TextDecoder().decode(buffer);
+          const contentType = res.headers.get("content-type") ?? "";
+          const isHtml = contentType.includes("html");
+          const plainText = isHtml ? stripHtml(text) : text;
+          const truncated = plainText.slice(0, 15_000);
+
+          logInfo("tools", `fetchUrl: ${url} → ${truncated.length} chars (${isHtml ? "html→text" : "raw"})`);
+          return {
+            success: true,
+            url,
+            contentType,
+            text: truncated,
+            truncated: plainText.length > 15_000,
+            charCount: truncated.length,
+          };
+        } finally {
+          clearTimeout(timeout);
+        }
       } catch (err) {
-        return { success: false, url, error: err instanceof Error ? err.message : "Fetch failed" };
+        const msg = err instanceof Error ? err.message : "Fetch failed";
+        logError("tools", `fetchUrl error: ${msg}`);
+        return { success: false, error: msg.includes("abort") ? "Request timed out (15s)" : msg };
       }
     },
   });
 
   const httpRequest = tool({
-    description:
-      "Make an HTTP request to any URL with full control over method, headers, and body. Use for calling external APIs, webhooks, or services. Only call when the user has explicitly asked you to interact with an external service.",
+    description: "Make an HTTP request to any API endpoint. Supports GET/POST/PUT/DELETE/PATCH with custom headers and JSON body.",
     inputSchema: z.object({
-      url: z.string().url().describe("Request URL"),
-      method: z
-        .enum(["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"])
-        .default("GET")
-        .describe("HTTP method"),
-      headers: z
-        .record(z.string(), z.string())
-        .optional()
-        .describe("HTTP headers as key-value pairs"),
-      body: z.string().optional().describe("Request body (JSON string or plain text)"),
+      url: z.string().url().describe("The API endpoint URL"),
+      method: z.enum(["GET", "POST", "PUT", "DELETE", "PATCH"]).default("GET"),
+      headers: z.record(z.string(), z.string()).optional().describe("Custom request headers"),
+      body: z.string().optional().describe("Request body (JSON string for POST/PUT/PATCH)"),
+      timeoutSeconds: z.number().min(1).max(30).default(15).describe("Request timeout in seconds"),
     }),
-    execute: async ({ url, method, headers, body }) => {
+    execute: async ({ url, method, headers, body, timeoutSeconds }) => {
+      deps.onCost?.(FETCH_COST);
       try {
-        const res = await fetch(url, {
-          method,
-          headers: headers as HeadersInit | undefined,
-          body: method !== "GET" && method !== "HEAD" ? body : undefined,
-          signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
-        });
+        const parsed = new URL(url);
+        if (!["http:", "https:"].includes(parsed.protocol)) {
+          return { success: false, error: "Only HTTP(S) URLs are supported" };
+        }
+        if (isBlockedHost(parsed.hostname)) {
+          return { success: false, error: "Access to internal/private addresses is blocked" };
+        }
 
-        const raw = await res.text();
-        const truncated = raw.length > maxBytes;
-        const responseBody = truncated ? raw.slice(0, maxBytes) : raw;
+        // Enforce max request body size (100KB)
+        if (body && body.length > 100_000) {
+          return { success: false, error: "Request body too large (max 100KB)" };
+        }
 
-        const responseHeaders: Record<string, string> = {};
-        res.headers.forEach((value, key) => {
-          responseHeaders[key] = value;
-        });
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), timeoutSeconds * 1000);
 
-        return {
-          success: res.ok,
-          status: res.status,
-          statusText: res.statusText,
-          headers: responseHeaders,
-          body: responseBody,
-          truncated,
-        };
+        try {
+          const reqHeaders: Record<string, string> = {
+            "User-Agent": "Koda/1.0 (AI Assistant)",
+            ...headers,
+          };
+
+          // Auto-set Content-Type for body requests if not already set
+          if (body && !Object.keys(reqHeaders).some((k) => k.toLowerCase() === "content-type")) {
+            reqHeaders["Content-Type"] = "application/json";
+          }
+
+          const res = await fetch(url, {
+            method,
+            headers: reqHeaders,
+            body: ["POST", "PUT", "PATCH"].includes(method) ? body : undefined,
+            signal: controller.signal,
+            redirect: "follow",
+          });
+
+          const resBuffer = await res.arrayBuffer();
+          const resText = new TextDecoder().decode(resBuffer).slice(0, 15_000);
+
+          // Extract relevant response headers
+          const responseHeaders: Record<string, string> = {};
+          for (const key of ["content-type", "x-request-id", "x-ratelimit-remaining", "retry-after", "location"]) {
+            const val = res.headers.get(key);
+            if (val) responseHeaders[key] = val;
+          }
+
+          logInfo("tools", `httpRequest: ${method} ${url} → ${res.status}`);
+          return {
+            success: res.ok,
+            status: res.status,
+            statusText: res.statusText,
+            headers: responseHeaders,
+            body: resText,
+            truncated: resBuffer.byteLength > 15_000,
+          };
+        } finally {
+          clearTimeout(timeout);
+        }
       } catch (err) {
-        return { success: false, error: err instanceof Error ? err.message : "Request failed" };
+        const msg = err instanceof Error ? err.message : "Request failed";
+        logError("tools", `httpRequest error: ${msg}`);
+        return { success: false, error: msg.includes("abort") ? `Request timed out (${timeoutSeconds}s)` : msg };
       }
     },
   });

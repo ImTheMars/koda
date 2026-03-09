@@ -239,24 +239,17 @@ export function registerSkillTools(deps: {
     description:
       "Manage skills. Actions: list (show all), load (read content), create (new skill), " +
       "search (find community skills), preview (inspect before installing), install (download + save).",
-    inputSchema: z.discriminatedUnion("action", [
-      z.object({ action: z.literal("list") }),
-      z.object({ action: z.literal("load"), name: z.string() }),
-      z.object({
-        action: z.literal("create"),
-        name: z.string(),
-        description: z.string(),
-        instructions: z.string(),
-        always: z.boolean().optional().default(false),
-      }),
-      z.object({ action: z.literal("search"), query: z.string() }),
-      z.object({ action: z.literal("preview"), rawUrl: z.string().url() }),
-      z.object({
-        action: z.literal("install"),
-        rawUrl: z.string().url(),
-        name: z.string().optional(),
-      }),
-    ]),
+    // OpenAI tool schemas require a top-level object; a discriminated union
+    // serializes to a non-object root schema and gets rejected.
+    inputSchema: z.object({
+      action: z.enum(["list", "load", "create", "search", "preview", "install"]),
+      name: z.string().optional(),
+      description: z.string().optional(),
+      instructions: z.string().optional(),
+      always: z.boolean().optional().default(false),
+      query: z.string().optional(),
+      rawUrl: z.string().url().optional(),
+    }),
     execute: async (input) => {
       // --- LIST ---
       if (input.action === "list") {
@@ -266,6 +259,7 @@ export function registerSkillTools(deps: {
 
       // --- LOAD ---
       if (input.action === "load") {
+        if (!input.name) return { success: false, error: "name is required for load" };
         const content = await skillLoader.loadSkill(input.name);
         if (!content) return { success: false, error: `Skill "${input.name}" not found` };
         return { success: true, content };
@@ -273,6 +267,9 @@ export function registerSkillTools(deps: {
 
       // --- CREATE ---
       if (input.action === "create") {
+        if (!input.name || !input.description || !input.instructions) {
+          return { success: false, error: "name, description, and instructions are required for create" };
+        }
         const { name, description, instructions, always } = input;
         if (!SKILL_NAME_PATTERN.test(name)) return { success: false, error: "Name must be lowercase letters, numbers, and hyphens" };
 
@@ -288,6 +285,7 @@ export function registerSkillTools(deps: {
 
       // --- SEARCH ---
       if (input.action === "search") {
+        if (!input.query) return { success: false, error: "query is required for search" };
         if (!deps.exaApiKey) return { success: false, error: "Skill shop requires Exa API key." };
         log("skills", "search: %s", input.query);
         try {
@@ -327,6 +325,7 @@ export function registerSkillTools(deps: {
 
       // --- PREVIEW ---
       if (input.action === "preview") {
+        if (!input.rawUrl) return { success: false, error: "rawUrl is required for preview" };
         if (!deps.exaApiKey) return { success: false, error: "Skill shop requires Exa API key." };
         log("skills", "preview: %s", input.rawUrl);
         const rawUrl = toRawUrl(input.rawUrl) ?? input.rawUrl;
@@ -358,6 +357,7 @@ export function registerSkillTools(deps: {
 
       // --- INSTALL ---
       if (input.action === "install") {
+        if (!input.rawUrl) return { success: false, error: "rawUrl is required for install" };
         if (!deps.exaApiKey) return { success: false, error: "Skill shop requires Exa API key." };
         log("skills", "install: %s", input.rawUrl);
         const rawUrl = toRawUrl(input.rawUrl) ?? input.rawUrl;

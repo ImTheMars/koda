@@ -1,97 +1,82 @@
 /**
- * Data analysis tool — parse and summarize CSV/JSON datasets without running code.
- *
- * analyzeData: Accepts a raw CSV or JSON string and returns schema, column statistics,
- * and sample rows — useful for quick data exploration without spawning a sandbox.
+ * Data analysis tools — structured CSV/JSON analysis without external dependencies.
  */
 
 import { tool, type ToolSet } from "ai";
 import { z } from "zod";
 
-type ColumnStats =
-  | { type: "number"; count: number; nulls: number; min: number; max: number; mean: number; unique: number }
-  | { type: "string"; count: number; nulls: number; unique: number; topValues: string[] };
+/** Parse a CSV string into rows of string arrays, handling quoted fields. */
+export function parseCsv(input: string): string[][] {
+  const rows: string[][] = [];
+  const lines = input.split(/\r?\n/).filter((l) => l.trim().length > 0);
 
-function detectFormat(data: string): "csv" | "json" {
-  const trimmed = data.trimStart();
-  if (trimmed.startsWith("{") || trimmed.startsWith("[")) return "json";
-  return "csv";
-}
+  for (const line of lines) {
+    const row: string[] = [];
+    let current = "";
+    let inQuotes = false;
 
-function parseCsv(text: string): Record<string, string>[] {
-  const lines = text.split(/\r?\n/).filter((l) => l.trim().length > 0);
-
-  const parseRow = (line: string): string[] => {
-    const cols: string[] = [];
-    let cur = "";
-    let inQuote = false;
     for (let i = 0; i < line.length; i++) {
-      const ch = line[i] ?? "";
-      if (ch === '"') {
-        const next = line[i + 1];
-        if (inQuote && next === '"') {
-          cur += '"';
-          i++;
+      const ch = line[i]!;
+      if (inQuotes) {
+        if (ch === '"' && line[i + 1] === '"') {
+          current += '"';
+          i++; // skip escaped quote
+        } else if (ch === '"') {
+          inQuotes = false;
         } else {
-          inQuote = !inQuote;
+          current += ch;
         }
-      } else if (ch === "," && !inQuote) {
-        cols.push(cur);
-        cur = "";
       } else {
-        cur += ch;
+        if (ch === '"') {
+          inQuotes = true;
+        } else if (ch === ",") {
+          row.push(current.trim());
+          current = "";
+        } else {
+          current += ch;
+        }
       }
     }
-    cols.push(cur);
-    return cols;
-  };
+    row.push(current.trim());
+    rows.push(row);
+  }
 
-  const [firstLine, ...dataLines] = lines;
-  if (!firstLine || dataLines.length === 0) return [];
-
-  const headers = parseRow(firstLine);
-  return dataLines.map((line) => {
-    const vals = parseRow(line);
-    return Object.fromEntries(headers.map((h, i) => [h.trim(), (vals[i] ?? "").trim()]));
-  });
+  return rows;
 }
 
-function computeStats(rows: Record<string, unknown>[], columns: string[]): Record<string, ColumnStats> {
-  const stats: Record<string, ColumnStats> = {};
+interface ColumnStats {
+  column: string;
+  min: number;
+  max: number;
+  avg: number;
+  sum: number;
+  count: number;
+}
 
-  for (const col of columns) {
-    const values = rows.map((r) => r[col]);
-    const nonNull = values.filter((v) => v !== null && v !== undefined && v !== "");
-    const nums = nonNull.map((v) => Number(v)).filter((n) => !isNaN(n));
+/** Compute numeric stats for each column. */
+export function computeStats(headers: string[], rows: string[][]): ColumnStats[] {
+  const stats: ColumnStats[] = [];
 
-    if (nums.length === nonNull.length && nonNull.length > 0) {
-      const min = Math.min(...nums);
-      const max = Math.max(...nums);
-      const mean = nums.reduce((a, b) => a + b, 0) / nums.length;
-      stats[col] = {
-        type: "number",
-        count: nonNull.length,
-        nulls: values.length - nonNull.length,
-        min,
-        max,
-        mean: Math.round(mean * 10_000) / 10_000,
-        unique: new Set(nums).size,
-      };
-    } else {
-      const strs = nonNull.map((v) => String(v));
-      const freq = new Map<string, number>();
-      for (const s of strs) freq.set(s, (freq.get(s) ?? 0) + 1);
-      const topValues = [...freq.entries()]
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, 5)
-        .map(([v]) => v);
-      stats[col] = {
-        type: "string",
-        count: nonNull.length,
-        nulls: values.length - nonNull.length,
-        unique: freq.size,
-        topValues,
-      };
+  for (let col = 0; col < headers.length; col++) {
+    const values: number[] = [];
+    for (const row of rows) {
+      const val = row[col];
+      if (val !== undefined && val !== "") {
+        const num = Number(val);
+        if (!isNaN(num)) values.push(num);
+      }
+    }
+
+    // Only report stats for columns with >50% numeric values
+    if (values.length > rows.length * 0.5 && values.length > 0) {
+      stats.push({
+        column: headers[col]!,
+        min: Math.min(...values),
+        max: Math.max(...values),
+        avg: values.reduce((a, b) => a + b, 0) / values.length,
+        sum: values.reduce((a, b) => a + b, 0),
+        count: values.length,
+      });
     }
   }
 
@@ -100,62 +85,56 @@ function computeStats(rows: Record<string, unknown>[], columns: string[]): Recor
 
 export function registerDataTools(): ToolSet {
   const analyzeData = tool({
-    description:
-      "Analyze a CSV or JSON dataset and return schema, column statistics, and sample rows. Use this instead of running code when the user shares structured data and wants summaries, counts, distributions, or quick insights.",
+    description: "Analyze structured data (CSV or JSON). Returns row count, column names, numeric statistics, and sample rows. Use for quick data exploration without running code.",
     inputSchema: z.object({
-      data: z.string().describe("Raw CSV or JSON content to analyze"),
-      format: z
-        .enum(["csv", "json", "auto"])
-        .default("auto")
-        .describe("Data format — use 'auto' to detect from content"),
-      sampleRows: z
-        .number()
-        .min(1)
-        .max(20)
-        .default(5)
-        .describe("Number of sample rows to include in the result"),
+      data: z.string().describe("The data to analyze — CSV text or JSON string (array of objects)"),
+      format: z.enum(["csv", "json"]).default("csv").describe("Data format"),
     }),
-    execute: async ({ data, format, sampleRows }) => {
+    execute: async ({ data, format }) => {
       try {
-        const fmt = format === "auto" ? detectFormat(data) : format;
-        let rows: Record<string, unknown>[] = [];
+        let headers: string[];
+        let dataRows: string[][];
 
-        if (fmt === "csv") {
-          rows = parseCsv(data);
-        } else {
-          const parsed = JSON.parse(data) as unknown;
-          if (Array.isArray(parsed)) {
-            rows = parsed.map((item) =>
-              typeof item === "object" && item !== null
-                ? (item as Record<string, unknown>)
-                : { value: item }
-            );
-          } else if (typeof parsed === "object" && parsed !== null) {
-            rows = [parsed as Record<string, unknown>];
-          } else {
-            return { success: false, error: "JSON must be an array or object" };
+        if (format === "json") {
+          const parsed = JSON.parse(data);
+          if (!Array.isArray(parsed) || parsed.length === 0) {
+            return { success: false, error: "Expected a non-empty JSON array of objects" };
           }
+          headers = Object.keys(parsed[0] as Record<string, unknown>);
+          dataRows = parsed.map((item: Record<string, unknown>) =>
+            headers.map((h) => String(item[h] ?? "")),
+          );
+        } else {
+          const allRows = parseCsv(data);
+          if (allRows.length < 2) {
+            return { success: false, error: "CSV needs at least a header row and one data row" };
+          }
+          headers = allRows[0]!;
+          dataRows = allRows.slice(1);
         }
 
-        if (rows.length === 0) {
-          return { success: false, error: "No rows found in data" };
-        }
-
-        const columns = [...new Set(rows.flatMap((r) => Object.keys(r)))];
-        const stats = computeStats(rows, columns);
-        const sample = rows.slice(0, sampleRows);
+        const stats = computeStats(headers, dataRows);
+        const sampleRows = dataRows.slice(0, 5).map((row) => {
+          const obj: Record<string, string> = {};
+          for (let i = 0; i < headers.length; i++) {
+            obj[headers[i]!] = row[i] ?? "";
+          }
+          return obj;
+        });
 
         return {
           success: true,
-          format: fmt,
-          rowCount: rows.length,
-          columnCount: columns.length,
-          columns,
-          stats,
-          sample,
+          rowCount: dataRows.length,
+          columns: headers,
+          numericStats: stats.map((s) => ({
+            ...s,
+            avg: Math.round(s.avg * 100) / 100,
+            sum: Math.round(s.sum * 100) / 100,
+          })),
+          sampleRows,
         };
       } catch (err) {
-        return { success: false, error: err instanceof Error ? err.message : "Analysis failed" };
+        return { success: false, error: err instanceof Error ? err.message : "Parse failed" };
       }
     },
   });

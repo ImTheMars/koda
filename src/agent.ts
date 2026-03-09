@@ -18,7 +18,7 @@ import { formatUserTime } from "./time.js";
 import { withToolContext, getPendingFiles } from "./tools/index.js";
 import type { UserProfile } from "./tools/memory.js";
 import { summarizeToolGovernance } from "./tools/autonomy.js";
-import { log, logInfo, logError } from "./log.js";
+import { log, logInfo, logError, logDebug, logTiming, startTimer, isDebug } from "./log.js";
 import { sanitizeForPrompt, redactSensitiveArgs } from "./security.js";
 import { detectFollowup } from "./followup.js";
 import { summarizeAndStore } from "./summarize.js";
@@ -126,6 +126,12 @@ export function shouldRequireResearch(input: { content: string; channel: string;
     return false;
   }
   return RESEARCH_TRIGGER_PATTERNS.some((pattern) => pattern.test(input.content));
+}
+
+function getSamplingSettings(modelId: string, temperature: number): { temperature?: number } {
+  // GPT-5 family models reject explicit temperature in provider requests.
+  if (/\/gpt-5(\b|[.-])/i.test(modelId)) return {};
+  return { temperature };
 }
 
 let llmFailures = 0;
@@ -463,6 +469,16 @@ function classifyAndAck(input: AgentInput, logPrefix: string, deps?: AgentDeps):
   const intent = classifyIntent(input.content);
   const willAck = shouldAck({ content: input.content, tier, intent, source: input.source });
   logInfo("agent", `${logPrefix}tier=${tier} intent=${intent} ack=${willAck}${input.tierOverride ? " (override)" : ""}`);
+  logDebug("router", `${logPrefix}classification`, {
+    input: input.content.slice(0, 200),
+    tier,
+    intent,
+    willAck,
+    source: input.source ?? "user",
+    channel: input.channel,
+    chatType: input.chatType ?? "private",
+    sender: input.senderId,
+  });
 
   if (input.onAck && willAck) {
     const soulAcks = deps?.getSoulAcks?.() ?? [];
@@ -495,7 +511,9 @@ async function buildAgentContext(deps: AgentDeps, input: AgentInput, tier: Tier,
     deps.getActivePlansSummary ? deps.getActivePlansSummary(input.senderId) : Promise.resolve(null),
   ];
 
+  const contextTimer = startTimer();
   const [profile, skillsSummary, workspaceProfile, projectProfile, assessmentSummary, activePlansSummary] = await Promise.all(promises);
+  logTiming("agent", `${input.requestId ? `[${input.requestId}] ` : ""}context fetch`, contextTimer());
 
   // Gather known issues from tool outcome learning
   let knownIssues: string[] | undefined;
@@ -518,7 +536,20 @@ async function buildAgentContext(deps: AgentDeps, input: AgentInput, tier: Tier,
     };
   }
 
-  return buildSystemPrompt({
+  logDebug("memory", `${input.requestId ? `[${input.requestId}] ` : ""}profile loaded`, {
+    staticFacts: profile.static.length,
+    dynamicFacts: profile.dynamic.length,
+    memories: profile.memories.length,
+    ...(profile.static.length > 0 ? { staticSample: profile.static.slice(0, 3).join("; ") } : {}),
+    ...(profile.memories.length > 0 ? { memorySample: profile.memories.slice(0, 3).join("; ") } : {}),
+    hasWorkspaceProfile: !!workspaceProfile,
+    hasProjectProfile: !!projectProfile,
+    hasAssessment: !!assessmentSummary,
+    hasActivePlans: !!activePlansSummary,
+    knownIssueCount: knownIssues?.length ?? 0,
+  });
+
+  const systemPrompt = buildSystemPrompt({
     tier,
     soulPrompt: deps.getSoulPrompt(),
     contextPrompt: deps.getContextPrompt(),
@@ -540,6 +571,15 @@ async function buildAgentContext(deps: AgentDeps, input: AgentInput, tier: Tier,
     researchRequired: shouldRequireResearch({ content: input.content, channel: input.channel, chatType: input.chatType }),
     groupContext,
   });
+
+  logDebug("agent", `${input.requestId ? `[${input.requestId}] ` : ""}system prompt built`, {
+    length: systemPrompt.length,
+    estimatedTokens: Math.round(systemPrompt.length / 4),
+    sections: systemPrompt.split("---").length,
+    researchRequired: shouldRequireResearch({ content: input.content, channel: input.channel, chatType: input.chatType }),
+  });
+
+  return systemPrompt;
 }
 
 /** Build the messages array from history + current input. */
@@ -601,22 +641,35 @@ function makeOnStepFinish(
   logPrefix: string,
   opts?: { userId?: string; enableOutcomeLearning?: boolean },
 ) {
+  const stepTimers: Map<string, () => number> = new Map();
+
   return async (step: { text?: string; toolCalls?: Array<{ toolName: string; args?: unknown }>; toolResults?: Array<{ toolName: string; result?: unknown }> }) => {
     if (step.toolCalls) {
       for (const call of step.toolCalls) {
         toolsUsed.push(call.toolName);
+        stepTimers.set(call.toolName, startTimer());
         logInfo("agent", `${logPrefix}step ${state.stepCount} CALL ${call.toolName} args=${redactSensitiveArgs((call.args ?? {}) as Record<string, unknown>)}`);
+        logDebug("agent", `${logPrefix}step ${state.stepCount} CALL ${call.toolName} full args`, {
+          args: JSON.stringify(call.args ?? {}).slice(0, 2000),
+        });
       }
     }
     if (step.toolResults) {
       for (const res of step.toolResults) {
         const raw = JSON.stringify(res.result ?? "").slice(0, 800);
         const isError = typeof res.result === "string" && (res.result.includes("Error") || res.result.includes("error"));
+        const elapsed = stepTimers.get(res.toolName)?.();
         if (isError) {
-          logError("agent", `${logPrefix}step ${state.stepCount} TOOL_ERROR ${res.toolName}: ${raw}`);
+          logError("agent", `${logPrefix}step ${state.stepCount} TOOL_ERROR ${res.toolName}: ${raw}${elapsed != null ? ` (${elapsed}ms)` : ""}`);
         } else {
-          logInfo("agent", `${logPrefix}step ${state.stepCount} RESULT ${res.toolName} ${raw.slice(0, 300)}`);
+          logInfo("agent", `${logPrefix}step ${state.stepCount} RESULT ${res.toolName} ${raw.slice(0, 300)}${elapsed != null ? ` (${elapsed}ms)` : ""}`);
         }
+        logDebug("agent", `${logPrefix}step ${state.stepCount} RESULT ${res.toolName} full`, {
+          resultLength: raw.length,
+          result: raw.slice(0, 3000),
+          isError,
+          ...(elapsed != null ? { elapsedMs: elapsed } : {}),
+        });
 
         // Record tool outcomes for learning
         if (opts?.enableOutcomeLearning && opts.userId) {
@@ -667,6 +720,19 @@ function finalizeResult(
   const uniqueTools = [...new Set(toolsUsed)];
 
   logInfo("agent", `${logPrefix}DONE model=${modelId} tokens=${promptTokens}/${completionTokens} cost=$${cost.toFixed(4)} toolCost=$${toolCost.toFixed(4)} tools=[${uniqueTools.join(",")}]`);
+  logDebug("agent", `${logPrefix}response`, {
+    model: modelId,
+    tier: currentTier,
+    promptTokens,
+    completionTokens,
+    cost: `$${cost.toFixed(4)}`,
+    toolCost: `$${toolCost.toFixed(4)}`,
+    totalCost: `$${(cost + toolCost).toFixed(4)}`,
+    tools: uniqueTools,
+    toolCallCount: toolsUsed.length,
+    responseLength: text.length,
+    responsePreview: text.slice(0, 300),
+  });
 
   dbUsage.track({
     userId: input.senderId,
@@ -763,10 +829,19 @@ export function createAgent(deps: AgentDeps) {
     const requestId = input.requestId ?? crypto.randomUUID().slice(0, 8);
     const logPrefix = `[${requestId}] `;
 
+    const requestTimer = startTimer();
     const { tier, skipQuery } = classifyAndAck(input, logPrefix, deps);
     const systemPrompt = await buildAgentContext(deps, input, tier, skipQuery);
     const history = dbMessages.getHistory(input.sessionKey, 30);
     const messageList = trimHistory(buildMessages(input, history), config.agent.historyTokenBudget, config.agent.charsPerToken, input.sessionKey);
+
+    logDebug("agent", `${logPrefix}history`, {
+      rawMessages: history.length,
+      afterTrim: messageList.length,
+      totalChars: messageList.reduce((sum, m) => sum + (typeof m.content === "string" ? m.content.length : JSON.stringify(m.content).length), 0),
+      estimatedTokens: Math.round(messageList.reduce((sum, m) => sum + (typeof m.content === "string" ? m.content.length : JSON.stringify(m.content).length), 0) / config.agent.charsPerToken),
+      hasAttachments: (input.attachments?.length ?? 0) > 0,
+    });
 
     input.onTypingStart?.();
 
@@ -801,7 +876,7 @@ export function createAgent(deps: AgentDeps) {
           toolChoice: "auto",
           stopWhen: stepCountIs(config.agent.maxSteps),
           maxOutputTokens: config.agent.maxTokens,
-          temperature: config.agent.temperature,
+          ...getSamplingSettings(modelId, config.agent.temperature),
           abortSignal: input.abortSignal,
           prepareStep: makePrepareStep(provider, tierOrder, config, state, logPrefix),
           onStepFinish: makeOnStepFinish(toolsUsed, state, logPrefix, {
@@ -814,6 +889,15 @@ export function createAgent(deps: AgentDeps) {
         const finalModelId = result.response?.modelId ?? getModelId(state.currentTier, config);
         const promptTokens = result.totalUsage?.inputTokens ?? result.usage?.inputTokens ?? 0;
         const completionTokens = result.totalUsage?.outputTokens ?? result.usage?.outputTokens ?? 0;
+
+        logTiming("agent", `${logPrefix}LLM generateText`, requestTimer());
+        logDebug("agent", `${logPrefix}generate result`, {
+          finalModel: finalModelId,
+          steps: state.stepCount,
+          uncertaintySignals: state.uncertaintyCount,
+          tierEscalated: state.currentTier !== tier,
+          responseLength: result.text.length,
+        });
 
         return finalizeResult(deps, input, history, state.currentTier, toolsUsed, result.text, finalModelId, promptTokens, completionTokens, logPrefix, toolCostRef.total);
       });
@@ -851,10 +935,19 @@ export function createStreamAgent(deps: AgentDeps) {
     const requestId = input.requestId ?? crypto.randomUUID().slice(0, 8);
     const logPrefix = `[${requestId}] stream `;
 
+    const requestTimer = startTimer();
     const { tier, skipQuery } = classifyAndAck(input, logPrefix, deps);
     const systemPrompt = await buildAgentContext(deps, input, tier, skipQuery);
     const history = dbMessages.getHistory(input.sessionKey, 30);
     const messageList = trimHistory(buildMessages(input, history), config.agent.historyTokenBudget, config.agent.charsPerToken, input.sessionKey);
+
+    logDebug("agent", `${logPrefix}history`, {
+      rawMessages: history.length,
+      afterTrim: messageList.length,
+      totalChars: messageList.reduce((sum, m) => sum + (typeof m.content === "string" ? m.content.length : JSON.stringify(m.content).length), 0),
+      estimatedTokens: Math.round(messageList.reduce((sum, m) => sum + (typeof m.content === "string" ? m.content.length : JSON.stringify(m.content).length), 0) / config.agent.charsPerToken),
+      hasAttachments: (input.attachments?.length ?? 0) > 0,
+    });
 
     const toolsUsed: string[] = [];
     const state = { currentTier: tier, stepCount: 0, uncertaintyCount: 0 };
@@ -883,7 +976,7 @@ export function createStreamAgent(deps: AgentDeps) {
         toolChoice: "auto",
         stopWhen: stepCountIs(config.agent.maxSteps),
         maxOutputTokens: config.agent.maxTokens,
-        temperature: config.agent.temperature,
+        ...getSamplingSettings(modelId, config.agent.temperature),
         prepareStep: makePrepareStep(provider, tierOrder, config, state, logPrefix),
         onStepFinish: makeOnStepFinish(toolsUsed, state, logPrefix, {
           userId: input.senderId,
