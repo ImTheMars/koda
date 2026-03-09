@@ -1,10 +1,16 @@
 /**
- * Telegram channel — Grammy bot with streaming text, photo, document, and webhook support.
- *
- * Uses streamAgent for text/photo/document messages so segments send as they complete.
+ * Telegram channel — Chat SDK transport with Koda-specific commands,
+ * attachment handling, session continuity, and admin helpers.
  */
 
-import { Bot, GrammyError, HttpError, InputFile } from "grammy";
+import { createMemoryState } from "@chat-adapter/state-memory";
+import {
+  createTelegramAdapter,
+  type TelegramMessage,
+  type TelegramRawMessage,
+  type TelegramWebhookInfo,
+} from "@chat-adapter/telegram";
+import { Chat, type Attachment, type Message, type Thread } from "chat";
 import type { Config, Tier } from "../config.js";
 import { persistConfig } from "../config.js";
 import { messages as dbMessages, usage as dbUsage, tasks as dbTasks, userProfiles, chatMembers } from "../db.js";
@@ -12,6 +18,7 @@ import type { StreamAgentResult } from "../agent.js";
 import { isLlmCircuitOpen, splitOnDelimiter } from "../agent.js";
 import { VERSION } from "../version.js";
 import { log, logWarn, logError } from "../log.js";
+import { getNamedSession } from "../tools/subagent.js";
 import { basename } from "path";
 
 export interface TelegramDeps {
@@ -37,6 +44,25 @@ export interface TelegramResult {
   handleWebhook?: (req: Request) => Promise<Response>;
   notifyAdmins: (text: string) => Promise<void>;
 }
+
+type TelegramThread = Thread<Record<string, unknown>, TelegramRawMessage>;
+type TelegramChatMessage = Message<TelegramRawMessage>;
+
+interface TelegramRawMessageExtra extends TelegramMessage {
+  forward_from?: { first_name?: string };
+  forward_from_chat?: { title?: string };
+  reply_to_message?: { text?: string; from?: { id: number } };
+  new_chat_members?: Array<{ id: number }>;
+  video_note?: { file_id: string; duration?: number };
+}
+
+const NAMED_AGENT_RE = /^@([A-Za-z][A-Za-z0-9_-]*)(?::|\s|$)\s*/;
+const COMMAND_RE = /^\/([A-Za-z0-9_]+)(?:@[A-Za-z0-9_]+)?(?:\s+([\s\S]*))?$/;
+const TYPING_TIMEOUT_MS = 120_000;
+const RATE_LIMIT_CLEANUP_MS = 5 * 60_000;
+const SEGMENT_DELAY_MS = 400;
+const MAX_DOCUMENT_SIZE = 20 * 1024 * 1024; // 20MB
+const MAX_DOCUMENT_TEXT = 30_000; // chars
 
 /** Transcribe audio via OpenRouter (Gemini Flash with native audio support). */
 async function transcribeAudio(audioBuffer: Buffer, config: Config): Promise<string | null> {
@@ -69,216 +95,278 @@ async function transcribeAudio(audioBuffer: Buffer, config: Config): Promise<str
   }
 }
 
-/** Safety timeout: auto-stop typing after 2 minutes */
-const TYPING_TIMEOUT_MS = 120_000;
-const DEDUP_CLEANUP_MS = 5 * 60_000;
-// Rate limit defaults — overridden by config in startTelegram
-let RATE_LIMIT = { maxRequests: 10, windowMs: 60_000 };
-const SEGMENT_DELAY_MS = 400;
-const MAX_DOCUMENT_SIZE = 20 * 1024 * 1024; // 20MB
-const MAX_DOCUMENT_TEXT = 30_000; // chars
-
-/** Check if a chat is a group or supergroup. */
-function isGroupChat(chatType: string): boolean {
+export function isGroupChat(chatType: string): boolean {
   return chatType === "group" || chatType === "supergroup";
 }
 
-/** Get display name for a Telegram user. */
-function getDisplayName(from: { first_name?: string; last_name?: string; username?: string } | undefined): string {
+export function getDisplayName(from: { first_name?: string; last_name?: string; username?: string } | undefined): string {
   if (!from) return "Unknown";
   const parts = [from.first_name, from.last_name].filter(Boolean);
   return parts.join(" ") || from.username || "Unknown";
 }
 
+function toAgentLabel(name: string): string {
+  return name
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+function getNamedAgentHeader(text: string): string | null {
+  const match = text.trim().match(NAMED_AGENT_RE);
+  if (!match) return null;
+  const agentName = match[1]!;
+  const namedSession = getNamedSession(agentName);
+  if (!namedSession) return null;
+  return `----- 🤖 From ${toAgentLabel(agentName)} Agent -----`;
+}
+
+export function parseCommand(text: string): { command: string; args: string } | null {
+  const match = text.trim().match(COMMAND_RE);
+  if (!match) return null;
+  return {
+    command: match[1]!.toLowerCase(),
+    args: (match[2] ?? "").trim(),
+  };
+}
+
+export function shouldRespondInTelegramGroup(input: {
+  botNameTriggers: string[];
+  botUserId?: string;
+  caption?: string;
+  isMention?: boolean;
+  newChatMemberIds?: string[];
+  replyToMessageFromId?: string;
+  text?: string;
+}): boolean {
+  if (input.isMention) return true;
+  if (input.replyToMessageFromId && input.botUserId && input.replyToMessageFromId === input.botUserId) {
+    return true;
+  }
+
+  const lower = (input.text ?? input.caption ?? "").toLowerCase();
+  for (const trigger of input.botNameTriggers) {
+    const re = new RegExp(`\\b${trigger.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i");
+    if (re.test(lower)) return true;
+  }
+
+  if (input.botUserId && input.newChatMemberIds?.some((id) => id === input.botUserId)) {
+    return true;
+  }
+
+  return false;
+}
+
+function enrichContent(text: string, message: {
+  forward_from?: { first_name?: string };
+  forward_from_chat?: { title?: string };
+  reply_to_message?: { text?: string };
+}): string {
+  let content = text;
+
+  if (message.forward_from) {
+    content = `[forwarded from ${message.forward_from.first_name}]\n\n${content}`;
+  } else if (message.forward_from_chat) {
+    content = `[forwarded from ${message.forward_from_chat.title ?? "unknown channel"}]\n\n${content}`;
+  }
+
+  if (message.reply_to_message?.text) {
+    content = `[replying to: "${message.reply_to_message.text.slice(0, 500)}"]\n\n${content}`;
+  }
+
+  return content;
+}
+
+function isLikelyModelId(value: string): boolean {
+  return /^[^\s/]+\/[^\s]+$/.test(value);
+}
+
+async function attachmentToBuffer(attachment: Attachment): Promise<Buffer> {
+  if (attachment.fetchData) return attachment.fetchData();
+  if (attachment.data instanceof Buffer) return attachment.data;
+  if (attachment.data instanceof Blob) return Buffer.from(await attachment.data.arrayBuffer());
+  if (attachment.data instanceof ArrayBuffer) return Buffer.from(attachment.data);
+  throw new Error("Attachment data unavailable");
+}
+
 export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult> {
   const { config } = deps;
   const token = config.telegram.token!;
-  const bot = new Bot(token);
-  RATE_LIMIT = {
-    maxRequests: config.telegram.rateLimitMax ?? 10,
-    windowMs: config.telegram.rateLimitWindowMs ?? 60_000,
-  };
+  const apiBaseUrl = process.env.TELEGRAM_API_BASE_URL ?? "https://api.telegram.org";
+  const state = createMemoryState();
+  const telegram = createTelegramAdapter({
+    botToken: token,
+    secretToken: config.telegram.webhookSecret,
+    mode: config.telegram.useWebhook ? "webhook" : "polling",
+    longPolling: {
+      timeout: 30,
+      retryDelayMs: 1000,
+      deleteWebhook: true,
+      dropPendingUpdates: false,
+    },
+  });
+  const chat = new Chat({
+    userName: process.env.TELEGRAM_BOT_USERNAME ?? "koda",
+    adapters: { telegram },
+    state,
+    logger: "warn",
+  });
+
   const allowFrom = new Set(config.telegram.allowFrom);
-  const processedMessages = new Set<string>();
-  const sentMessages = new Set<string>();
   const rateCounts = new Map<string, { count: number; resetAt: number }>();
+  const tierOverrides = new Map<string, Tier>();
+  const pendingClears = new Set<string>();
   const typingRefCounts = new Map<string, number>();
   const typingIntervals = new Map<string, ReturnType<typeof setInterval>>();
   const typingTimeouts = new Map<string, ReturnType<typeof setTimeout>>();
-  const tierOverrides = new Map<string, Tier>();
+  const kodaEnv = process.env.KODA_ENV ?? (config.telegram.useWebhook ? "production" : "development");
+  const bootTime = new Date();
+  const rateLimit = {
+    maxRequests: config.telegram.rateLimitMax ?? 10,
+    windowMs: config.telegram.rateLimitWindowMs ?? 60_000,
+  };
 
-  const dedupTimer = setInterval(() => {
-    processedMessages.clear();
-    sentMessages.clear();
-    // Sweep stale rate limit entries (entries self-expire via resetAt but are never deleted)
+  const cleanupTimer = setInterval(() => {
     const now = Date.now();
-    for (const [id, entry] of rateCounts) {
-      if (now > entry.resetAt) rateCounts.delete(id);
+    for (const [chatId, entry] of rateCounts) {
+      if (now > entry.resetAt) rateCounts.delete(chatId);
     }
-  }, DEDUP_CLEANUP_MS);
+  }, RATE_LIMIT_CLEANUP_MS);
+
+  const telegramFetch = async <T>(method: string, payload?: Record<string, unknown>): Promise<T> => {
+    const response = await fetch(`${apiBaseUrl}/bot${token}/${method}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload ?? {}),
+    });
+    if (!response.ok) {
+      throw new Error(`${method} failed with ${response.status}`);
+    }
+    const data = await response.json() as { ok: boolean; result?: T; description?: string };
+    if (!data.ok || data.result === undefined) {
+      throw new Error(data.description ?? `${method} failed`);
+    }
+    return data.result;
+  };
+
+  const downloadTelegramFile = async (fileId: string): Promise<Buffer> => {
+    const file = await telegramFetch<{ file_path?: string }>("getFile", { file_id: fileId });
+    if (!file.file_path) throw new Error("Telegram file path missing");
+    const response = await fetch(`${apiBaseUrl}/file/bot${token}/${file.file_path}`);
+    if (!response.ok) throw new Error(`Telegram file download failed (${response.status})`);
+    return Buffer.from(await response.arrayBuffer());
+  };
 
   const isAllowed = (userId: string) => allowFrom.size === 0 || allowFrom.has(userId);
+  const isAdmin = (userId: string) => config.telegram.adminIds.includes(userId);
+  const sessionKeyForChat = (chatId: string) => `telegram_${chatId}`;
+  const decodeThread = (threadId: string) => telegram.decodeThreadId(threadId);
 
   const isRateLimited = (chatId: string): boolean => {
     const now = Date.now();
     let entry = rateCounts.get(chatId);
-    if (!entry || now > entry.resetAt) { entry = { count: 0, resetAt: now + RATE_LIMIT.windowMs }; rateCounts.set(chatId, entry); }
+    if (!entry || now > entry.resetAt) {
+      entry = { count: 0, resetAt: now + rateLimit.windowMs };
+      rateCounts.set(chatId, entry);
+    }
     entry.count++;
-    return entry.count > RATE_LIMIT.maxRequests;
+    return entry.count > rateLimit.maxRequests;
   };
 
-  const startTyping = (chatId: string) => {
-    const nextCount = (typingRefCounts.get(chatId) ?? 0) + 1;
-    typingRefCounts.set(chatId, nextCount);
+  const startTyping = (thread: TelegramThread) => {
+    const key = thread.id;
+    const nextCount = (typingRefCounts.get(key) ?? 0) + 1;
+    typingRefCounts.set(key, nextCount);
     if (nextCount > 1) return;
-    const send = () => bot.api.sendChatAction(Number(chatId), "typing").catch(() => {});
+    const send = () => thread.startTyping().catch(() => {});
     send();
-    typingIntervals.set(chatId, setInterval(send, 4000));
-    typingTimeouts.set(chatId, setTimeout(() => {
-      typingRefCounts.set(chatId, 0);
-      stopTyping(chatId);
+    typingIntervals.set(key, setInterval(send, 4000));
+    typingTimeouts.set(key, setTimeout(() => {
+      typingRefCounts.set(key, 0);
+      stopTyping(thread.id);
     }, TYPING_TIMEOUT_MS));
   };
 
-  const stopTyping = (chatId: string) => {
-    const current = typingRefCounts.get(chatId) ?? 0;
+  const stopTyping = (threadId: string) => {
+    const current = typingRefCounts.get(threadId) ?? 0;
     if (current > 1) {
-      typingRefCounts.set(chatId, current - 1);
+      typingRefCounts.set(threadId, current - 1);
       return;
     }
-    typingRefCounts.delete(chatId);
-    const iv = typingIntervals.get(chatId);
-    if (iv) { clearInterval(iv); typingIntervals.delete(chatId); }
-    const to = typingTimeouts.get(chatId);
-    if (to) { clearTimeout(to); typingTimeouts.delete(chatId); }
-  };
-
-  const escapeHtml = (text: string): string =>
-    text
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;");
-
-  const markdownToTelegramHtml = (text: string): string => {
-    // HTML-escape first so code block content is safe
-    let html = escapeHtml(text);
-
-    // Extract code blocks to placeholders so list conversion doesn't corrupt them
-    const codeBlocks: string[] = [];
-    html = html.replace(/```[\w-]*\n([\s\S]*?)```/g, (_m, code: string) => {
-      const idx = codeBlocks.length;
-      codeBlocks.push(`<pre><code>${code.trim()}</code></pre>`);
-      return `\x00BLOCK${idx}\x00`;
-    });
-
-    // Inline formatting
-    html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
-    html = html.replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>");
-    html = html.replace(/\*([^*]+)\*/g, "<i>$1</i>");
-    html = html.replace(/~~([^~]+)~~/g, "<s>$1</s>");
-    html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '<a href="$2">$1</a>');
-
-    // List and todo conversion (applied per-line, safe now that code blocks are out)
-    html = html.replace(/^(\s*)[-*] \[[xX]\] /gm, "$1✅ ");   // checked todo
-    html = html.replace(/^(\s*)[-*] \[ \] /gm, "$1☐ ");        // unchecked todo
-    html = html.replace(/^(  )[-*] /gm, "$1◦ ");               // nested bullet (2-space indent)
-    html = html.replace(/^[-*] /gm, "• ");                     // top-level bullet
-
-    html = html.replace(/\n{3,}/g, "\n\n");
-
-    // Restore code blocks
-    html = html.replace(/\x00BLOCK(\d+)\x00/g, (_m, i) => codeBlocks[Number(i)]!);
-
-    return html;
-  };
-
-  const chunkMessage = (text: string, maxLen = 4000): string[] => {
-    if (text.length <= maxLen) return [text];
-    const chunks: string[] = [];
-    let remaining = text;
-    while (remaining.length > maxLen) {
-      let splitAt = remaining.lastIndexOf("\n", maxLen);
-      if (splitAt <= 0) splitAt = maxLen;
-      chunks.push(remaining.slice(0, splitAt));
-      remaining = remaining.slice(splitAt).trimStart();
+    typingRefCounts.delete(threadId);
+    const interval = typingIntervals.get(threadId);
+    if (interval) {
+      clearInterval(interval);
+      typingIntervals.delete(threadId);
     }
-    if (remaining) chunks.push(remaining);
-    return chunks;
-  };
-
-  const sendSegment = async (chatId: number, text: string, threadId?: number) => {
-    const outgoingKey = `${chatId}:${threadId ?? "main"}:${Bun.hash(text)}`;
-    if (sentMessages.has(outgoingKey)) {
-      log("telegram", "dedup: skipping duplicate outgoing message");
-      return;
-    }
-    sentMessages.add(outgoingKey);
-
-    // Detect image URLs from generation APIs and send as photos
-    const imageUrlMatch = text.match(/https:\/\/[^\s"'<>]+\.(png|jpg|jpeg|webp)/i);
-    if (imageUrlMatch) {
-      await bot.api.sendPhoto(chatId, imageUrlMatch[0], {
-        ...(threadId !== undefined ? { message_thread_id: threadId } : {}),
-      }).catch(() => {});
-    }
-
-    for (const chunk of chunkMessage(text)) {
-      await bot.api.sendMessage(chatId, markdownToTelegramHtml(chunk), {
-        parse_mode: "HTML",
-        ...(threadId !== undefined ? { message_thread_id: threadId } : {}),
-      });
+    const timeout = typingTimeouts.get(threadId);
+    if (timeout) {
+      clearTimeout(timeout);
+      typingTimeouts.delete(threadId);
     }
   };
 
-  const sendReply = async (chatId: number, text: string, threadId?: number) => {
+  const sendSegment = async (thread: TelegramThread, text: string) => {
+    if (!text.trim()) return;
+    await thread.post({ markdown: text });
+  };
+
+  const sendDirectChannelMessage = async (chatId: string, text: string) => {
     const segments = splitOnDelimiter(text);
     for (let i = 0; i < segments.length; i++) {
-      await sendSegment(chatId, segments[i]!, threadId);
-      if (i < segments.length - 1) await new Promise((r) => setTimeout(r, SEGMENT_DELAY_MS + Math.random() * 200));
+      await telegram.postChannelMessage(chatId, { markdown: segments[i]! });
+      if (i < segments.length - 1) {
+        await new Promise((resolve) => setTimeout(resolve, SEGMENT_DELAY_MS + Math.random() * 200));
+      }
     }
   };
 
   const sendStreamReply = async (input: {
-    chatId: number;
-    threadId?: number;
+    thread: TelegramThread;
     stream: AsyncIterable<string>;
     onStop: () => void;
+    header?: string;
   }) => {
-    const { chatId, threadId, stream, onStop } = input;
+    const { thread, stream, onStop, header } = input;
     let buffer = "";
+    let headerAdded = false;
+
+    const withHeader = (text: string): string => {
+      if (!header || headerAdded) return text;
+      headerAdded = true;
+      return `${header}\n${text}`;
+    };
 
     try {
       for await (const chunk of stream) {
         buffer += chunk;
-        // Track whether we're inside a code block — don't split there
         const fenceCount = (buffer.match(/```/g) || []).length;
-        const inCodeBlock = fenceCount % 2 !== 0;
-        if (inCodeBlock) continue;
+        if (fenceCount % 2 !== 0) continue;
         const segments = splitOnDelimiter(buffer);
         if (segments.length > 1) {
           for (let i = 0; i < segments.length - 1; i++) {
-            await sendSegment(chatId, segments[i]!, threadId);
-            await new Promise((r) => setTimeout(r, SEGMENT_DELAY_MS + Math.random() * 200));
+            await sendSegment(thread, withHeader(segments[i]!));
+            await new Promise((resolve) => setTimeout(resolve, SEGMENT_DELAY_MS + Math.random() * 200));
           }
           buffer = segments[segments.length - 1] ?? "";
         }
       }
+
       const remaining = buffer.trim();
-      if (remaining) await sendSegment(chatId, remaining, threadId);
+      if (remaining) await sendSegment(thread, withHeader(remaining));
     } finally {
       onStop();
     }
   };
 
-  /** Send pending files from agent result */
-  const sendPendingFiles = async (chatId: number, files: Array<{ path: string; caption?: string }>) => {
+  const sendPendingFiles = async (thread: TelegramThread, files: Array<{ path: string; caption?: string }>) => {
     for (const file of files) {
       try {
         const data = await Bun.file(file.path).arrayBuffer();
-        const buffer = Buffer.from(data);
-        const filename = basename(file.path);
-        await bot.api.sendDocument(chatId, new InputFile(buffer, filename), {
-          caption: file.caption,
+        await thread.post({
+          raw: file.caption ?? "",
+          files: [{ data, filename: basename(file.path) }],
         });
       } catch (err) {
         logError("telegram", `Failed to send file ${file.path}`, err);
@@ -286,49 +374,53 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
     }
   };
 
-  const dedupKey = (chatId: number, messageId: number) => `${chatId}:${messageId}`;
-
-  // --- Consume tier override for a chat ---
   const consumeTierOverride = (chatId: string): Tier | undefined => {
     const override = tierOverrides.get(chatId);
     if (override) tierOverrides.delete(chatId);
     return override;
   };
 
-  // --- Build content with forwarded/reply metadata ---
-  const enrichContent = (text: string, message: {
-    forward_from?: { first_name?: string };
-    forward_from_chat?: { title?: string };
-    reply_to_message?: { text?: string };
-  }): string => {
-    let content = text;
-
-    // Forwarded message metadata (apply first)
-    if (message.forward_from) {
-      const name = message.forward_from.first_name;
-      content = `[forwarded from ${name}]\n\n${content}`;
-    } else if (message.forward_from_chat) {
-      const title = message.forward_from_chat.title ?? "unknown channel";
-      content = `[forwarded from ${title}]\n\n${content}`;
-    }
-
-    // Reply threading (can stack with forwarded)
-    if (message.reply_to_message?.text) {
-      content = `[replying to: "${message.reply_to_message.text.slice(0, 500)}"]\n\n${content}`;
-    }
-
-    return content;
+  const requireAdmin = async (thread: TelegramThread, senderId: string): Promise<boolean> => {
+    if (isAdmin(senderId)) return true;
+    await thread.post("admin only.").catch(() => {});
+    return false;
   };
 
-  // Lazy singleton for pdf-parse to avoid repeated dynamic imports
+  const trackUserPresence = (
+    senderId: string,
+    chatId: string,
+    from: { first_name?: string; last_name?: string; username?: string } | undefined,
+    chatType: string,
+  ) => {
+    try {
+      const displayName = getDisplayName(from);
+      const role = isAdmin(senderId) ? "admin" as const : "member" as const;
+      userProfiles.upsert({ userId: senderId, displayName, username: from?.username, role });
+      if (isGroupChat(chatType)) chatMembers.upsert(chatId, senderId);
+    } catch {
+      // DB may not be migrated yet.
+    }
+  };
+
+  const shouldRespondInGroup = (raw: TelegramRawMessageExtra, message: TelegramChatMessage): boolean => {
+    return shouldRespondInTelegramGroup({
+      text: message.text,
+      caption: raw.caption,
+      isMention: message.isMention,
+      replyToMessageFromId: raw.reply_to_message?.from ? String(raw.reply_to_message.from.id) : undefined,
+      botUserId: telegram.botUserId,
+      botNameTriggers: config.group.botNameTriggers,
+      newChatMemberIds: raw.new_chat_members?.map((member) => String(member.id)),
+    });
+  };
+
   let pdfParseFn: ((buf: Buffer) => Promise<{ text: string }>) | null = null;
   const getPdfParse = async (): Promise<(buf: Buffer) => Promise<{ text: string }>> => {
-    // @ts-ignore — pdf-parse has no type declarations
+    // @ts-ignore - pdf-parse has no bundled types.
     if (!pdfParseFn) pdfParseFn = (await import("pdf-parse")).default;
     return pdfParseFn!;
   };
 
-  // --- Extract text from a document ---
   const extractDocumentText = async (buffer: Buffer, mimeType: string, fileName: string): Promise<string | null> => {
     const textTypes = [
       "text/plain", "text/markdown", "text/csv", "text/html", "text/xml",
@@ -351,220 +443,21 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
       }
     }
 
-    if (textTypes.some((t) => mimeType.startsWith(t)) || textExtensions.some((ext) => fileName.toLowerCase().endsWith(ext))) {
+    if (textTypes.some((type) => mimeType.startsWith(type)) || textExtensions.some((ext) => fileName.toLowerCase().endsWith(ext))) {
       return buffer.toString("utf-8");
     }
 
     return null;
   };
 
-  // --- Error tracking + reconnect ---
-  let consecutiveErrors = 0;
-
-  bot.catch(async (err) => {
-    const e = err.error;
-    if (e instanceof GrammyError) {
-      logError("telegram", `API error ${e.error_code}: ${e.description}`);
-    } else if (e instanceof HttpError) {
-      logError("telegram", "Network error", e);
-      consecutiveErrors++;
-      if (consecutiveErrors > 5) {
-        logError("telegram", "Too many network errors, restarting bot...");
-        consecutiveErrors = 0;
-        try { await bot.stop(); } catch { /* shutdown may fail if already disconnected */ }
-        startWithRetry();
-      }
-    } else {
-      logError("telegram", "Unknown error", e ?? err);
-      consecutiveErrors++;
-      if (consecutiveErrors > 5) {
-        logError("telegram", "Too many errors, restarting bot...");
-        consecutiveErrors = 0;
-        try { await bot.stop(); } catch { /* shutdown may fail if already disconnected */ }
-        startWithRetry();
-      }
+  const notifyAdmins = async (text: string) => {
+    for (const adminId of config.telegram.adminIds) {
+      await sendDirectChannelMessage(adminId, text).catch(() => {});
     }
-  });
+  };
 
-  // --- Commands ---
-  bot.command("start", async (ctx) => {
-    if (!isAllowed(String(ctx.from?.id))) { await ctx.reply("Access denied."); return; }
-    await ctx.reply("hey. send me a message to get started.");
-  });
-
-  const pendingClears = new Set<string>();
-  bot.command("clear", async (ctx) => {
-    const senderId = String(ctx.from?.id);
-    if (!isAllowed(senderId)) return;
-    if (isGroupChat(ctx.chat.type) && !(await requireAdmin(ctx, senderId))) return;
-    const chatId = String(ctx.chat.id);
-    if (pendingClears.has(chatId)) {
-      pendingClears.delete(chatId);
-      dbMessages.clear(`telegram_${chatId}`);
-      await ctx.reply("Conversation cleared.");
-    } else {
-      pendingClears.add(chatId);
-      setTimeout(() => pendingClears.delete(chatId), 30_000);
-      await ctx.reply("Clear conversation history? Send /clear again to confirm.");
-    }
-  });
-
-  bot.command("help", async (ctx) => {
-    const senderId = String(ctx.from?.id);
-    if (!isAllowed(senderId)) return;
-    const helpText = "commands:\n" +
-      "/help - this message\n" +
-      "/clear - reset conversation\n" +
-      "/usage - see token usage and costs\n" +
-      "/status - system health summary\n" +
-      "/deep - force next message to use deep tier\n" +
-      "/fast - force next message to use fast tier\n" +
-      "/recap - summarize recent conversation\n" +
-      "/memories - list or delete stored memories\n" +
-      "/model - view or change models (quick set: /model <id>)\n" +
-      "/adduser <id> - add a user (admin)\n" +
-      "/removeuser <id> - remove a user (admin)\n\n" +
-      "i can also search the web, remember things, run code, set reminders, manage files, generate images, and load skills.\n" +
-      "send me voice messages — i'll transcribe and respond.\n" +
-      "send me PDFs and text files — i'll read them. reply to messages for context.";
-    if (isGroupChat(ctx.chat.type)) {
-      await ctx.reply(helpText + "\n\nin groups, mention me (@" + (bot.botInfo?.username ?? "koda") + ") or reply to my messages to get a response.");
-    } else {
-      await ctx.reply(helpText);
-    }
-  });
-
-  bot.command("usage", async (ctx) => {
-    const senderId = String(ctx.from?.id);
-    if (!isAllowed(senderId)) return;
-    const now = new Date();
-    const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
-    const [today, month, allTime] = [dbUsage.getSummary(senderId, todayStart), dbUsage.getSummary(senderId, monthStart), dbUsage.getSummary(senderId)];
-    const fmt = (cost: number) => `$${cost.toFixed(4)}`;
-    await ctx.reply(`usage summary:\n\ntoday: ${today.totalRequests} requests, ${fmt(today.totalCost)}\nthis month: ${month.totalRequests} requests, ${fmt(month.totalCost)}\nall time: ${allTime.totalRequests} requests, ${fmt(allTime.totalCost)}`);
-  });
-
-  bot.command("status", async (ctx) => {
-    const senderId = String(ctx.from?.id);
-    if (!isAllowed(senderId)) return;
-
-    const uptimeSecs = Math.floor(process.uptime());
-    const uptimeStr = uptimeSecs < 60
-      ? `${uptimeSecs}s`
-      : uptimeSecs < 3600
-      ? `${Math.floor(uptimeSecs / 60)}m ${uptimeSecs % 60}s`
-      : `${Math.floor(uptimeSecs / 3600)}h ${Math.floor((uptimeSecs % 3600) / 60)}m`;
-
-    const mem = process.memoryUsage();
-    const heapMb = (mem.heapUsed / 1024 / 1024).toFixed(1);
-    const rssMb = (mem.rss / 1024 / 1024).toFixed(1);
-
-    const now = new Date();
-    const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-    const todayUsage = dbUsage.getSummary(senderId, todayStart);
-
-    const allReady = dbTasks.getReady(new Date("2099-01-01").toISOString());
-    const nextTask = allReady.length > 0 ? allReady[0] : null;
-
-    const llmStatus = isLlmCircuitOpen() ? "degraded" : "healthy";
-
-    let status = `koda v${VERSION}\n`;
-    status += `uptime: ${uptimeStr}\n`;
-    status += `memory: ${heapMb}MB heap / ${rssMb}MB rss\n`;
-    status += `llm: ${llmStatus}\n`;
-    status += `today: ${todayUsage.totalRequests} requests, $${todayUsage.totalCost.toFixed(4)}\n`;
-    status += `models: fast=${config.openrouter.fastModel}, deep=${config.openrouter.deepModel}\n`;
-    if (nextTask) {
-      status += `next task: ${nextTask.description} (${nextTask.nextRunAt})`;
-    } else {
-      status += `tasks: ${allReady.length} active`;
-    }
-
-    await ctx.reply(status);
-  });
-
-  bot.command("deep", async (ctx) => {
-    const senderId = String(ctx.from?.id);
-    if (!isAllowed(senderId)) return;
-    tierOverrides.set(String(ctx.chat.id), "deep");
-    await ctx.reply("next message will use deep tier.");
-  });
-
-  bot.command("fast", async (ctx) => {
-    const senderId = String(ctx.from?.id);
-    if (!isAllowed(senderId)) return;
-    tierOverrides.set(String(ctx.chat.id), "fast");
-    await ctx.reply("next message will use fast tier.");
-  });
-
-  bot.command("recap", async (ctx) => {
-    const senderId = String(ctx.from?.id);
-    if (!isAllowed(senderId)) return;
-    const chatId = String(ctx.chat.id);
-
-    startTyping(chatId);
-    try {
-      const result = await deps.streamAgent({
-        content: "give me a brief recap of our recent conversation — key topics, decisions, and any open items.",
-        senderId, chatId, channel: "telegram",
-        sessionKey: `telegram_${chatId}`,
-        source: "command",
-      });
-      await sendStreamReply({
-        chatId: Number(chatId),
-        threadId: ctx.message!.message_thread_id,
-        stream: result.fullStream,
-        onStop: () => stopTyping(chatId),
-      });
-      await result.finishedPromise.catch((err) => logError("telegram", "agent promise failed", err));
-    } catch (err) {
-      stopTyping(chatId);
-      logError("telegram", "Recap error", err);
-      await ctx.reply("ran into an issue generating the recap.").catch(() => {});
-    }
-  });
-
-  bot.command("memories", async (ctx) => {
-    const senderId = String(ctx.from?.id);
-    if (!isAllowed(senderId)) return;
-    const chatId = String(ctx.chat.id);
-    const args = ctx.message!.text.replace(/^\/memories\s*/, "").trim();
-
-    startTyping(chatId);
-    try {
-      let prompt: string;
-      if (args.startsWith("delete ")) {
-        const target = args.slice(7).trim();
-        prompt = `Delete the memory matching: "${target}". Use the deleteMemory tool. Confirm what was deleted.`;
-      } else {
-        prompt = "List my 10 most recent memories using the recall tool with a broad query. Number each one clearly.";
-      }
-
-      const result = await deps.streamAgent({
-        content: prompt,
-        senderId, chatId, channel: "telegram",
-        sessionKey: `telegram_${chatId}`,
-        source: "command",
-      });
-      await sendStreamReply({
-        chatId: Number(chatId),
-        threadId: ctx.message!.message_thread_id,
-        stream: result.fullStream,
-        onStop: () => stopTyping(chatId),
-      });
-      await result.finishedPromise.catch((err) => logError("telegram", "agent promise failed", err));
-    } catch (err) {
-      stopTyping(chatId);
-      logError("telegram", "Memories error", err);
-      await ctx.reply("ran into an issue with memories.").catch(() => {});
-    }
-  });
-
-  bot.command("model", async (ctx) => {
-    const senderId = String(ctx.from?.id);
-    if (!isAllowed(senderId)) return;
-    if (isGroupChat(ctx.chat.type) && !(await requireAdmin(ctx, senderId))) return;
+  const handleModelCommand = async (thread: TelegramThread, senderId: string, args: string, inGroup: boolean) => {
+    if (inGroup && !(await requireAdmin(thread, senderId))) return;
 
     const verifyChatModel = async (modelId: string): Promise<string | null> => {
       try {
@@ -589,9 +482,7 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
         const resolvedModel = typeof data.model === "string" ? data.model : null;
         if (resolvedModel && resolvedModel !== modelId) {
           const isAliasMatch = resolvedModel.startsWith(`${modelId}-`) || modelId.startsWith(`${resolvedModel}-`);
-          if (isAliasMatch) {
-            return `note: OpenRouter resolved alias to ${resolvedModel}.`;
-          }
+          if (isAliasMatch) return `note: OpenRouter resolved alias to ${resolvedModel}.`;
           return `warning: OpenRouter responded with ${resolvedModel}; saved ${modelId} anyway.`;
         }
 
@@ -612,14 +503,11 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
       "/model primary <model-id> - same as all";
 
     const showCurrentModels = async () => {
-      await ctx.reply(
+      await thread.post(
         `models:\nfast: ${config.openrouter.fastModel}\ndeep: ${config.openrouter.deepModel}\nimage: ${config.openrouter.imageModel}\n\n${usageText}`,
       );
     };
 
-    const isLikelyModelId = (value: string) => /^[^\s/]+\/[^\s]+$/.test(value);
-
-    const args = ctx.message!.text.replace(/^\/model\s*/, "").trim();
     if (!args || args === "show" || args === "list") {
       await showCurrentModels();
       return;
@@ -630,7 +518,6 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
     const parts = args.split(/\s+/).filter(Boolean);
 
     if (parts.length === 1 && isLikelyModelId(parts[0]!)) {
-      // Quick path: /model <id> updates primary chat model (fast + deep).
       target = "all";
       modelId = parts[0]!;
     } else {
@@ -643,13 +530,13 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
       } else if (normalizedTarget === "fast" || normalizedTarget === "deep" || normalizedTarget === "image" || normalizedTarget === "all") {
         target = normalizedTarget;
       } else {
-        await ctx.reply(usageText);
+        await thread.post(usageText);
         return;
       }
     }
 
     if (!isLikelyModelId(modelId)) {
-      await ctx.reply("invalid model id. expected something like provider/model-name");
+      await thread.post("invalid model id. expected something like provider/model-name");
       return;
     }
 
@@ -674,680 +561,499 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
 
     try {
       await persistConfig(config);
-      await ctx.reply(verificationNote ? `${successText}\n${verificationNote}` : successText);
+      await thread.post(verificationNote ? `${successText}\n${verificationNote}` : successText);
     } catch (err) {
-      // Config change takes effect in memory even if persist fails
-      await ctx.reply(`${successText} (config save failed: ${(err as Error).message})${verificationNote ? `\n${verificationNote}` : ""}`);
+      await thread.post(`${successText} (config save failed: ${(err as Error).message})${verificationNote ? `\n${verificationNote}` : ""}`);
     }
-  });
+  };
 
-  // --- Text messages (streaming) ---
-  bot.on("message:text", async (ctx) => {
-    const senderId = String(ctx.from?.id);
-    if (!isAllowed(senderId)) {
-      log("msg", `BLOCKED text from=${senderId} reason=not_allowed`);
-      return;
+  const handleCommand = async (thread: TelegramThread, message: TelegramChatMessage, raw: TelegramRawMessageExtra, senderId: string, chatId: string, inGroup: boolean): Promise<boolean> => {
+    const parsed = parseCommand(message.text);
+    if (!parsed) return false;
+
+    switch (parsed.command) {
+      case "start":
+        await thread.post(isAllowed(senderId) ? "hey. send me a message to get started." : "Access denied.");
+        return true;
+      case "help": {
+        if (!isAllowed(senderId)) return true;
+        const helpText = "commands:\n" +
+          "/help - this message\n" +
+          "/clear - reset conversation\n" +
+          "/usage - see token usage and costs\n" +
+          "/status - system health summary\n" +
+          "/deep - force next message to use deep tier\n" +
+          "/fast - force next message to use fast tier\n" +
+          "/recap - summarize recent conversation\n" +
+          "/memories - list or delete stored memories\n" +
+          "/model - view or change models (quick set: /model <id>)\n" +
+          "/adduser <id> - add a user (admin)\n" +
+          "/removeuser <id> - remove a user (admin)\n\n" +
+          "i can also search the web, remember things, run code, set reminders, manage files, generate images, and load skills.\n" +
+          "send me voice messages — i'll transcribe and respond.\n" +
+          "send me PDFs and text files — i'll read them. reply to messages for context.";
+        if (inGroup) {
+          await thread.post(`${helpText}\n\nin groups, mention me (@${telegram.userName}) or reply to my messages to get a response.`);
+        } else {
+          await thread.post(helpText);
+        }
+        return true;
+      }
+      case "clear":
+        if (!isAllowed(senderId)) return true;
+        if (inGroup && !(await requireAdmin(thread, senderId))) return true;
+        if (pendingClears.has(chatId)) {
+          pendingClears.delete(chatId);
+          dbMessages.clear(sessionKeyForChat(chatId));
+          await thread.post("Conversation cleared.");
+        } else {
+          pendingClears.add(chatId);
+          setTimeout(() => pendingClears.delete(chatId), 30_000);
+          await thread.post("Clear conversation history? Send /clear again to confirm.");
+        }
+        return true;
+      case "usage": {
+        if (!isAllowed(senderId)) return true;
+        const now = new Date();
+        const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+        const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+        const [today, month, allTime] = [
+          dbUsage.getSummary(senderId, todayStart),
+          dbUsage.getSummary(senderId, monthStart),
+          dbUsage.getSummary(senderId),
+        ];
+        const fmt = (cost: number) => `$${cost.toFixed(4)}`;
+        await thread.post(
+          `usage summary:\n\ntoday: ${today.totalRequests} requests, ${fmt(today.totalCost)}\nthis month: ${month.totalRequests} requests, ${fmt(month.totalCost)}\nall time: ${allTime.totalRequests} requests, ${fmt(allTime.totalCost)}`,
+        );
+        return true;
+      }
+      case "status": {
+        if (!isAllowed(senderId)) return true;
+        const uptimeSecs = Math.floor(process.uptime());
+        const uptimeStr = uptimeSecs < 60
+          ? `${uptimeSecs}s`
+          : uptimeSecs < 3600
+          ? `${Math.floor(uptimeSecs / 60)}m ${uptimeSecs % 60}s`
+          : `${Math.floor(uptimeSecs / 3600)}h ${Math.floor((uptimeSecs % 3600) / 60)}m`;
+        const mem = process.memoryUsage();
+        const heapMb = (mem.heapUsed / 1024 / 1024).toFixed(1);
+        const rssMb = (mem.rss / 1024 / 1024).toFixed(1);
+        const now = new Date();
+        const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+        const todayUsage = dbUsage.getSummary(senderId, todayStart);
+        const allReady = dbTasks.getReady(new Date("2099-01-01").toISOString());
+        const nextTask = allReady.length > 0 ? allReady[0] : null;
+        const llmStatus = isLlmCircuitOpen() ? "degraded" : "healthy";
+        let status = `koda v${VERSION}\n`;
+        status += `uptime: ${uptimeStr}\n`;
+        status += `memory: ${heapMb}MB heap / ${rssMb}MB rss\n`;
+        status += `llm: ${llmStatus}\n`;
+        status += `today: ${todayUsage.totalRequests} requests, $${todayUsage.totalCost.toFixed(4)}\n`;
+        status += `models: fast=${config.openrouter.fastModel}, deep=${config.openrouter.deepModel}\n`;
+        if (nextTask) {
+          status += `next task: ${nextTask.description} (${nextTask.nextRunAt})`;
+        } else {
+          status += `tasks: ${allReady.length} active`;
+        }
+        await thread.post(status);
+        return true;
+      }
+      case "deep":
+        if (!isAllowed(senderId)) return true;
+        tierOverrides.set(chatId, "deep");
+        await thread.post("next message will use deep tier.");
+        return true;
+      case "fast":
+        if (!isAllowed(senderId)) return true;
+        tierOverrides.set(chatId, "fast");
+        await thread.post("next message will use fast tier.");
+        return true;
+      case "recap": {
+        if (!isAllowed(senderId)) return true;
+        startTyping(thread);
+        try {
+          const result = await deps.streamAgent({
+            content: "give me a brief recap of our recent conversation — key topics, decisions, and any open items.",
+            senderId,
+            chatId,
+            channel: "telegram",
+            sessionKey: sessionKeyForChat(chatId),
+            source: "command",
+          });
+          await sendStreamReply({
+            thread,
+            stream: result.fullStream,
+            onStop: () => stopTyping(thread.id),
+          });
+          await result.finishedPromise.catch((err) => logError("telegram", "agent promise failed", err));
+        } catch (err) {
+          stopTyping(thread.id);
+          logError("telegram", "Recap error", err);
+          await thread.post("ran into an issue generating the recap.").catch(() => {});
+        }
+        return true;
+      }
+      case "memories": {
+        if (!isAllowed(senderId)) return true;
+        startTyping(thread);
+        try {
+          const prompt = parsed.args.startsWith("delete ")
+            ? `Delete the memory matching: "${parsed.args.slice(7).trim()}". Use the deleteMemory tool. Confirm what was deleted.`
+            : "List my 10 most recent memories using the recall tool with a broad query. Number each one clearly.";
+          const result = await deps.streamAgent({
+            content: prompt,
+            senderId,
+            chatId,
+            channel: "telegram",
+            sessionKey: sessionKeyForChat(chatId),
+            source: "command",
+          });
+          await sendStreamReply({
+            thread,
+            stream: result.fullStream,
+            onStop: () => stopTyping(thread.id),
+          });
+          await result.finishedPromise.catch((err) => logError("telegram", "agent promise failed", err));
+        } catch (err) {
+          stopTyping(thread.id);
+          logError("telegram", "Memories error", err);
+          await thread.post("ran into an issue with memories.").catch(() => {});
+        }
+        return true;
+      }
+      case "model":
+        if (!isAllowed(senderId)) return true;
+        await handleModelCommand(thread, senderId, parsed.args, inGroup);
+        return true;
+      case "debug": {
+        if (!isAdmin(senderId)) {
+          await thread.post("admin only.");
+          return true;
+        }
+        const uptimeSecs = Math.floor(process.uptime());
+        const uptimeStr = uptimeSecs < 3600
+          ? `${Math.floor(uptimeSecs / 60)}m ${uptimeSecs % 60}s`
+          : `${Math.floor(uptimeSecs / 3600)}h ${Math.floor((uptimeSecs % 3600) / 60)}m`;
+        const mem = process.memoryUsage();
+        const heapMb = (mem.heapUsed / 1024 / 1024).toFixed(1);
+        const rssMb = (mem.rss / 1024 / 1024).toFixed(1);
+        const now = new Date();
+        const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+        const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+        const todayUsage = dbUsage.getSummary(senderId, todayStart);
+        const monthUsage = dbUsage.getSummary(senderId, monthStart);
+        const allUsage = dbUsage.getSummary(senderId);
+        const allTasks = dbTasks.getReady(new Date("2099-01-01").toISOString());
+        const llmStatus = isLlmCircuitOpen() ? "DEGRADED" : "healthy";
+        let msg = `--- koda debug ---\n`;
+        msg += `version: v${VERSION}\n`;
+        msg += `env: ${kodaEnv}\n`;
+        msg += `mode: ${config.telegram.useWebhook ? "webhook" : "polling"}\n`;
+        msg += `uptime: ${uptimeStr}\n`;
+        msg += `booted: ${bootTime.toISOString()}\n`;
+        msg += `heap: ${heapMb}MB / rss: ${rssMb}MB\n`;
+        msg += `llm: ${llmStatus}\n`;
+        msg += `models:\n  fast: ${config.openrouter.fastModel}\n  deep: ${config.openrouter.deepModel}\n  image: ${config.openrouter.imageModel}\n`;
+        msg += `---\n`;
+        msg += `today: ${todayUsage.totalRequests} req, $${todayUsage.totalCost.toFixed(4)}\n`;
+        msg += `month: ${monthUsage.totalRequests} req, $${monthUsage.totalCost.toFixed(4)}\n`;
+        msg += `all-time: ${allUsage.totalRequests} req, $${allUsage.totalCost.toFixed(4)}\n`;
+        msg += `tasks: ${allTasks.length} active\n`;
+        msg += `node: ${process.version}\n`;
+        msg += `platform: ${process.platform}/${process.arch}`;
+        await thread.post(msg);
+        return true;
+      }
+      case "adduser":
+        if (!isAllowed(senderId)) return true;
+        if (!(await requireAdmin(thread, senderId))) return true;
+        if (!parsed.args || !/^\d+$/.test(parsed.args)) {
+          await thread.post("usage: /adduser <telegram_user_id>");
+          return true;
+        }
+        allowFrom.add(parsed.args);
+        try {
+          userProfiles.upsert({ userId: parsed.args, displayName: `User ${parsed.args}`, role: "member" });
+        } catch {}
+        await thread.post(`user ${parsed.args} added.`);
+        log("telegram", `admin ${senderId} added user ${parsed.args}`);
+        return true;
+      case "removeuser":
+        if (!isAllowed(senderId)) return true;
+        if (!(await requireAdmin(thread, senderId))) return true;
+        if (!parsed.args || !/^\d+$/.test(parsed.args)) {
+          await thread.post("usage: /removeuser <telegram_user_id>");
+          return true;
+        }
+        if (parsed.args === senderId) {
+          await thread.post("can't remove yourself.");
+          return true;
+        }
+        if (isAdmin(parsed.args)) {
+          await thread.post("can't remove an admin.");
+          return true;
+        }
+        allowFrom.delete(parsed.args);
+        await thread.post(`user ${parsed.args} removed.`);
+        log("telegram", `admin ${senderId} removed user ${parsed.args}`);
+        return true;
+      default:
+        return false;
     }
-    const key = dedupKey(ctx.chat.id, ctx.message.message_id);
-    if (processedMessages.has(key)) { log("msg", `DEDUP text from=${senderId}`); return; }
-    processedMessages.add(key);
-    const chatId = String(ctx.chat.id);
-    const displayName = getDisplayName(ctx.from);
-    const inGroup = isGroupChat(ctx.chat.type);
-    const preview = ctx.message.text.slice(0, 100);
-    log("msg", `IN text from=${senderId} chat=${chatId}${inGroup ? " (group)" : ""} len=${ctx.message.text.length} "${preview}"`);
+  };
 
-    // Track user presence
-    trackUserPresence(senderId, chatId, ctx.from, ctx.chat.type);
-
-    // Group passive listening: store but don't respond unless addressed
-    if (inGroup && config.group.passiveListening && !shouldRespondInGroup(ctx.message)) {
-      const attributed = `[${displayName}]: ${ctx.message.text}`;
-      dbMessages.append(`telegram_${chatId}`, "user", attributed);
-      log("msg", `PASSIVE text from=${senderId} chat=${chatId}`);
-      return;
-    }
-
-    if (isRateLimited(chatId)) { log("msg", `RATE_LIMITED chat=${chatId}`); await ctx.reply("slow down! you're sending messages too fast."); return; }
-
-    let content = enrichContent(ctx.message.text, ctx.message);
-    // In group chats, prefix with sender name for context
-    if (inGroup) {
-      content = `[${displayName}]: ${content}`;
-    }
-    const tierOverride = consumeTierOverride(chatId);
+  const runAgentForMessage = async (input: {
+    thread: TelegramThread;
+    content: string;
+    senderId: string;
+    chatId: string;
+    displayName: string;
+    inGroup: boolean;
+    header?: string | null;
+    attachments?: Array<{ type: "image"; mimeType: string; data: string }>;
+    tierOverride?: Tier;
+    source?: string;
+  }) => {
+    const { thread, content, senderId, chatId, displayName, inGroup, header, attachments, tierOverride, source } = input;
     const t0 = Date.now();
-
-    startTyping(chatId);
+    startTyping(thread);
     try {
       const streamResult = await deps.streamAgent({
         content,
-        senderId, chatId, channel: "telegram",
-        sessionKey: `telegram_${chatId}`,
+        attachments,
+        senderId,
+        chatId,
+        channel: "telegram",
+        sessionKey: sessionKeyForChat(chatId),
         tierOverride,
+        source,
         senderDisplayName: displayName,
         chatType: inGroup ? "group" : "private",
-        onAck: (text) => ctx.reply(text).catch(() => {}),
+        onAck: (text) => {
+          void thread.post({ markdown: text }).catch(() => {});
+        },
       });
 
-      consecutiveErrors = 0;
       await sendStreamReply({
-        chatId: Number(chatId),
-        threadId: ctx.message.message_thread_id,
+        thread,
         stream: streamResult.fullStream,
-        onStop: () => stopTyping(chatId),
+        onStop: () => stopTyping(thread.id),
+        ...(header ? { header } : {}),
       });
-      const agentResult = await streamResult.finishedPromise.catch((err) => { logError("telegram", "agent promise failed", err); return null; });
+
+      const agentResult = await streamResult.finishedPromise.catch((err) => {
+        logError("telegram", "agent promise failed", err);
+        return null;
+      });
 
       const elapsed = Date.now() - t0;
-      const replyPreview = (agentResult?.text ?? "").slice(0, 120);
-      log("msg", `OUT text to=${chatId} len=${agentResult?.text?.length ?? 0} tier=${agentResult?.tier ?? "?"} tools=[${agentResult?.toolsUsed?.join(",") ?? ""}] ${elapsed}ms "${replyPreview}"`);
-
-      // Send pending files
+      log("msg", `OUT to=${chatId} len=${agentResult?.text?.length ?? 0} tier=${agentResult?.tier ?? "?"} tools=[${agentResult?.toolsUsed?.join(",") ?? ""}] ${elapsed}ms`);
       if (agentResult?.files?.length) {
-        log("msg", `FILES to=${chatId} count=${agentResult.files.length}`);
-        await sendPendingFiles(Number(chatId), agentResult.files);
+        await sendPendingFiles(thread, agentResult.files);
       }
     } catch (err) {
-      stopTyping(chatId);
-      logError("msg", `text from=${senderId} chat=${chatId} ${Date.now() - t0}ms`, err);
-      await ctx.reply("ran into an issue, try again?").catch(() => {});
+      stopTyping(thread.id);
+      logError("msg", `message from=${senderId} chat=${chatId} ${Date.now() - t0}ms`, err);
+      await thread.post("ran into an issue, try again?").catch(() => {});
     }
-  });
+  };
 
-  // --- Photo messages (streaming) ---
-  bot.on("message:photo", async (ctx) => {
-    const senderId = String(ctx.from?.id);
-    if (!isAllowed(senderId)) { log("msg", `BLOCKED photo from=${senderId} reason=not_allowed`); return; }
-    const key = dedupKey(ctx.chat.id, ctx.message.message_id);
-    if (processedMessages.has(key)) return;
-    processedMessages.add(key);
-    const chatId = String(ctx.chat.id);
-    const displayName = getDisplayName(ctx.from);
-    const inGroup = isGroupChat(ctx.chat.type);
-    log("msg", `IN photo from=${senderId} chat=${chatId} caption="${(ctx.message.caption ?? "").slice(0, 80)}"`);
+  const handleIncomingMessage = async (thread: TelegramThread, message: TelegramChatMessage) => {
+    const raw = message.raw as TelegramRawMessageExtra;
+    const chatId = String(raw.chat.id);
+    const senderId = message.author.userId;
+    const displayName = getDisplayName(raw.from) || message.author.fullName || "Unknown";
+    const inGroup = isGroupChat(raw.chat.type);
+    const namedAgentHeader = getNamedAgentHeader(message.text ?? raw.caption ?? "");
 
-    trackUserPresence(senderId, chatId, ctx.from, ctx.chat.type);
-
-    // Group passive listening for photos
-    if (inGroup && config.group.passiveListening && !shouldRespondInGroup(ctx.message as Parameters<typeof shouldRespondInGroup>[0])) {
-      dbMessages.append(`telegram_${chatId}`, "user", `[${displayName}]: [photo] ${ctx.message.caption ?? ""}`);
-      log("msg", `PASSIVE photo from=${senderId} chat=${chatId}`);
+    if (!isAllowed(senderId)) {
+      log("msg", `BLOCKED message from=${senderId} reason=not_allowed`);
       return;
     }
 
-    if (isRateLimited(chatId)) { log("msg", `RATE_LIMITED chat=${chatId}`); await ctx.reply("slow down!"); return; }
+    trackUserPresence(senderId, chatId, raw.from, raw.chat.type);
 
-    let caption = ctx.message.caption ?? "What's in this image?";
-    if (inGroup) caption = `[${displayName}]: ${caption}`;
-
-    // Reply context for photos
-    if (ctx.message.reply_to_message?.text) {
-      caption = `[replying to: "${ctx.message.reply_to_message.text.slice(0, 500)}"]\n\n${caption}`;
-    }
-
-    const photos = ctx.message.photo;
-    if (!photos.length) {
-      await ctx.reply("I couldn't read that image.");
+    if (!message.metadata.edited && await handleCommand(thread, message, raw, senderId, chatId, inGroup)) {
       return;
     }
-    const largest = photos.at(-1);
-    if (!largest) {
-      await ctx.reply("I couldn't read that image.");
-      return;
-    }
-    const file = await ctx.api.getFile(largest.file_id);
-    if (!file.file_path) {
-      await ctx.reply("I couldn't access that image.");
-      return;
-    }
-    const url = `https://api.telegram.org/file/bot${token}/${file.file_path}`;
-    const response = await fetch(url);
-    if (!response.ok) {
-      await ctx.reply("I couldn't download that image.");
-      return;
-    }
-    const buffer = Buffer.from(await response.arrayBuffer());
 
-    const t0 = Date.now();
-    startTyping(chatId);
-    try {
-      const streamResult = await deps.streamAgent({
-        content: caption,
-        attachments: [{ type: "image", mimeType: "image/jpeg", data: buffer.toString("base64") }],
-        senderId, chatId, channel: "telegram",
-        sessionKey: `telegram_${chatId}`,
-        senderDisplayName: displayName,
-        chatType: inGroup ? "group" : "private",
-        onAck: (text) => ctx.reply(text).catch(() => {}),
-      });
-
-      consecutiveErrors = 0;
-      await sendStreamReply({
-        chatId: Number(chatId),
-        threadId: ctx.message.message_thread_id,
-        stream: streamResult.fullStream,
-        onStop: () => stopTyping(chatId),
-      });
-      const agentResult = await streamResult.finishedPromise.catch((err) => { logError("telegram", "agent promise failed", err); return null; });
-      log("msg", `OUT photo to=${chatId} len=${agentResult?.text?.length ?? 0} tier=${agentResult?.tier ?? "?"} ${Date.now() - t0}ms`);
-      if (agentResult?.files?.length) {
-        await sendPendingFiles(Number(chatId), agentResult.files);
+    if (inGroup && config.group.passiveListening && !shouldRespondInGroup(raw, message)) {
+      if (raw.photo?.length) {
+        dbMessages.append(sessionKeyForChat(chatId), "user", `[${displayName}]: [photo] ${raw.caption ?? ""}`);
+      } else if (raw.document) {
+        dbMessages.append(sessionKeyForChat(chatId), "user", `[${displayName}]: [document: ${raw.document.file_name ?? "file"}] ${raw.caption ?? ""}`);
+      } else if (raw.voice) {
+        dbMessages.append(sessionKeyForChat(chatId), "user", `[${displayName}]: [voice message]`);
+      } else if (raw.video_note) {
+        dbMessages.append(sessionKeyForChat(chatId), "user", `[${displayName}]: [video note]`);
+      } else if (message.text) {
+        dbMessages.append(sessionKeyForChat(chatId), "user", `[${displayName}]: ${message.text}`);
       }
-    } catch (err) {
-      stopTyping(chatId);
-      logError("msg", `photo from=${senderId} chat=${chatId} ${Date.now() - t0}ms`, err);
-      await ctx.reply("ran into an issue, try again?").catch(() => {});
-    }
-  });
-
-  // --- Document/PDF messages ---
-  bot.on("message:document", async (ctx) => {
-    const senderId = String(ctx.from?.id);
-    if (!isAllowed(senderId)) { log("msg", `BLOCKED document from=${senderId} reason=not_allowed`); return; }
-    const key = dedupKey(ctx.chat.id, ctx.message.message_id);
-    if (processedMessages.has(key)) return;
-    processedMessages.add(key);
-    const chatId = String(ctx.chat.id);
-    const displayName = getDisplayName(ctx.from);
-    const inGroup = isGroupChat(ctx.chat.type);
-    log("msg", `IN document from=${senderId} chat=${chatId} file="${ctx.message.document.file_name ?? "?"}"`);
-
-    trackUserPresence(senderId, chatId, ctx.from, ctx.chat.type);
-
-    // Group passive listening for documents
-    if (inGroup && config.group.passiveListening && !shouldRespondInGroup(ctx.message as Parameters<typeof shouldRespondInGroup>[0])) {
-      dbMessages.append(`telegram_${chatId}`, "user", `[${displayName}]: [document: ${ctx.message.document.file_name ?? "file"}] ${ctx.message.caption ?? ""}`);
-      log("msg", `PASSIVE document from=${senderId} chat=${chatId}`);
+      log("msg", `PASSIVE message from=${senderId} chat=${chatId}`);
       return;
     }
 
-    if (isRateLimited(chatId)) { log("msg", `RATE_LIMITED chat=${chatId}`); await ctx.reply("slow down!"); return; }
-
-    const doc = ctx.message.document;
-    const fileName = doc.file_name ?? "document";
-    const mimeType = doc.mime_type ?? "application/octet-stream";
-    const fileSize = doc.file_size ?? 0;
-
-    if (fileSize > MAX_DOCUMENT_SIZE) {
-      await ctx.reply("That file is too large (max 20MB).");
+    if (isRateLimited(chatId)) {
+      await thread.post(inGroup ? "slow down!" : "slow down! you're sending messages too fast.").catch(() => {});
       return;
     }
 
-    // Download the file
-    const file = await ctx.api.getFile(doc.file_id);
-    if (!file.file_path) {
-      await ctx.reply("I couldn't access that file.");
-      return;
-    }
-    const url = `https://api.telegram.org/file/bot${token}/${file.file_path}`;
-    const response = await fetch(url);
-    if (!response.ok) {
-      await ctx.reply("I couldn't download that file.");
-      return;
-    }
-    const buffer = Buffer.from(await response.arrayBuffer());
-
-    // Extract text
-    const extractedText = await extractDocumentText(buffer, mimeType, fileName);
-    if (extractedText === null) {
-      await ctx.reply("I can read PDFs and text files (.txt, .md, .csv, .json, .html, .xml). This format isn't supported yet.");
-      return;
-    }
-
-    const truncatedText = extractedText.slice(0, MAX_DOCUMENT_TEXT);
-    const caption = ctx.message.caption ?? "";
-    let content = `[document: ${fileName}]\n\n${truncatedText}`;
-    if (truncatedText.length < extractedText.length) {
-      content += `\n\n[truncated — showing ${MAX_DOCUMENT_TEXT} of ${extractedText.length} characters]`;
-    }
-    if (caption) {
-      content = `${caption}\n\n${content}`;
-    }
-    if (inGroup) {
-      content = `[${displayName}]: ${content}`;
-    }
-
-    // Reply context for documents
-    if (ctx.message.reply_to_message?.text) {
-      content = `[replying to: "${ctx.message.reply_to_message.text.slice(0, 500)}"]\n\n${content}`;
-    }
-
-    const t0 = Date.now();
-    startTyping(chatId);
-    try {
-      const streamResult = await deps.streamAgent({
+    if (message.metadata.edited && message.text) {
+      let content = `[edited] ${message.text}`;
+      if (inGroup) content = `[${displayName}]: ${content}`;
+      await runAgentForMessage({
+        thread,
         content,
-        senderId, chatId, channel: "telegram",
-        sessionKey: `telegram_${chatId}`,
-        senderDisplayName: displayName,
-        chatType: inGroup ? "group" : "private",
-        onAck: (text) => ctx.reply(text).catch(() => {}),
+        senderId,
+        chatId,
+        displayName,
+        inGroup,
+        header: namedAgentHeader,
       });
-
-      consecutiveErrors = 0;
-      await sendStreamReply({
-        chatId: Number(chatId),
-        threadId: ctx.message.message_thread_id,
-        stream: streamResult.fullStream,
-        onStop: () => stopTyping(chatId),
-      });
-      const agentResult = await streamResult.finishedPromise.catch((err) => { logError("telegram", "agent promise failed", err); return null; });
-      log("msg", `OUT document to=${chatId} len=${agentResult?.text?.length ?? 0} tier=${agentResult?.tier ?? "?"} ${Date.now() - t0}ms`);
-      if (agentResult?.files?.length) {
-        await sendPendingFiles(Number(chatId), agentResult.files);
-      }
-    } catch (err) {
-      stopTyping(chatId);
-      logError("msg", `document from=${senderId} chat=${chatId} ${Date.now() - t0}ms`, err);
-      await ctx.reply("ran into an issue processing that file.").catch(() => {});
-    }
-  });
-
-  // --- Voice messages ---
-  bot.on("message:voice", async (ctx) => {
-    const senderId = String(ctx.from?.id);
-    if (!isAllowed(senderId)) { log("msg", `BLOCKED voice from=${senderId} reason=not_allowed`); return; }
-    const key = dedupKey(ctx.chat.id, ctx.message.message_id);
-    if (processedMessages.has(key)) return;
-    processedMessages.add(key);
-    const chatId = String(ctx.chat.id);
-    const displayName = getDisplayName(ctx.from);
-    const inGroup = isGroupChat(ctx.chat.type);
-    log("msg", `IN voice from=${senderId} chat=${chatId} duration=${ctx.message.voice.duration}s`);
-
-    trackUserPresence(senderId, chatId, ctx.from, ctx.chat.type);
-
-    // Group passive listening for voice — can't check text content, so only respond if reply-to-bot
-    if (inGroup && config.group.passiveListening && !shouldRespondInGroup(ctx.message as Parameters<typeof shouldRespondInGroup>[0])) {
-      dbMessages.append(`telegram_${chatId}`, "user", `[${displayName}]: [voice message]`);
-      log("msg", `PASSIVE voice from=${senderId} chat=${chatId}`);
       return;
     }
 
-    if (isRateLimited(chatId)) { log("msg", `RATE_LIMITED chat=${chatId}`); await ctx.reply("slow down!"); return; }
-
-    const voice = ctx.message.voice;
-    const file = await ctx.api.getFile(voice.file_id);
-    if (!file.file_path) {
-      await ctx.reply("I couldn't access that voice message.");
-      return;
-    }
-    const url = `https://api.telegram.org/file/bot${token}/${file.file_path}`;
-    const response = await fetch(url);
-    if (!response.ok) {
-      await ctx.reply("I couldn't download that voice message.");
-      return;
-    }
-    const buffer = Buffer.from(await response.arrayBuffer());
-
-    const transcription = await transcribeAudio(buffer, config);
-    if (!transcription) {
-      await ctx.reply("I couldn't transcribe that voice message. Try again or send it as text.");
-      return;
-    }
-
-    log("msg", `TRANSCRIBED voice from=${senderId} "${transcription.slice(0, 100)}"`);
-
-    let content = `[voice message] ${transcription}`;
-    content = enrichContent(content, ctx.message);
-    if (inGroup) content = `[${displayName}]: ${content}`;
-    const tierOverride = consumeTierOverride(chatId);
-    const t0 = Date.now();
-
-    startTyping(chatId);
-    try {
-      const streamResult = await deps.streamAgent({
-        content,
-        senderId, chatId, channel: "telegram",
-        sessionKey: `telegram_${chatId}`,
-        tierOverride,
-        senderDisplayName: displayName,
-        chatType: inGroup ? "group" : "private",
-        onAck: (text) => ctx.reply(text).catch(() => {}),
-      });
-
-      consecutiveErrors = 0;
-      await sendStreamReply({
-        chatId: Number(chatId),
-        threadId: ctx.message.message_thread_id,
-        stream: streamResult.fullStream,
-        onStop: () => stopTyping(chatId),
-      });
-      const agentResult = await streamResult.finishedPromise.catch((err) => { logError("telegram", "agent promise failed", err); return null; });
-      log("msg", `OUT voice to=${chatId} len=${agentResult?.text?.length ?? 0} tier=${agentResult?.tier ?? "?"} ${Date.now() - t0}ms`);
-      if (agentResult?.files?.length) {
-        await sendPendingFiles(Number(chatId), agentResult.files);
-      }
-    } catch (err) {
-      stopTyping(chatId);
-      logError("msg", `voice from=${senderId} chat=${chatId} ${Date.now() - t0}ms`, err);
-      await ctx.reply("ran into an issue, try again?").catch(() => {});
-    }
-  });
-
-  // --- Video note (circle video) messages ---
-  bot.on("message:video_note", async (ctx) => {
-    const senderId = String(ctx.from?.id);
-    if (!isAllowed(senderId)) { log("msg", `BLOCKED video_note from=${senderId} reason=not_allowed`); return; }
-    const key = dedupKey(ctx.chat.id, ctx.message.message_id);
-    if (processedMessages.has(key)) return;
-    processedMessages.add(key);
-    const chatId = String(ctx.chat.id);
-    const displayName = getDisplayName(ctx.from);
-    const inGroup = isGroupChat(ctx.chat.type);
-    log("msg", `IN video_note from=${senderId} chat=${chatId}`);
-
-    trackUserPresence(senderId, chatId, ctx.from, ctx.chat.type);
-
-    if (inGroup && config.group.passiveListening && !shouldRespondInGroup(ctx.message as Parameters<typeof shouldRespondInGroup>[0])) {
-      dbMessages.append(`telegram_${chatId}`, "user", `[${displayName}]: [video note]`);
-      log("msg", `PASSIVE video_note from=${senderId} chat=${chatId}`);
-      return;
-    }
-
-    if (isRateLimited(chatId)) { log("msg", `RATE_LIMITED chat=${chatId}`); await ctx.reply("slow down!"); return; }
-
-    const videoNote = ctx.message.video_note;
-    const file = await ctx.api.getFile(videoNote.file_id);
-    if (!file.file_path) {
-      await ctx.reply("I couldn't access that video note.");
-      return;
-    }
-    const url = `https://api.telegram.org/file/bot${token}/${file.file_path}`;
-    const response = await fetch(url);
-    if (!response.ok) {
-      await ctx.reply("I couldn't download that video note.");
-      return;
-    }
-    const buffer = Buffer.from(await response.arrayBuffer());
-
-    const transcription = await transcribeAudio(buffer, config);
-    if (!transcription) {
-      await ctx.reply("I couldn't transcribe that video note. Try again or send it as text.");
-      return;
-    }
-
-    let content = `[voice message] ${transcription}`;
-    content = enrichContent(content, ctx.message);
-    if (inGroup) content = `[${displayName}]: ${content}`;
-    const tierOverride = consumeTierOverride(chatId);
-    const t0 = Date.now();
-
-    startTyping(chatId);
-    try {
-      const streamResult = await deps.streamAgent({
-        content,
-        senderId, chatId, channel: "telegram",
-        sessionKey: `telegram_${chatId}`,
-        tierOverride,
-        senderDisplayName: displayName,
-        chatType: inGroup ? "group" : "private",
-        onAck: (text) => ctx.reply(text).catch(() => {}),
-      });
-
-      consecutiveErrors = 0;
-      await sendStreamReply({
-        chatId: Number(chatId),
-        threadId: ctx.message.message_thread_id,
-        stream: streamResult.fullStream,
-        onStop: () => stopTyping(chatId),
-      });
-      const agentResult = await streamResult.finishedPromise.catch((err) => { logError("telegram", "agent promise failed", err); return null; });
-      log("msg", `OUT video_note to=${chatId} len=${agentResult?.text?.length ?? 0} tier=${agentResult?.tier ?? "?"} ${Date.now() - t0}ms`);
-      if (agentResult?.files?.length) {
-        await sendPendingFiles(Number(chatId), agentResult.files);
-      }
-    } catch (err) {
-      stopTyping(chatId);
-      logError("msg", `video_note from=${senderId} chat=${chatId} ${Date.now() - t0}ms`, err);
-      await ctx.reply("ran into an issue, try again?").catch(() => {});
-    }
-  });
-
-  // --- Edited message handling ---
-  bot.on("edited_message:text", async (ctx) => {
-    const senderId = String(ctx.from?.id);
-    if (!isAllowed(senderId)) return;
-    const key = `edit:${ctx.editedMessage!.chat.id}:${ctx.editedMessage!.message_id}`;
-    if (processedMessages.has(key)) return;
-    processedMessages.add(key);
-    const chatId = String(ctx.editedMessage!.chat.id);
-    const displayName = getDisplayName(ctx.from);
-    const inGroup = isGroupChat(ctx.editedMessage!.chat.type);
-    log("msg", `IN edited from=${senderId} chat=${chatId} "${ctx.editedMessage!.text?.slice(0, 80)}"`);
-
-    trackUserPresence(senderId, chatId, ctx.from, ctx.editedMessage!.chat.type);
-
-    // Group passive listening for edits
-    if (inGroup && config.group.passiveListening && !shouldRespondInGroup(ctx.editedMessage as Parameters<typeof shouldRespondInGroup>[0])) {
-      return;
-    }
-
-    if (isRateLimited(chatId)) return;
-
-    let content = `[edited] ${ctx.editedMessage!.text}`;
-    if (inGroup) content = `[${displayName}]: ${content}`;
-    const t0 = Date.now();
-
-    startTyping(chatId);
-    try {
-      const streamResult = await deps.streamAgent({
-        content,
-        senderId, chatId, channel: "telegram",
-        sessionKey: `telegram_${chatId}`,
-        senderDisplayName: displayName,
-        chatType: inGroup ? "group" : "private",
-      });
-
-      consecutiveErrors = 0;
-      await sendStreamReply({
-        chatId: Number(chatId),
-        threadId: ctx.editedMessage!.message_thread_id,
-        stream: streamResult.fullStream,
-        onStop: () => stopTyping(chatId),
-      });
-      const agentResult = await streamResult.finishedPromise.catch((err) => { logError("telegram", "agent promise failed", err); return null; });
-      log("msg", `OUT edited to=${chatId} len=${agentResult?.text?.length ?? 0} ${Date.now() - t0}ms`);
-    } catch (err) {
-      stopTyping(chatId);
-      logError("msg", `edited from=${senderId} chat=${chatId} ${Date.now() - t0}ms`, err);
-    }
-  });
-
-  // --- Start polling with retry ---
-  const startWithRetry = async () => {
-    let delay = 1000;
-    const maxDelay = 60_000;
-    while (true) {
+    const imageAttachment = message.attachments.find((attachment) => attachment.type === "image");
+    if (imageAttachment) {
       try {
-        await bot.start({
-          onStart: async () => {
-            log("telegram", "Bot is running");
-            consecutiveErrors = 0;
-          },
+        const buffer = await attachmentToBuffer(imageAttachment);
+        let content = message.text || raw.caption || "What's in this image?";
+        content = enrichContent(content, raw);
+        if (inGroup) content = `[${displayName}]: ${content}`;
+        await runAgentForMessage({
+          thread,
+          content,
+          senderId,
+          chatId,
+          displayName,
+          inGroup,
+          header: namedAgentHeader,
+          attachments: [{
+            type: "image",
+            mimeType: imageAttachment.mimeType ?? "image/jpeg",
+            data: buffer.toString("base64"),
+          }],
+          tierOverride: consumeTierOverride(chatId),
         });
-        break;
       } catch (err) {
-        logError("telegram", `Connection failed, retrying in ${delay / 1000}s`, err);
-        await new Promise((r) => setTimeout(r, delay + Math.random() * 1000));
-        delay = Math.min(delay * 2, maxDelay);
+        logError("telegram", "Image download failed", err);
+        await thread.post("I couldn't read that image.").catch(() => {});
       }
+      return;
     }
-  };
 
-  // --- Environment detection ---
-  const kodaEnv = process.env.KODA_ENV ?? (config.telegram.useWebhook ? "production" : "development");
-  const isAdmin = (userId: string) => config.telegram.adminIds.includes(userId);
-  const bootTime = new Date();
-
-  /** Gate a command behind admin check. Returns true if allowed, false if denied. */
-  const requireAdmin = async (ctx: { reply: (text: string) => Promise<unknown> }, senderId: string): Promise<boolean> => {
-    if (isAdmin(senderId)) return true;
-    await ctx.reply("admin only.").catch(() => {});
-    return false;
-  };
-
-  /** Determine whether the bot should actively respond in a group chat. */
-  const shouldRespondInGroup = (message: {
-    text?: string;
-    caption?: string;
-    entities?: Array<{ type: string; offset: number; length: number }>;
-    caption_entities?: Array<{ type: string; offset: number; length: number }>;
-    reply_to_message?: { from?: { id: number } };
-    new_chat_members?: Array<{ id: number }>;
-  }): boolean => {
-    const text = message.text ?? message.caption ?? "";
-    const entities = message.entities ?? message.caption_entities ?? [];
-
-    // 1. @mention of the bot
-    const botUsername = bot.botInfo.username.toLowerCase();
-    for (const entity of entities) {
-      if (entity.type === "mention") {
-        const mention = text.slice(entity.offset, entity.offset + entity.length).toLowerCase();
-        if (mention === `@${botUsername}`) return true;
+    if (raw.document) {
+      try {
+        const documentAttachment = message.attachments.find((attachment) => attachment.type === "file");
+        const buffer = documentAttachment
+          ? await attachmentToBuffer(documentAttachment)
+          : await downloadTelegramFile(raw.document.file_id);
+        const fileName = raw.document.file_name ?? "document";
+        const mimeType = raw.document.mime_type ?? "application/octet-stream";
+        const fileSize = raw.document.file_size ?? buffer.length;
+        if (fileSize > MAX_DOCUMENT_SIZE) {
+          await thread.post("That file is too large (max 20MB).").catch(() => {});
+          return;
+        }
+        const extractedText = await extractDocumentText(buffer, mimeType, fileName);
+        if (extractedText === null) {
+          await thread.post("I can read PDFs and text files (.txt, .md, .csv, .json, .html, .xml). This format isn't supported yet.").catch(() => {});
+          return;
+        }
+        const truncatedText = extractedText.slice(0, MAX_DOCUMENT_TEXT);
+        let content = `[document: ${fileName}]\n\n${truncatedText}`;
+        if (truncatedText.length < extractedText.length) {
+          content += `\n\n[truncated — showing ${MAX_DOCUMENT_TEXT} of ${extractedText.length} characters]`;
+        }
+        if (raw.caption) content = `${raw.caption}\n\n${content}`;
+        content = enrichContent(content, raw);
+        if (inGroup) content = `[${displayName}]: ${content}`;
+        await runAgentForMessage({
+          thread,
+          content,
+          senderId,
+          chatId,
+          displayName,
+          inGroup,
+          header: namedAgentHeader,
+        });
+      } catch (err) {
+        logError("telegram", "Document processing failed", err);
+        await thread.post("ran into an issue processing that file.").catch(() => {});
       }
+      return;
     }
 
-    // 2. Reply to bot's own message
-    if (message.reply_to_message?.from?.id === bot.botInfo.id) return true;
-
-    // 3. Bot's name triggers in text (case-insensitive)
-    const lower = text.toLowerCase();
-    const triggers = config.group.botNameTriggers;
-    for (const trigger of triggers) {
-      // Word boundary match to avoid false positives
-      const re = new RegExp(`\\b${trigger.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i");
-      if (re.test(lower)) return true;
-    }
-
-    // 4. Bot added as new chat member
-    if (message.new_chat_members?.some((m) => m.id === bot.botInfo.id)) return true;
-
-    return false;
-  };
-
-  /** Track user profile and chat membership on incoming message. */
-  const trackUserPresence = (senderId: string, chatId: string, from: { first_name?: string; last_name?: string; username?: string } | undefined, chatType: string) => {
-    try {
-      const displayName = getDisplayName(from);
-      const role = isAdmin(senderId) ? "admin" as const : "member" as const;
-      userProfiles.upsert({ userId: senderId, displayName, username: from?.username, role });
-      if (isGroupChat(chatType)) {
-        chatMembers.upsert(chatId, senderId);
+    if (raw.voice || raw.video_note) {
+      try {
+        const buffer = raw.voice
+          ? await attachmentToBuffer(message.attachments.find((attachment) => attachment.type === "audio")!)
+          : await downloadTelegramFile(raw.video_note!.file_id);
+        const transcription = await transcribeAudio(buffer, config);
+        if (!transcription) {
+          await thread.post(raw.voice
+            ? "I couldn't transcribe that voice message. Try again or send it as text."
+            : "I couldn't transcribe that video note. Try again or send it as text.",
+          ).catch(() => {});
+          return;
+        }
+        let content = `[voice message] ${transcription}`;
+        content = enrichContent(content, raw);
+        if (inGroup) content = `[${displayName}]: ${content}`;
+        await runAgentForMessage({
+          thread,
+          content,
+          senderId,
+          chatId,
+          displayName,
+          inGroup,
+          header: namedAgentHeader,
+          tierOverride: consumeTierOverride(chatId),
+        });
+      } catch (err) {
+        logError("telegram", "Audio transcription failed", err);
+        await thread.post("ran into an issue, try again?").catch(() => {});
       }
-    } catch { /* DB not migrated yet — safe to skip */ }
-  };
-
-  // --- Notify admins helper ---
-  const notifyAdmins = async (text: string) => {
-    for (const adminId of config.telegram.adminIds) {
-      await bot.api.sendMessage(Number(adminId), text).catch(() => {});
+      return;
     }
+
+    if (!message.text) return;
+
+    let content = enrichContent(message.text, raw);
+    if (inGroup) content = `[${displayName}]: ${content}`;
+    await runAgentForMessage({
+      thread,
+      content,
+      senderId,
+      chatId,
+      displayName,
+      inGroup,
+      header: namedAgentHeader,
+      tierOverride: consumeTierOverride(chatId),
+    });
   };
 
-  // --- /debug command (admin-only) ---
-  bot.command("debug", async (ctx) => {
-    const senderId = String(ctx.from?.id);
-    if (!isAdmin(senderId)) { await ctx.reply("admin only."); return; }
-
-    const uptimeSecs = Math.floor(process.uptime());
-    const uptimeStr = uptimeSecs < 3600
-      ? `${Math.floor(uptimeSecs / 60)}m ${uptimeSecs % 60}s`
-      : `${Math.floor(uptimeSecs / 3600)}h ${Math.floor((uptimeSecs % 3600) / 60)}m`;
-    const mem = process.memoryUsage();
-    const heapMb = (mem.heapUsed / 1024 / 1024).toFixed(1);
-    const rssMb = (mem.rss / 1024 / 1024).toFixed(1);
-    const now = new Date();
-    const todayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate());
-    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
-    const todayUsage = dbUsage.getSummary(senderId, todayStart);
-    const monthUsage = dbUsage.getSummary(senderId, monthStart);
-    const allUsage = dbUsage.getSummary(senderId);
-    const allTasks = dbTasks.getReady(new Date("2099-01-01").toISOString());
-    const llmStatus = isLlmCircuitOpen() ? "DEGRADED" : "healthy";
-
-    let msg = `--- koda debug ---\n`;
-    msg += `version: v${VERSION}\n`;
-    msg += `env: ${kodaEnv}\n`;
-    msg += `mode: ${config.telegram.useWebhook ? "webhook" : "polling"}\n`;
-    msg += `uptime: ${uptimeStr}\n`;
-    msg += `booted: ${bootTime.toISOString()}\n`;
-    msg += `heap: ${heapMb}MB / rss: ${rssMb}MB\n`;
-    msg += `llm: ${llmStatus}\n`;
-    msg += `models:\n  fast: ${config.openrouter.fastModel}\n  deep: ${config.openrouter.deepModel}\n  image: ${config.openrouter.imageModel}\n`;
-    msg += `---\n`;
-    msg += `today: ${todayUsage.totalRequests} req, $${todayUsage.totalCost.toFixed(4)}\n`;
-    msg += `month: ${monthUsage.totalRequests} req, $${monthUsage.totalCost.toFixed(4)}\n`;
-    msg += `all-time: ${allUsage.totalRequests} req, $${allUsage.totalCost.toFixed(4)}\n`;
-    msg += `tasks: ${allTasks.length} active\n`;
-    msg += `node: ${process.version}\n`;
-    msg += `platform: ${process.platform}/${process.arch}`;
-
-    await ctx.reply(msg);
+  chat.onNewMention(async (thread, message) => {
+    await handleIncomingMessage(thread as TelegramThread, message as TelegramChatMessage);
   });
 
-  // --- /adduser command (admin-only) ---
-  bot.command("adduser", async (ctx) => {
-    const senderId = String(ctx.from?.id);
-    if (!isAllowed(senderId)) return;
-    if (!(await requireAdmin(ctx, senderId))) return;
-
-    const args = ctx.message!.text.replace(/^\/adduser\s*/, "").trim();
-    if (!args || !/^\d+$/.test(args)) {
-      await ctx.reply("usage: /adduser <telegram_user_id>");
-      return;
-    }
-
-    allowFrom.add(args);
-    try {
-      userProfiles.upsert({ userId: args, displayName: `User ${args}`, role: "member" });
-    } catch { /* DB not migrated yet */ }
-    await ctx.reply(`user ${args} added.`);
-    log("telegram", `admin ${senderId} added user ${args}`);
+  chat.onNewMessage(/[\s\S]*/, async (thread, message) => {
+    await handleIncomingMessage(thread as TelegramThread, message as TelegramChatMessage);
   });
 
-  // --- /removeuser command (admin-only) ---
-  bot.command("removeuser", async (ctx) => {
-    const senderId = String(ctx.from?.id);
-    if (!isAllowed(senderId)) return;
-    if (!(await requireAdmin(ctx, senderId))) return;
+  await chat.initialize();
+  log("telegram", `Bot initialized: @${telegram.userName}`);
 
-    const args = ctx.message!.text.replace(/^\/removeuser\s*/, "").trim();
-    if (!args || !/^\d+$/.test(args)) {
-      await ctx.reply("usage: /removeuser <telegram_user_id>");
-      return;
-    }
-
-    if (args === senderId) {
-      await ctx.reply("can't remove yourself.");
-      return;
-    }
-    if (isAdmin(args)) {
-      await ctx.reply("can't remove an admin.");
-      return;
-    }
-
-    allowFrom.delete(args);
-    await ctx.reply(`user ${args} removed.`);
-    log("telegram", `admin ${senderId} removed user ${args}`);
-  });
-
-  // --- Initialize bot (required before handleUpdate in webhook mode) ---
-  await bot.init();
-  log("telegram", `Bot initialized: @${bot.botInfo.username}`);
-
-  // --- Webhook or polling ---
   if (config.telegram.useWebhook && config.telegram.webhookUrl) {
-    // Webhook mode — register with retry (Railway networking may not be ready on first boot)
     const setWebhookWithRetry = async (retries = 5, delay = 3000) => {
       for (let i = 0; i < retries; i++) {
         try {
-          await bot.api.setWebhook(config.telegram.webhookUrl!, {
+          await telegramFetch("setWebhook", {
+            url: config.telegram.webhookUrl,
             secret_token: config.telegram.webhookSecret,
           });
-          // Verify it actually took
-          const info = await bot.api.getWebhookInfo();
+          const info = await telegramFetch<TelegramWebhookInfo>("getWebhookInfo");
           if (info.url === config.telegram.webhookUrl) {
             log("telegram", `Webhook set: ${config.telegram.webhookUrl}`);
             return;
@@ -1356,19 +1062,20 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
         } catch (err) {
           logWarn("telegram", `setWebhook attempt ${i + 1}/${retries} failed: ${(err as Error).message}`);
         }
-        if (i < retries - 1) await new Promise((r) => setTimeout(r, delay));
+        if (i < retries - 1) await new Promise((resolve) => setTimeout(resolve, delay));
       }
       logError("telegram", "Failed to set webhook after all retries!");
     };
+
     await setWebhookWithRetry();
 
-    // Re-register webhook after 10s to survive old container's shutdown race
     setTimeout(async () => {
       try {
-        const info = await bot.api.getWebhookInfo();
+        const info = await telegramFetch<TelegramWebhookInfo>("getWebhookInfo");
         if (info.url !== config.telegram.webhookUrl) {
           logWarn("telegram", "Webhook was cleared (deploy race), re-registering...");
-          await bot.api.setWebhook(config.telegram.webhookUrl!, {
+          await telegramFetch("setWebhook", {
+            url: config.telegram.webhookUrl,
             secret_token: config.telegram.webhookSecret,
           });
           log("telegram", "Webhook re-registered successfully");
@@ -1378,85 +1085,43 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
       }
     }, 10_000);
 
-    // Notify admins bot is online (include deploy duration if we know it)
-    const durationSuffix = deps.deployDurationMs
-      ? ` — deployed in ${Math.round(deps.deployDurationMs / 1000)}s`
-      : "";
-    // Only notify in production — dev mode with --watch would spam on every file save
     if (kodaEnv === "production") {
-      await notifyAdmins(`koda v${VERSION} is online. [${kodaEnv}]`);
+      const durationSuffix = deps.deployDurationMs
+        ? ` — deployed in ${Math.round(deps.deployDurationMs / 1000)}s`
+        : "";
+      await notifyAdmins(`koda v${VERSION} is online. [${kodaEnv}]${durationSuffix}`);
     }
-
-    return {
-      notifyAdmins,
-      async sendDirect(chatId: string, text: string) {
-        const id = Number(chatId);
-        if (!Number.isFinite(id)) throw new Error("Invalid chat id");
-        await sendReply(id, text);
-      },
-      async stop(signal: "SIGTERM" | "SIGINT" = "SIGTERM") {
-        for (const chatId of typingIntervals.keys()) stopTyping(chatId);
-        clearInterval(dedupTimer);
-        processedMessages.clear();
-        sentMessages.clear();
-        if (kodaEnv === "production") {
-          const msg = signal === "SIGTERM"
-            ? `deploying now, switching over... [${kodaEnv}]`
-            : `restarting unexpectedly... [${kodaEnv}]`;
-          await notifyAdmins(msg);
-        }
-        // Do NOT call deleteWebhook() — during Railway zero-downtime deploys,
-        // the new container sets the webhook first, then the old container shuts down.
-        // Calling deleteWebhook here would wipe the new container's registration.
-      },
-      async handleWebhook(req: Request): Promise<Response> {
-        // Verify secret token if configured
-        if (config.telegram.webhookSecret) {
-          const secretHeader = req.headers.get("x-telegram-bot-api-secret-token");
-          if (secretHeader !== config.telegram.webhookSecret) {
-            logWarn("webhook", "UNAUTHORIZED request (bad secret)");
-            return new Response("Unauthorized", { status: 401 });
-          }
-        }
-        try {
-          const update = await req.json() as Parameters<typeof bot.handleUpdate>[0];
-          const raw = update as unknown as Record<string, unknown>;
-          const updateType = Object.keys(raw).filter((k) => k !== "update_id").join(",") || "unknown";
-          const msg = raw.message as { from?: { id: number }; text?: string } | undefined;
-          const editMsg = raw.edited_message as { from?: { id: number }; text?: string } | undefined;
-          const fromId = msg?.from?.id ?? editMsg?.from?.id ?? "?";
-          const preview = (msg?.text ?? editMsg?.text ?? "").slice(0, 60);
-          log("webhook", `id=${update.update_id} type=${updateType} from=${fromId}${preview ? ` "${preview}"` : ""}`);
-          await bot.handleUpdate(update);
-          return new Response("ok");
-        } catch (err) {
-          logError("webhook", "processing update failed", err);
-          return new Response("error", { status: 500 });
-        }
-      },
-    };
   }
-
-  // Polling mode
-  startWithRetry();
 
   return {
     notifyAdmins,
     async sendDirect(chatId: string, text: string) {
-      const id = Number(chatId);
-      if (!Number.isFinite(id)) throw new Error("Invalid chat id");
-      await sendReply(id, text);
+      await sendDirectChannelMessage(chatId, text);
     },
     async stop(signal: "SIGTERM" | "SIGINT" = "SIGTERM") {
-      for (const chatId of typingIntervals.keys()) stopTyping(chatId);
-      clearInterval(dedupTimer);
-      processedMessages.clear();
-      sentMessages.clear();
-      const msg = signal === "SIGTERM"
-        ? `deploying now, switching over... [${kodaEnv}]`
-        : `restarting unexpectedly... [${kodaEnv}]`;
-      await notifyAdmins(msg);
-      await bot.stop();
+      for (const threadId of typingIntervals.keys()) stopTyping(threadId);
+      clearInterval(cleanupTimer);
+      if (kodaEnv === "production") {
+        const msg = signal === "SIGTERM"
+          ? `deploying now, switching over... [${kodaEnv}]`
+          : `restarting unexpectedly... [${kodaEnv}]`;
+        await notifyAdmins(msg);
+      }
+      await chat.shutdown().catch((err) => logWarn("telegram", `shutdown warning: ${(err as Error).message}`));
+    },
+    async handleWebhook(req: Request): Promise<Response> {
+      try {
+        const clone = req.clone();
+        const update = await clone.json() as { update_id?: number; message?: { from?: { id?: number }; text?: string }; edited_message?: { from?: { id?: number }; text?: string } };
+        const raw = update as unknown as Record<string, unknown>;
+        const updateType = Object.keys(raw).filter((key) => key !== "update_id").join(",") || "unknown";
+        const fromId = update.message?.from?.id ?? update.edited_message?.from?.id ?? "?";
+        const preview = (update.message?.text ?? update.edited_message?.text ?? "").slice(0, 60);
+        log("webhook", `id=${update.update_id ?? "?"} type=${updateType} from=${fromId}${preview ? ` "${preview}"` : ""}`);
+      } catch {
+        // Ignore logging parse errors and pass original request through.
+      }
+      return chat.webhooks.telegram(req);
     },
   };
 }

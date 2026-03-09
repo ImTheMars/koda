@@ -11,6 +11,12 @@ import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { resolve } from "path";
 import { unlinkSync } from "fs";
 import { tmpdir } from "os";
+import {
+  getDisplayName,
+  isGroupChat,
+  parseCommand,
+  shouldRespondInTelegramGroup,
+} from "../channels/telegram.js";
 
 const testDbPath = resolve(tmpdir(), `koda-group-test-${Date.now()}.db`);
 let db: typeof import("../db.js");
@@ -124,10 +130,6 @@ describe("chatMembers", () => {
 // ============================================================
 
 describe("isGroupChat", () => {
-  // We test the logic directly since the function is simple
-  const isGroupChat = (chatType: string) =>
-    chatType === "group" || chatType === "supergroup";
-
   test("private chat is not group", () => {
     expect(isGroupChat("private")).toBe(false);
   });
@@ -150,95 +152,76 @@ describe("isGroupChat", () => {
 // ============================================================
 
 describe("shouldRespondInGroup logic", () => {
-  const BOT_ID = 123456;
-  const BOT_USERNAME = "koda_bot";
+  const BOT_ID = "123456";
   const TRIGGERS = ["koda"];
 
-  /** Simulates the shouldRespondInGroup logic from telegram.ts */
-  function shouldRespond(message: {
-    text?: string;
-    caption?: string;
-    entities?: Array<{ type: string; offset: number; length: number }>;
-    reply_to_message?: { from?: { id: number } };
-    new_chat_members?: Array<{ id: number }>;
-  }): boolean {
-    const text = message.text ?? message.caption ?? "";
-    const entities = message.entities ?? [];
-
-    // 1. @mention of the bot
-    for (const entity of entities) {
-      if (entity.type === "mention") {
-        const mention = text.slice(entity.offset, entity.offset + entity.length).toLowerCase();
-        if (mention === `@${BOT_USERNAME}`) return true;
-      }
-    }
-
-    // 2. Reply to bot's own message
-    if (message.reply_to_message?.from?.id === BOT_ID) return true;
-
-    // 3. Bot's name triggers
-    const lower = text.toLowerCase();
-    for (const trigger of TRIGGERS) {
-      const re = new RegExp(`\\b${trigger}\\b`, "i");
-      if (re.test(lower)) return true;
-    }
-
-    // 4. Bot added as new member
-    if (message.new_chat_members?.some((m) => m.id === BOT_ID)) return true;
-
-    return false;
-  }
-
   test("responds to @mention", () => {
-    expect(shouldRespond({
+    expect(shouldRespondInTelegramGroup({
       text: "hey @koda_bot what's up",
-      entities: [{ type: "mention", offset: 4, length: 9 }],
+      isMention: true,
+      botNameTriggers: TRIGGERS,
+      botUserId: BOT_ID,
     })).toBe(true);
   });
 
   test("responds to reply to bot message", () => {
-    expect(shouldRespond({
+    expect(shouldRespondInTelegramGroup({
       text: "yes I agree",
-      reply_to_message: { from: { id: BOT_ID } },
+      replyToMessageFromId: BOT_ID,
+      botNameTriggers: TRIGGERS,
+      botUserId: BOT_ID,
     })).toBe(true);
   });
 
   test("responds to bot name trigger", () => {
-    expect(shouldRespond({ text: "hey koda, can you help?" })).toBe(true);
+    expect(shouldRespondInTelegramGroup({
+      text: "hey koda, can you help?",
+      botNameTriggers: TRIGGERS,
+      botUserId: BOT_ID,
+    })).toBe(true);
   });
 
   test("responds when bot added as member", () => {
-    expect(shouldRespond({
+    expect(shouldRespondInTelegramGroup({
       text: "",
-      new_chat_members: [{ id: BOT_ID }],
+      newChatMemberIds: [BOT_ID],
+      botNameTriggers: TRIGGERS,
+      botUserId: BOT_ID,
     })).toBe(true);
   });
 
   test("does NOT respond to random message", () => {
-    expect(shouldRespond({ text: "just chatting about lunch" })).toBe(false);
+    expect(shouldRespondInTelegramGroup({
+      text: "just chatting about lunch",
+      botNameTriggers: TRIGGERS,
+      botUserId: BOT_ID,
+    })).toBe(false);
   });
 
   test("does NOT respond to mention of different bot", () => {
-    expect(shouldRespond({
+    expect(shouldRespondInTelegramGroup({
       text: "hey @other_bot what's up",
-      entities: [{ type: "mention", offset: 4, length: 10 }],
+      botNameTriggers: TRIGGERS,
+      botUserId: BOT_ID,
     })).toBe(false);
   });
 
   test("does NOT respond to reply to other user", () => {
-    expect(shouldRespond({
+    expect(shouldRespondInTelegramGroup({
       text: "I agree with you",
-      reply_to_message: { from: { id: 999999 } },
+      replyToMessageFromId: "999999",
+      botNameTriggers: TRIGGERS,
+      botUserId: BOT_ID,
     })).toBe(false);
   });
 
   test("trigger match is case insensitive", () => {
-    expect(shouldRespond({ text: "KODA do this" })).toBe(true);
-    expect(shouldRespond({ text: "Hey Koda!" })).toBe(true);
+    expect(shouldRespondInTelegramGroup({ text: "KODA do this", botNameTriggers: TRIGGERS, botUserId: BOT_ID })).toBe(true);
+    expect(shouldRespondInTelegramGroup({ text: "Hey Koda!", botNameTriggers: TRIGGERS, botUserId: BOT_ID })).toBe(true);
   });
 
   test("trigger requires word boundary", () => {
-    expect(shouldRespond({ text: "kodak moment" })).toBe(false);
+    expect(shouldRespondInTelegramGroup({ text: "kodak moment", botNameTriggers: TRIGGERS, botUserId: BOT_ID })).toBe(false);
   });
 });
 
@@ -247,12 +230,6 @@ describe("shouldRespondInGroup logic", () => {
 // ============================================================
 
 describe("message attribution", () => {
-  const getDisplayName = (from: { first_name?: string; last_name?: string; username?: string } | undefined): string => {
-    if (!from) return "Unknown";
-    const parts = [from.first_name, from.last_name].filter(Boolean);
-    return parts.join(" ") || from.username || "Unknown";
-  };
-
   test("full name from first + last", () => {
     expect(getDisplayName({ first_name: "Alice", last_name: "Smith" })).toBe("Alice Smith");
   });
@@ -268,6 +245,26 @@ describe("message attribution", () => {
   test("fallback to Unknown", () => {
     expect(getDisplayName(undefined)).toBe("Unknown");
     expect(getDisplayName({})).toBe("Unknown");
+  });
+});
+
+describe("parseCommand", () => {
+  test("parses command with args", () => {
+    expect(parseCommand("/model fast anthropic/claude-sonnet")).toEqual({
+      command: "model",
+      args: "fast anthropic/claude-sonnet",
+    });
+  });
+
+  test("parses bot-qualified command", () => {
+    expect(parseCommand("/help@koda_bot")).toEqual({
+      command: "help",
+      args: "",
+    });
+  });
+
+  test("returns null for plain text", () => {
+    expect(parseCommand("hello there")).toBeNull();
   });
 });
 
