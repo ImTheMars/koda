@@ -19,7 +19,7 @@ import { registerSubAgentTools, getNamedSession } from "./tools/subagent.js";
 import { log, logWarn } from "./log.js";
 import { bootConfig } from "./boot/config.js";
 import { bootProviders } from "./boot/providers.js";
-import { bootMcp, reconnectMcpServer, type McpEntry } from "./boot/mcp.js";
+import { bootMcp, type McpEntry } from "./boot/mcp.js";
 import { bootServer } from "./boot/server.js";
 import { startRailwayMonitor } from "./boot/railway-monitor.js";
 
@@ -215,19 +215,16 @@ function seedRecurringTaskForTargets(params: {
 }
 
 // --- Seed built-in recurring tasks (once per install) ---
-(function seedBuiltinTasks() {
-  seedRecurringTaskForTargets({
-    seedKeyBase: "builtin-skill-discovery-v2",
-    taskIdBase: "builtin-skill-discovery",
-    cron: config.features.skillDiscoveryCron,
-    description: "Weekly skill discovery",
-    prompt: "Search the skill shop for 3-5 interesting new skills relevant to my recent activity. Briefly list what you found with their rawUrl - don't install anything, just surface the options.",
-  });
-})();
+seedRecurringTaskForTargets({
+  seedKeyBase: "builtin-skill-discovery-v2",
+  taskIdBase: "builtin-skill-discovery",
+  cron: config.features.skillDiscoveryCron,
+  description: "Weekly skill discovery",
+  prompt: "Search the skill shop for 3-5 interesting new skills relevant to my recent activity. Briefly list what you found with their rawUrl - don't install anything, just surface the options.",
+});
 
 // --- Seed daily briefing (requires Composio Gmail + Calendar) ---
-(function seedDailyBriefing() {
-  if (!config.composio?.apiKey) return;
+if (config.composio?.apiKey) {
   seedRecurringTaskForTargets({
     seedKeyBase: "builtin-daily-briefing-v2",
     taskIdBase: "builtin-daily-briefing",
@@ -235,29 +232,23 @@ function seedRecurringTaskForTargets(params: {
     description: "Daily morning briefing",
     prompt: "Give me a brief morning briefing. Check my calendar for today's events, check my recent emails for anything important, and list any pending tasks or reminders. Keep it concise - a quick overview to start my day.",
   });
-})();
+}
 
-// --- Seed weekly review ---
-(function seedWeeklyReview() {
-  seedRecurringTaskForTargets({
-    seedKeyBase: "builtin-weekly-review-v2",
-    taskIdBase: "builtin-weekly-review",
-    cron: config.features.weeklyReviewCron,
-    description: "Weekly review",
-    prompt: "Run a weekly review. Use assessmentSnapshot, listGoals, listPlans, listTasks, and listReviews. Identify wins, risks, contradictions, and the 1-3 highest leverage next actions. Store the review with storeReview and keep the message concise but real.",
-  });
-})();
+seedRecurringTaskForTargets({
+  seedKeyBase: "builtin-weekly-review-v2",
+  taskIdBase: "builtin-weekly-review",
+  cron: config.features.weeklyReviewCron,
+  description: "Weekly review",
+  prompt: "Run a weekly review. Use assessmentSnapshot, listGoals, listPlans, listTasks, and listReviews. Identify wins, risks, contradictions, and the 1-3 highest leverage next actions. Store the review with storeReview and keep the message concise but real.",
+});
 
-// --- Seed goal drift audit ---
-(function seedGoalDriftAudit() {
-  seedRecurringTaskForTargets({
-    seedKeyBase: "builtin-goal-drift-v2",
-    taskIdBase: "builtin-goal-drift",
-    cron: config.features.goalDriftCron,
-    description: "Goal drift audit",
-    prompt: "Run a goal drift audit. Compare the user's active goals, recent observations, interventions, tasks, and durable plans. Call out where goals and behavior seem misaligned, log any important observations, and recommend one intervention if needed.",
-  });
-})();
+seedRecurringTaskForTargets({
+  seedKeyBase: "builtin-goal-drift-v2",
+  taskIdBase: "builtin-goal-drift",
+  cron: config.features.goalDriftCron,
+  description: "Goal drift audit",
+  prompt: "Run a goal drift audit. Compare the user's active goals, recent observations, interventions, tasks, and durable plans. Call out where goals and behavior seem misaligned, log any important observations, and recommend one intervention if needed.",
+});
 
 // --- Named agent routing wrapper ---
 const NAMED_AGENT_RE = /^@([A-Za-z][A-Za-z0-9_-]*):\s*/;

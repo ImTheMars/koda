@@ -432,7 +432,7 @@ export async function startTelegram(deps: TelegramDeps): Promise<TelegramResult>
 
   let pdfParseFn: ((buf: Buffer) => Promise<{ text: string }>) | null = null;
   const getPdfParse = async (): Promise<(buf: Buffer) => Promise<{ text: string }>> => {
-    // @ts-ignore - pdf-parse has no bundled types.
+    // @ts-expect-error - pdf-parse has no bundled types.
     if (!pdfParseFn) pdfParseFn = (await import("pdf-parse")).default;
     return pdfParseFn!;
   };
