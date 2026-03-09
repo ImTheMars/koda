@@ -8,8 +8,8 @@
  */
 
 import { Composio } from "@composio/core";
+import { tool, type ToolSet } from "ai";
 import { z } from "zod";
-import type { ToolSet } from "ai";
 import { logError } from "./log.js";
 
 // --- Composio SDK response types ---
@@ -62,6 +62,11 @@ const ESSENTIAL_TOOLS: Record<string, string[]> = {
   googlecalendar: ["LIST_EVENTS", "FIND_EVENT", "CREATE_EVENT", "DELETE_EVENT", "GET_EVENT", "FREE_BUSY", "GET_CALENDAR_PROFILE"],
   github: ["CREATE_AN_ISSUE", "CREATE_A_PULL_REQUEST", "FIND_PULL_REQUESTS", "CREATE_AN_ISSUE_COMMENT", "COMMIT_MULTIPLE", "CREATE_OR_UPDATE_FILE"],
   googlesheets: ["CREATE_A_GOOGLE", "GET_SPREADSHEET_INFO", "BATCH_GET_SPREADSHEET_VALUES", "APPEND_DIMENSION", "GET_SHEET_NAMES"],
+};
+
+/** Override Composio's stingy defaults for specific tools (matched by slug substring). */
+const TOOL_ARG_DEFAULTS: Record<string, Record<string, unknown>> = {
+  GMAIL_FETCH_EMAILS: { max_results: 25 },
 };
 
 /** Build a Zod schema from Composio's raw inputParameters */
@@ -142,20 +147,25 @@ export function createComposioClient(deps: ComposioDeps): ComposioClient {
       }
       if (allRawTools.length === 0) return {};
 
-      // Build Vercel AI SDK tools with direct API execution
-      const tools: Record<string, { description: string; parameters: z.ZodObject<Record<string, z.ZodTypeAny>>; execute: (args: Record<string, unknown>) => Promise<unknown> }> = {};
+      // Build AI SDK tools with direct API execution.
+      const tools: ToolSet = {};
       for (const rawTool of allRawTools) {
         const slug = rawTool.slug;
-        const description = rawTool.description ?? rawTool.name ?? slug;
-        const parameters = buildZodSchema(rawTool.inputParameters ?? []);
+        let description = rawTool.description ?? rawTool.name ?? slug;
+        // Augment descriptions so model knows to request a reasonable batch size.
+        if (slug.toUpperCase().includes("GMAIL_FETCH_EMAILS")) {
+          description += " Default fetches 25 emails. Use max_results to request more.";
+        }
+        const inputSchema = buildZodSchema(rawTool.inputParameters ?? []);
 
-        tools[slug] = {
+        const toolDefaults = Object.entries(TOOL_ARG_DEFAULTS).find(([key]) => slug.toUpperCase().includes(key))?.[1] ?? {};
+        tools[slug] = tool({
           description,
-          parameters,
-          execute: async (args: Record<string, unknown>) => executeToolDirect(slug, args),
-        };
+          inputSchema,
+          execute: async (args: Record<string, unknown>) => executeToolDirect(slug, { ...toolDefaults, ...args }),
+        });
       }
-      return tools as unknown as ToolSet;
+      return tools;
     },
 
     async getAuthUrl(app: string): Promise<string> {
